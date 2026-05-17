@@ -1,0 +1,23 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+pydantic==2.8.2
+
+# LlamaIndex core + integrations
+llama-index-core==0.11.0
+llama-index-llms-ollama==0.3.0
+llama-index-embeddings-ollama==0.3.0
+llama-index-vector-stores-milvus==0.2.0
+
+# Document readers
+llama-index-readers-file==0.2.0
+pypdf==4.3.1
+python-docx==1.1.2
+openpyxl==3.1.5
+
+# Milvus client
+pymilvus==2.4.5
+
+# Utilities
+python-dotenv==1.0.1
+aiofiles==24.1.0
