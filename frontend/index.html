@@ -119,6 +119,14 @@
     .msg.user .msg-body { background:rgba(108,140,245,.10); border-color:rgba(108,140,245,.22); max-width:78%; border-bottom-right-radius:4px; }
     .msg.assistant .msg-body { border-color:var(--border2); max-width:100%; border-bottom-left-radius:4px; }
     .msg.assistant .sources { width:100%; }
+    .msg-body { user-select:text; cursor:default; }
+    /* UI chrome should not show a text caret or be selectable */
+    .topbar,.sidebar,.msg-role,.sidebar-title,.session-title,.kb-stats,.source-meta,.input-hint,.supported-types,.upload-text,.welcome-title,.welcome-sub { user-select:none; }
+    .msg-actions { display:flex; gap:6px; margin-top:6px; opacity:0; transition:opacity .15s; }
+    .msg:hover .msg-actions { opacity:1; }
+    .msg.user .msg-actions { justify-content:flex-end; }
+    .msg-action { background:transparent; border:1px solid var(--border); color:var(--muted); font-size:11px; font-family:var(--mono); padding:3px 9px; border-radius:5px; cursor:pointer; transition:border-color .15s,color .15s; user-select:none; }
+    .msg-action:hover { border-color:var(--accent); color:var(--text); }
     .msg-body.thinking { display:flex; align-items:center; gap:6px; color:var(--muted); font-style:italic; }
     .cursor::after { content:'▋'; color:var(--accent); animation:blink 1s steps(2) infinite; }
     @keyframes blink { 0%,50%{opacity:1}50.01%,100%{opacity:0} }
@@ -160,13 +168,10 @@
 
   <header class="topbar">
     <div class="topbar-logo">RAG <span>Local</span></div>
-    <span class="model-badge" id="modelBadge">—</span>
     <div class="topbar-sep"></div>
     <div class="lang-toggle" id="langToggle">
       <button data-lang="fr">FR</button><button data-lang="en">EN</button>
     </div>
-    <div class="status-dot" id="statusDot"></div>
-    <span class="status-label" id="statusLabel">…</span>
   </header>
 
   <!-- Left: conversations -->
@@ -243,6 +248,8 @@
       chunks:'Chunks', docs:'Docs',
       role_user:'Vous', role_assistant:'Assistant',
       sources:'Sources',
+      copy:'Copier', copied:'Copié', edit:'Modifier', copy_failed:'Échec de la copie',
+      reply_ready:'Réponse prête : « {title} »',
       searching:'Recherche dans la base…',
       no_response:'(aucune réponse)',
       greeting:"Bonjour 👋 Je suis votre assistant. Posez-moi une question, ou ajoutez des documents et je m'appuierai dessus pour vous répondre.",
@@ -278,6 +285,8 @@
       chunks:'Chunks', docs:'Docs',
       role_user:'You', role_assistant:'Assistant',
       sources:'Sources',
+      copy:'Copy', copied:'Copied', edit:'Edit', copy_failed:'Copy failed',
+      reply_ready:'Reply ready: "{title}"',
       searching:'Searching the knowledge base…',
       no_response:'(no response)',
       greeting:"Hi 👋 I'm your assistant. Ask me anything, or add documents and I'll use them to answer.",
@@ -307,7 +316,6 @@
     document.querySelectorAll('[data-i18n]').forEach(el => el.textContent = t(el.dataset.i18n));
     document.querySelectorAll('[data-i18n-html]').forEach(el => el.innerHTML = t(el.dataset.i18nHtml));
     document.querySelectorAll('[data-i18n-ph]').forEach(el => el.placeholder = t(el.dataset.i18nPh));
-    document.getElementById('statusLabel').textContent = t('status_' + currentStatus);
     document.querySelectorAll('.lang-toggle button').forEach(b => b.classList.toggle('active', b.dataset.lang === lang));
   }
 
@@ -333,8 +341,6 @@
       const res = await fetch(`${API}/`);
       const data = await res.json();
       setStatus('ready');
-      document.getElementById('modelBadge').textContent =
-        `${data.llm_model || 'LLM'} · ${data.embed_model || 'embed'}`;
       updateStats(data.doc_count, data.total_documents);
       await Promise.all([refreshDocs(), refreshSessions()]);
     } catch (e) {
@@ -345,8 +351,6 @@
 
   function setStatus(s) {
     currentStatus = s;
-    document.getElementById('statusDot').className = 'status-dot ' + s;
-    document.getElementById('statusLabel').textContent = t('status_' + s);
     updateSendBtn();
   }
   function updateSendBtn() {
@@ -482,6 +486,9 @@
     } else {
       el.innerHTML = role + `<div class="msg-body${activeStream.done ? '' : ' cursor'}">${escHtml(activeStream.answer)}</div>` + renderSourcesHtml(activeStream.sources);
     }
+    if (activeStream.done && !activeStream.error && activeStream.answer) {
+      el.appendChild(buildActions(activeStream.answer, false));
+    }
     if (activeStream.done) el.removeAttribute('id'); // becomes a normal message
     msgs.scrollTop = msgs.scrollHeight;
   }
@@ -491,6 +498,7 @@
     const el = document.createElement('div');
     el.className = 'msg user';
     el.innerHTML = `<div class="msg-role">${escHtml(t('role_user'))}</div><div class="msg-body">${escHtml(text)}</div>`;
+    el.appendChild(buildActions(text, true));
     msgs.appendChild(el);
     msgs.scrollTop = msgs.scrollHeight;
   }
@@ -501,8 +509,44 @@
     el.className = 'msg assistant';
     el.innerHTML = `<div class="msg-role">${escHtml(t('role_assistant'))}</div>
       <div class="msg-body">${escHtml(answer)}</div>${renderSourcesHtml(sources)}`;
+    el.appendChild(buildActions(answer, false));
     msgs.appendChild(el);
     msgs.scrollTop = msgs.scrollHeight;
+  }
+
+  // Copy (all messages) + Edit (user messages) action row.
+  function buildActions(text, isUser) {
+    const row = document.createElement('div');
+    row.className = 'msg-actions';
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'msg-action';
+    copyBtn.textContent = t('copy');
+    copyBtn.onclick = () => copyText(text, copyBtn);
+    row.appendChild(copyBtn);
+    if (isUser) {
+      const editBtn = document.createElement('button');
+      editBtn.className = 'msg-action';
+      editBtn.textContent = t('edit');
+      editBtn.onclick = () => editMessage(text);
+      row.appendChild(editBtn);
+    }
+    return row;
+  }
+
+  function copyText(text, btn) {
+    const done = () => { const old = btn.textContent; btn.textContent = t('copied'); setTimeout(() => { btn.textContent = old; }, 1500); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done).catch(() => showToast(t('copy_failed'), 'error'));
+    } else {
+      const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta);
+      ta.select(); try { document.execCommand('copy'); done(); } catch (e) { showToast(t('copy_failed'), 'error'); }
+      ta.remove();
+    }
+  }
+
+  function editMessage(text) {
+    const input = document.getElementById('questionInput');
+    input.value = text; autoResize(input); input.focus();
   }
 
   function renderSourcesHtml(sources) {
@@ -511,7 +555,6 @@
       <div class="source-item" onclick="this.classList.toggle('source-expanded')">
         <div class="source-meta">
           <span class="source-file">📎 ${escHtml(s.filename)}</span>
-          <span class="source-score">score: ${s.score}</span>
           ${s.page && s.page !== '?' ? `<span class="source-score">p.${escHtml(String(s.page))}</span>` : ''}
         </div>
         <div class="source-text">${escHtml(s.text)}</div>
@@ -542,6 +585,7 @@
 
     const controller = new AbortController();
     activeStream = { sessionId: sid, answer: '', sources: [], done: false, error: null, thinking: true, controller };
+    let doneTitle = null;
     updateSendBtn();
     ensureStreamBubble();
 
@@ -581,6 +625,8 @@
           } else if (evt.type === 'error') {
             activeStream.error = evt.data;
             ensureStreamBubble();
+          } else if (evt.type === 'done') {
+            doneTitle = evt.title;
           }
         }
         if (!activeStream) break;
@@ -595,8 +641,13 @@
         if (activeStream.thinking && !activeStream.answer && !activeStream.error) {
           activeStream.error = t('no_response');
         }
+        const finishedAway = sid !== currentSessionId; // user left this conversation
         ensureStreamBubble();
         activeStream = null;
+        if (finishedAway) {
+          const s = sessions.find(x => x.id === sid);
+          showToast(t('reply_ready', { title: doneTitle || (s && s.title) || '' }), 'success');
+        }
       }
       updateSendBtn();
       refreshSessions();

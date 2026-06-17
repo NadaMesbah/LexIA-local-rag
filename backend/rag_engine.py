@@ -34,6 +34,7 @@ from llama_index.core import (
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.llms import ChatMessage, MessageRole
 from llama_index.core.memory import ChatMemoryBuffer
+from llama_index.core.chat_engine import SimpleChatEngine
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.llms.ollama import Ollama
 from llama_index.embeddings.ollama import OllamaEmbedding
@@ -92,6 +93,28 @@ CONTEXT_TEMPLATE = (
     "---------------------\n"
     "{context_str}\n"
     "---------------------"
+)
+
+# Prompt for plain conversation (no document retrieval).
+CONV_SYSTEM_PROMPT = (
+    "You are a friendly, helpful AI assistant. Chat naturally: greet the user, "
+    "answer general questions, help with reasoning, coding and explanations. "
+    "Always reply in the SAME LANGUAGE the user used. Be clear and concise."
+)
+
+# Router prompt: decides if a message needs the private documents.
+ROUTER_PROMPT = (
+    "You are a routing classifier for an assistant that can search the user's "
+    "private uploaded documents.\n"
+    "Decide whether answering the user's LAST message requires those documents.\n"
+    "Answer NO for greetings, small talk, thanks, general knowledge, coding, math, "
+    "definitions — anything answerable without their specific files.\n"
+    "Answer YES only when the message is about the content of their documents or "
+    "clearly needs information that would live in their uploaded files.\n"
+    "Reply with exactly one word: YES or NO.\n\n"
+    "{conversation}"
+    "User: {message}\n"
+    "Answer:"
 )
 
 
@@ -168,36 +191,21 @@ class RAGEngine:
 
     # ─── Chat (session-aware, streaming) ───────────────────────────────────────
 
-    def _build_chat_engine(self, history: list[dict]):
-        """
-        Build a fresh chat engine seeded with prior conversation turns.
-
-        `history` is a list of {"role": "user"|"assistant", "content": str}
-        representing the messages BEFORE the new user message.
-        """
+    def _memory(self, history: list[dict]):
         chat_history = [
             ChatMessage(
                 role=MessageRole.USER if m["role"] == "user" else MessageRole.ASSISTANT,
                 content=m["content"],
             )
-            for m in history
-            if m.get("content")
+            for m in history if m.get("content")
         ]
-
-        memory = ChatMemoryBuffer.from_defaults(
-            chat_history=chat_history,
-            token_limit=MEMORY_TOKEN_LIMIT,
+        return ChatMemoryBuffer.from_defaults(
+            chat_history=chat_history, token_limit=MEMORY_TOKEN_LIMIT
         )
 
+    def _build_doc_engine(self, memory):
+        """Conversational RAG: retrieves doc chunks and answers grounded in them."""
         postprocessors = [self._reranker] if self._reranker else []
-
-        # "context" chat engine = conversational RAG:
-        #   * retrieves relevant chunks for the latest message
-        #   * injects them into the system message (CONTEXT_TEMPLATE)
-        #   * calls the LLM with the full chat history (memory)
-        # Unlike "condense_plus_context", it does NOT force every message into a
-        # standalone document query, so greetings / small talk work normally and
-        # we never get the "Empty Response" placeholder on an empty knowledge base.
         return self._index.as_chat_engine(
             chat_mode="context",
             memory=memory,
@@ -208,23 +216,52 @@ class RAGEngine:
             streaming=True,
         )
 
+    def _build_chat_only_engine(self, memory):
+        """Plain conversation: NO retrieval (greetings, small talk, general questions)."""
+        return SimpleChatEngine.from_defaults(
+            memory=memory,
+            system_prompt=CONV_SYSTEM_PROMPT,
+        )
+
+    def _should_use_docs(self, message: str, history: list[dict]) -> bool:
+        """Fast YES/NO: does this message actually need the private documents?"""
+        try:
+            convo = ""
+            for m in history[-4:]:
+                who = "User" if m["role"] == "user" else "Assistant"
+                convo += f"{who}: {m['content'][:300]}\n"
+            prompt = ROUTER_PROMPT.format(conversation=convo, message=message)
+            resp = Settings.llm.complete(prompt)
+            ans = (resp.text or "").strip().lower()
+            return ans.startswith("y") or "yes" in ans[:8]
+        except Exception as e:
+            print(f"[RAG] router error ({e}); defaulting to document search")
+            return True
+
     async def stream_chat(self, message: str, history: list[dict]):
         """
-        Async generator over (token, sources).
+        Async generator yielding ("token", str) events, then a final
+        ("sources", list[dict]) event.
 
-        Yields ("token", str) for each streamed token, then a final
-        ("sources", list[dict]) event once generation completes.
+        Smart routing: the documents are searched ONLY when the question needs
+        them. Greetings / small talk / general questions are answered instantly
+        with no retrieval and no sources.
         """
         loop = asyncio.get_event_loop()
 
-        chat_engine = self._build_chat_engine(history)
+        use_docs = False
+        if self.doc_count() > 0:
+            use_docs = await loop.run_in_executor(
+                None, self._should_use_docs, message, history
+            )
 
-        # The retrieval + condensation step is blocking -> run in a worker thread.
+        memory = self._memory(history)
+        engine = self._build_doc_engine(memory) if use_docs else self._build_chat_only_engine(memory)
+
         streaming_response = await loop.run_in_executor(
-            None, lambda: chat_engine.stream_chat(message)
+            None, lambda: engine.stream_chat(message)
         )
 
-        # Pull tokens one at a time without blocking the event loop.
         gen = streaming_response.response_gen
         sentinel = object()
         while True:
@@ -233,7 +270,10 @@ class RAGEngine:
                 break
             yield ("token", token)
 
-        sources = self._format_sources(getattr(streaming_response, "source_nodes", []))
+        sources = (
+            self._format_sources(getattr(streaming_response, "source_nodes", []))
+            if use_docs else []
+        )
         yield ("sources", sources)
 
     @staticmethod
