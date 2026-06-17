@@ -214,7 +214,7 @@
 
 <script>
   const API = '/api';
-  let isLoading = false;
+  let activeStream = null; // single in-flight generation: {sessionId, answer, sources, done, error, thinking, controller}
   let documents = [];
   let sessions = [];
   let currentSessionId = null;
@@ -337,7 +337,6 @@
         `${data.llm_model || 'LLM'} · ${data.embed_model || 'embed'}`;
       updateStats(data.doc_count, data.total_documents);
       await Promise.all([refreshDocs(), refreshSessions()]);
-      document.getElementById('sendBtn').disabled = false;
     } catch (e) {
       setStatus('error');
       showToast(t('toast_backend'), 'error');
@@ -348,6 +347,11 @@
     currentStatus = s;
     document.getElementById('statusDot').className = 'status-dot ' + s;
     document.getElementById('statusLabel').textContent = t('status_' + s);
+    updateSendBtn();
+  }
+  function updateSendBtn() {
+    const busy = !!(activeStream && !activeStream.done);
+    document.getElementById('sendBtn').disabled = busy || currentStatus !== 'ready';
   }
   function updateStats(chunks, docCount) {
     if (chunks >= 0) document.getElementById('statChunks').textContent = chunks.toLocaleString();
@@ -392,12 +396,14 @@
       currentSessionId = s.id;
       await refreshSessions();
       showGreeting();
+      updateSendBtn();
     } catch (e) { showToast(t('toast_create_error'), 'error'); }
   }
 
   async function openSession(id) {
     currentSessionId = id;
     renderSessions();
+    updateSendBtn();
     try {
       const res = await fetch(`${API}/sessions/${id}`);
       const data = await res.json();
@@ -408,6 +414,12 @@
   async function deleteSession(id, ev) {
     ev.stopPropagation();
     if (!confirm(t('confirm_del_session'))) return;
+    // Abort an in-flight generation that belongs to the session being deleted.
+    if (activeStream && activeStream.sessionId === id) {
+      try { activeStream.controller.abort(); } catch (e) {}
+      activeStream = null;
+      updateSendBtn();
+    }
     try {
       await fetch(`${API}/sessions/${id}`, { method: 'DELETE' });
       if (currentSessionId === id) { currentSessionId = null; renderLanding(); }
@@ -438,11 +450,39 @@
   function renderMessages(messages) {
     const msgs = document.getElementById('messages');
     msgs.innerHTML = '';
-    if (!messages.length) { showGreeting(); return; }
+    const hasActive = activeStream && !activeStream.done && activeStream.sessionId === currentSessionId;
+    if (!messages.length && !hasActive) { showGreeting(); return; }
     messages.forEach(m => {
       if (m.role === 'user') appendUserMessage(m.content);
       else appendAnswerMessage(m.content, m.sources || []);
     });
+    ensureStreamBubble(); // re-attach a live answer if we navigated back mid-generation
+    msgs.scrollTop = msgs.scrollHeight;
+  }
+
+  // Creates/updates the live assistant bubble for the active stream, but only
+  // when the user is actually viewing that conversation. This is what lets you
+  // leave and come back without losing the in-progress (or finished) answer.
+  function ensureStreamBubble() {
+    if (!activeStream || currentSessionId !== activeStream.sessionId) return;
+    const msgs = document.getElementById('messages');
+    const w = msgs.querySelector('.welcome'); if (w) w.remove();
+    let el = document.getElementById('activeStreamMsg');
+    if (!el) {
+      el = document.createElement('div');
+      el.className = 'msg assistant';
+      el.id = 'activeStreamMsg';
+      msgs.appendChild(el);
+    }
+    const role = `<div class="msg-role">${escHtml(t('role_assistant'))}</div>`;
+    if (activeStream.error) {
+      el.innerHTML = role + `<div class="msg-body">⚠️ ${escHtml(activeStream.error)}</div>`;
+    } else if (activeStream.thinking && !activeStream.answer) {
+      el.innerHTML = role + `<div class="msg-body thinking"><div class="dots"><span></span><span></span><span></span></div>${escHtml(t('searching'))}</div>`;
+    } else {
+      el.innerHTML = role + `<div class="msg-body${activeStream.done ? '' : ' cursor'}">${escHtml(activeStream.answer)}</div>` + renderSourcesHtml(activeStream.sources);
+    }
+    if (activeStream.done) el.removeAttribute('id'); // becomes a normal message
     msgs.scrollTop = msgs.scrollHeight;
   }
 
@@ -487,35 +527,28 @@
   async function sendQuestion() {
     const input = document.getElementById('questionInput');
     const question = input.value.trim();
-    if (!question || isLoading) return;
+    if (!question) return;
+    if (activeStream && !activeStream.done) return; // one generation at a time
+    if (currentStatus !== 'ready') return;
 
     if (!currentSessionId) { await newSession(); if (!currentSessionId) return; }
+    const sid = currentSessionId;
 
     const welcome = document.querySelector('#messages .welcome');
     if (welcome) welcome.remove();
 
-    isLoading = true;
     input.value = ''; input.style.height = 'auto';
-    document.getElementById('sendBtn').disabled = true;
-
-    const msgs = document.getElementById('messages');
     appendUserMessage(question);
 
-    const el = document.createElement('div');
-    el.className = 'msg assistant';
-    el.innerHTML = `<div class="msg-role">${escHtml(t('role_assistant'))}</div>
-      <div class="msg-body thinking"><div class="dots"><span></span><span></span><span></span></div>${escHtml(t('searching'))}</div>`;
-    msgs.appendChild(el);
-    msgs.scrollTop = msgs.scrollHeight;
-    const bodyEl = el.querySelector('.msg-body');
-
-    let answer = '';
-    let firstToken = true;
+    const controller = new AbortController();
+    activeStream = { sessionId: sid, answer: '', sources: [], done: false, error: null, thinking: true, controller };
+    updateSendBtn();
+    ensureStreamBubble();
 
     try {
-      const res = await fetch(`${API}/sessions/${currentSessionId}/chat`, {
+      const res = await fetch(`${API}/sessions/${sid}/chat`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: question })
+        body: JSON.stringify({ message: question }), signal: controller.signal
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
@@ -536,34 +569,38 @@
           buf = buf.slice(idx + 1);
           if (!line) continue;
           let evt; try { evt = JSON.parse(line); } catch { continue; }
+          if (!activeStream) break; // stream was cancelled (e.g. session deleted)
 
           if (evt.type === 'token') {
-            if (firstToken) { bodyEl.classList.remove('thinking'); bodyEl.classList.add('cursor'); bodyEl.textContent = ''; firstToken = false; }
-            answer += evt.data;
-            bodyEl.textContent = answer;
-            msgs.scrollTop = msgs.scrollHeight;
+            activeStream.thinking = false;
+            activeStream.answer += evt.data;
+            ensureStreamBubble();
           } else if (evt.type === 'sources') {
-            bodyEl.classList.remove('cursor');
-            el.insertAdjacentHTML('beforeend', renderSourcesHtml(evt.data));
-            msgs.scrollTop = msgs.scrollHeight;
+            activeStream.sources = evt.data;
+            ensureStreamBubble();
           } else if (evt.type === 'error') {
-            bodyEl.classList.remove('thinking', 'cursor');
-            bodyEl.textContent = '⚠️ ' + evt.data;
-          } else if (evt.type === 'done') {
-            bodyEl.classList.remove('cursor');
-            await refreshSessions();
+            activeStream.error = evt.data;
+            ensureStreamBubble();
           }
         }
+        if (!activeStream) break;
       }
-      if (firstToken) { bodyEl.classList.remove('thinking'); bodyEl.textContent = t('no_response'); }
     } catch (e) {
-      bodyEl.classList.remove('thinking', 'cursor');
-      bodyEl.textContent = '⚠️ ' + (e.message || t('backend_no_response'));
+      if (activeStream && e.name !== 'AbortError') {
+        activeStream.error = (e.message || t('backend_no_response'));
+      }
+    } finally {
+      if (activeStream && activeStream.sessionId === sid) {
+        activeStream.done = true;
+        if (activeStream.thinking && !activeStream.answer && !activeStream.error) {
+          activeStream.error = t('no_response');
+        }
+        ensureStreamBubble();
+        activeStream = null;
+      }
+      updateSendBtn();
+      refreshSessions();
     }
-
-    isLoading = false;
-    document.getElementById('sendBtn').disabled = false;
-    msgs.scrollTop = msgs.scrollHeight;
   }
 
   // ─── Documents ───────────────────────────────────────────────────────────────

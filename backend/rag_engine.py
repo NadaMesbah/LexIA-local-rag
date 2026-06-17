@@ -58,9 +58,12 @@ CHUNK_SIZE      = int(os.getenv("CHUNK_SIZE", "512"))
 CHUNK_OVERLAP   = int(os.getenv("CHUNK_OVERLAP", "64"))
 
 # Retrieval + reranking
-RETRIEVE_TOP_K  = int(os.getenv("RETRIEVE_TOP_K", "10"))   # wide candidate set
+RETRIEVE_TOP_K  = int(os.getenv("RETRIEVE_TOP_K", "5"))    # candidate set
 RERANK_TOP_N    = int(os.getenv("RERANK_TOP_N", "4"))      # kept after rerank
-RERANK_ENABLED  = os.getenv("RERANK_ENABLED", "true").lower() in ("1", "true", "yes")
+# Reranker OFF by default: it runs on CPU and adds noticeable latency to EVERY
+# message (incl. greetings) + a one-time ~2.2 GB download. Turn it on only if
+# you want maximum retrieval quality and can accept slower replies.
+RERANK_ENABLED  = os.getenv("RERANK_ENABLED", "false").lower() in ("1", "true", "yes")
 RERANK_MODEL    = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
 RERANK_DEVICE   = os.getenv("RERANK_DEVICE", "cpu")        # keep VRAM free for the LLM
 

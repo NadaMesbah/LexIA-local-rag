@@ -154,6 +154,19 @@ async def chat(session_id: str, req: ChatRequest):
     async def ndjson_stream():
         answer_parts: list[str] = []
         sources: list[dict] = []
+        saved = {"done": False}
+
+        def persist():
+            # Save the assistant message exactly once. Called both on normal
+            # completion AND in `finally`, so the answer is preserved even if
+            # the client disconnects / switches conversation mid-stream.
+            if saved["done"]:
+                return
+            ans = "".join(answer_parts).strip()
+            if ans:
+                db.add_message(session_id, "assistant", ans, json.dumps(sources))
+            saved["done"] = True
+
         try:
             async for kind, payload in rag.stream_chat(message, history):
                 if kind == "token":
@@ -164,11 +177,8 @@ async def chat(session_id: str, req: ChatRequest):
                     yield json.dumps({"type": "sources", "data": payload}) + "\n"
         except Exception as e:
             yield json.dumps({"type": "error", "data": str(e)}) + "\n"
-
-        # Persist the assistant message (with its sources) once complete.
-        answer = "".join(answer_parts).strip()
-        if answer:
-            db.add_message(session_id, "assistant", answer, json.dumps(sources))
+        finally:
+            persist()
 
         current = db.get_session(session_id)
         yield json.dumps(
