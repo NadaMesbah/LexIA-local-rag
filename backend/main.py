@@ -98,7 +98,7 @@ async def get_session(session_id: str):
     session = db.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found.")
-    messages = db.get_messages(session_id)
+    messages = db.get_active_path(session_id)
     for m in messages:
         if m.get("sources"):
             try:
@@ -122,7 +122,7 @@ async def autotitle_session(session_id: str):
     session = db.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found.")
-    messages = db.get_messages(session_id)
+    messages = db.get_active_path(session_id)
     first_user = next((m for m in messages if m["role"] == "user"), None)
     if not first_user:
         return {"title": session["title"]}
@@ -134,6 +134,14 @@ async def autotitle_session(session_id: str):
     return {"title": title}
 
 
+@app.post("/sessions/{session_id}/messages/{message_id}/select")
+async def select_version(session_id: str, message_id: str):
+    """Switch the active branch to a sibling version (ChatGPT-style edit history)."""
+    if not db.set_active_version(session_id, message_id):
+        raise HTTPException(status_code=404, detail="Message not found.")
+    return {"ok": True}
+
+
 @app.delete("/sessions/{session_id}")
 async def delete_session(session_id: str):
     if not db.delete_session(session_id):
@@ -141,9 +149,51 @@ async def delete_session(session_id: str):
     return {"message": "Session deleted."}
 
 
-def _derive_title(text: str) -> str:
-    text = " ".join(text.strip().split())
-    return (text[:48] + "…") if len(text) > 48 else (text or "Nouvelle conversation")
+def _turn_stream(session_id: str, fallback_title: str, user_content: str,
+                 history: list[dict], parent_id: Optional[str]):
+    """
+    Shared streaming generator for a conversation turn.
+
+    Creates the user message under `parent_id` (a new branch), streams the
+    assistant reply, and persists it as the user message's child — so the
+    answer is never lost even if the client disconnects mid-stream.
+    """
+    async def gen():
+        uid = db.add_message(session_id, "user", user_content, parent_id=parent_id)["id"]
+        answer_parts: list[str] = []
+        sources: list[dict] = []
+        saved = {"done": False}
+
+        def persist():
+            if saved["done"]:
+                return
+            ans = "".join(answer_parts).strip()
+            if ans:
+                db.add_message(session_id, "assistant", ans, parent_id=uid,
+                               sources=json.dumps(sources))
+            saved["done"] = True
+
+        try:
+            async for kind, payload in rag.stream_chat(user_content, history):
+                if kind == "token":
+                    answer_parts.append(payload)
+                    yield json.dumps({"type": "token", "data": payload}) + "\n"
+                elif kind == "sources":
+                    sources = payload
+                    yield json.dumps({"type": "sources", "data": payload}) + "\n"
+        except Exception as e:
+            yield json.dumps({"type": "error", "data": str(e)}) + "\n"
+        finally:
+            persist()
+
+        current = db.get_session(session_id)
+        yield json.dumps({
+            "type": "done",
+            "session_id": session_id,
+            "title": current["title"] if current else fallback_title,
+        }) + "\n"
+
+    return gen
 
 
 @app.post("/sessions/{session_id}/chat")
@@ -157,57 +207,42 @@ async def chat(session_id: str, req: ChatRequest):
     if not message:
         raise HTTPException(status_code=400, detail="Empty message.")
 
-    # History BEFORE this turn (multi-turn memory).
-    prior = db.get_messages(session_id)
-    history = [{"role": m["role"], "content": m["content"]} for m in prior]
+    path = db.get_active_path(session_id)
+    history = [{"role": m["role"], "content": m["content"]} for m in path]
+    parent_id = path[-1]["id"] if path else None
 
-    # Auto-name a brand-new conversation from its first message.
-    is_first = len(prior) == 0
+    gen = _turn_stream(session_id, session["title"], message, history, parent_id)
+    return StreamingResponse(gen(), media_type="application/x-ndjson")
 
-    # Persist the user message immediately.
-    db.add_message(session_id, "user", message)
-    if is_first:
-        db.rename_session(session_id, _derive_title(message))
 
-    async def ndjson_stream():
-        answer_parts: list[str] = []
-        sources: list[dict] = []
-        saved = {"done": False}
+@app.post("/sessions/{session_id}/messages/{message_id}/edit")
+async def edit_message(session_id: str, message_id: str, req: ChatRequest):
+    """
+    Edit a user message: create a new sibling branch with the new text and
+    regenerate the assistant reply (the old version is preserved as a sibling).
+    """
+    session = db.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found.")
 
-        def persist():
-            # Save the assistant message exactly once. Called both on normal
-            # completion AND in `finally`, so the answer is preserved even if
-            # the client disconnects / switches conversation mid-stream.
-            if saved["done"]:
-                return
-            ans = "".join(answer_parts).strip()
-            if ans:
-                db.add_message(session_id, "assistant", ans, json.dumps(sources))
-            saved["done"] = True
+    target = db.get_message(message_id)
+    if not target or target["session_id"] != session_id or target["role"] != "user":
+        raise HTTPException(status_code=404, detail="Editable user message not found.")
 
-        try:
-            async for kind, payload in rag.stream_chat(message, history):
-                if kind == "token":
-                    answer_parts.append(payload)
-                    yield json.dumps({"type": "token", "data": payload}) + "\n"
-                elif kind == "sources":
-                    sources = payload
-                    yield json.dumps({"type": "sources", "data": payload}) + "\n"
-        except Exception as e:
-            yield json.dumps({"type": "error", "data": str(e)}) + "\n"
-        finally:
-            persist()
+    content = (req.message or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty message.")
 
-        current = db.get_session(session_id)
-        yield json.dumps(
-            {
-                "type": "done",
-                "session_id": session_id,
-                "title": current["title"] if current else session["title"],
-            }
-        ) + "\n"
+    # History = active path up to (but not including) the edited message.
+    path = db.get_active_path(session_id)
+    history: list[dict] = []
+    for m in path:
+        if m["id"] == message_id:
+            break
+        history.append({"role": m["role"], "content": m["content"]})
 
-    return StreamingResponse(ndjson_stream(), media_type="application/x-ndjson")
+    gen = _turn_stream(session_id, session["title"], content, history, target["parent_id"])
+    return StreamingResponse(gen(), media_type="application/x-ndjson")
 
 
 # ─── Documents ─────────────────────────────────────────────────────────────
