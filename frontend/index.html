@@ -160,6 +160,24 @@
     .modal-btn.cancel:hover { background:var(--surface2); }
     .modal-btn.danger { background:rgba(224,82,82,.15); border-color:rgba(224,82,82,.4); color:#ff8585; }
     .modal-btn.danger:hover { background:rgba(224,82,82,.25); }
+
+    /* Per-code-block copy button */
+    .code-block { position:relative; }
+    .code-copy { position:absolute; top:6px; right:6px; width:26px; height:26px; display:inline-flex; align-items:center; justify-content:center; background:var(--surface); border:1px solid var(--border); color:var(--muted); border-radius:6px; cursor:pointer; opacity:0; transition:opacity .15s,border-color .15s,color .15s; }
+    .code-block:hover .code-copy { opacity:1; }
+    .code-copy:hover { border-color:var(--accent); color:var(--text); }
+    .code-copy.ok { color:var(--success); border-color:var(--success); }
+    .code-copy svg { width:13px; height:13px; display:block; }
+
+    /* Reply-to-selection */
+    .sel-reply { position:fixed; z-index:150; display:none; align-items:center; gap:6px; background:var(--accent2); color:#fff; border:none; border-radius:8px; padding:6px 12px; font-size:12px; font-family:var(--sans); cursor:pointer; box-shadow:0 4px 16px rgba(0,0,0,.45); }
+    .sel-reply:hover { background:var(--accent); }
+    .sel-reply svg { width:13px; height:13px; }
+    .reply-chip { display:flex; align-items:center; gap:8px; background:var(--surface2); border:1px solid var(--border2); border-left:3px solid var(--accent); border-radius:8px; padding:6px 10px; margin-bottom:8px; font-size:12px; color:var(--muted); }
+    .reply-chip-text { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .reply-chip-x { background:transparent; border:none; color:var(--muted); cursor:pointer; font-size:14px; line-height:1; }
+    .reply-chip-x:hover { color:var(--danger); }
+    .msg-quote { border-left:3px solid var(--accent); padding:4px 10px; margin:0 0 8px; color:var(--muted); font-size:13px; background:rgba(108,140,245,.06); border-radius:0 6px 6px 0; }
     .msg-body.thinking { display:flex; align-items:center; gap:6px; color:var(--muted); font-style:italic; }
     .cursor::after { content:'▋'; color:var(--accent); animation:blink 1s steps(2) infinite; }
     @keyframes blink { 0%,50%{opacity:1}50.01%,100%{opacity:0} }
@@ -218,6 +236,10 @@
   <main class="main">
     <div class="messages" id="messages"></div>
     <div class="input-bar">
+      <div class="reply-chip" id="replyChip" style="display:none;">
+        <span class="reply-chip-text" id="replyChipText"></span>
+        <button class="reply-chip-x" id="replyChipX" title="✕">✕</button>
+      </div>
       <div class="input-wrap">
         <textarea id="questionInput" data-i18n-ph="input_placeholder" placeholder="Posez votre question…" rows="1" onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
         <button class="send-btn" id="sendBtn" onclick="sendQuestion()" disabled>
@@ -249,6 +271,12 @@
     </div>
   </aside>
 </div>
+
+<!-- Floating "reply to selection" button -->
+<button class="sel-reply" id="selReply">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 17l-6-5 6-5"/><path d="M3 12h11a6 6 0 0 1 6 6v1"/></svg>
+  <span data-i18n="reply">Répondre</span>
+</button>
 
 <!-- Confirmation modal -->
 <div class="modal-overlay" id="modalOverlay">
@@ -294,7 +322,7 @@
       sources:'Sources',
       copy:'Copier', copied:'Copié', edit:'Modifier', copy_failed:'Échec de la copie',
       reply_ready:'Réponse prête : « {title} »',
-      delete:'Supprimer', cancel:'Annuler',
+      delete:'Supprimer', cancel:'Annuler', reply:'Répondre',
       searching:'Recherche dans la base…',
       no_response:'(aucune réponse)',
       greeting:"Bonjour 👋 Je suis votre assistant. Posez-moi une question, ou ajoutez des documents et je m'appuierai dessus pour vous répondre.",
@@ -332,7 +360,7 @@
       sources:'Sources',
       copy:'Copy', copied:'Copied', edit:'Edit', copy_failed:'Copy failed',
       reply_ready:'Reply ready: "{title}"',
-      delete:'Delete', cancel:'Cancel',
+      delete:'Delete', cancel:'Cancel', reply:'Reply',
       searching:'Searching the knowledge base…',
       no_response:'(no response)',
       greeting:"Hi 👋 I'm your assistant. Ask me anything, or add documents and I'll use them to answer.",
@@ -543,10 +571,24 @@
     const msgs = document.getElementById('messages');
     const el = document.createElement('div');
     el.className = 'msg user';
-    el.innerHTML = `<div class="msg-role">${escHtml(t('role_user'))}</div><div class="msg-body">${escHtml(text)}</div>`;
+    el.innerHTML = `<div class="msg-role">${escHtml(t('role_user'))}</div><div class="msg-body">${renderUserContent(text)}</div>`;
     el.appendChild(buildActions(text, true));
     msgs.appendChild(el);
     msgs.scrollTop = msgs.scrollHeight;
+  }
+
+  // User messages are literal, but leading "> " lines render as a quote block
+  // (used by the reply-to-selection feature).
+  function renderUserContent(text) {
+    const lines = escHtml(text == null ? '' : String(text)).split('\n');
+    let html = '', quote = [];
+    const flush = () => { if (quote.length) { html += '<div class="msg-quote">' + quote.join('<br>') + '</div>'; quote = []; } };
+    for (const l of lines) {
+      const m = l.match(/^&gt;\s?(.*)$/);
+      if (m) quote.push(m[1]); else { flush(); html += l + '<br>'; }
+    }
+    flush();
+    return html.replace(/<br>$/, '');
   }
 
   function appendAnswerMessage(answer, sources) {
@@ -638,7 +680,14 @@
     if (welcome) welcome.remove();
 
     input.value = ''; input.style.height = 'auto';
-    appendUserMessage(question);
+
+    // If the user is replying to a selected passage, prepend it as a quote.
+    let toSend = question;
+    if (replyQuote) {
+      toSend = '> ' + replyQuote.replace(/\n+/g, '\n> ') + '\n\n' + question;
+      clearReplyQuote();
+    }
+    appendUserMessage(toSend);
 
     const controller = new AbortController();
     activeStream = { sessionId: sid, answer: '', sources: [], done: false, error: null, thinking: true, controller };
@@ -649,7 +698,7 @@
     try {
       const res = await fetch(`${API}/sessions/${sid}/chat`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: question }), signal: controller.signal
+        body: JSON.stringify({ message: toSend }), signal: controller.signal
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
@@ -810,7 +859,11 @@
     let s = escHtml(src);
     const blocks = [];
     s = s.replace(/```[^\n]*\n?([\s\S]*?)```/g, (_, code) => {
-      blocks.push('<pre class="md-pre"><code>' + code.replace(/\n+$/, '') + '</code></pre>');
+      const c = code.replace(/\n+$/, '');
+      blocks.push(
+        '<div class="code-block"><button class="code-copy" type="button" title="' + t('copy') +
+        '">' + ICON_COPY + '</button><pre class="md-pre"><code>' + c + '</code></pre></div>'
+      );
       return '\u0000B' + (blocks.length - 1) + '\u0000';
     });
     s = s.replace(/`([^`\n]+)`/g, '<code class="md-code">$1</code>');
@@ -873,6 +926,56 @@
   });
   document.addEventListener('keydown', e => {
     if (e.key === 'Escape' && document.getElementById('modalOverlay').classList.contains('open')) closeModal(false);
+  });
+
+  // ─── Reply-to-selection + per-code-block copy ───────────────────────────────
+  let replyQuote = null;
+  let pendingQuote = null;
+
+  function clearReplyQuote() {
+    replyQuote = null;
+    document.getElementById('replyChip').style.display = 'none';
+  }
+  function setReplyQuote(text) {
+    replyQuote = text;
+    const chip = document.getElementById('replyChip');
+    document.getElementById('replyChipText').textContent = '❝ ' + text;
+    chip.style.display = 'flex';
+  }
+  document.getElementById('replyChipX').addEventListener('click', clearReplyQuote);
+
+  // Show a floating "reply" button when text inside an assistant message is selected.
+  const selReplyBtn = document.getElementById('selReply');
+  selReplyBtn.addEventListener('mousedown', e => e.preventDefault()); // keep the selection
+  selReplyBtn.addEventListener('click', () => {
+    if (pendingQuote) { setReplyQuote(pendingQuote); document.getElementById('questionInput').focus(); }
+    window.getSelection().removeAllRanges();
+    selReplyBtn.style.display = 'none';
+  });
+
+  document.addEventListener('mouseup', () => setTimeout(positionSelReply, 0));
+  document.addEventListener('scroll', () => { selReplyBtn.style.display = 'none'; }, true);
+
+  function positionSelReply() {
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || !sel.toString().trim()) { selReplyBtn.style.display = 'none'; return; }
+    const node = sel.anchorNode;
+    const host = node && (node.nodeType === 3 ? node.parentElement : node);
+    const body = host && host.closest && host.closest('.msg.assistant .msg-body');
+    if (!body) { selReplyBtn.style.display = 'none'; return; }
+    const rect = sel.getRangeAt(0).getBoundingClientRect();
+    pendingQuote = sel.toString().trim();
+    selReplyBtn.style.display = 'flex';
+    selReplyBtn.style.top = Math.max(8, rect.top - 40) + 'px';
+    selReplyBtn.style.left = Math.max(8, rect.left) + 'px';
+  }
+
+  // Per-code-block copy (event delegation on the messages container).
+  document.getElementById('messages').addEventListener('click', e => {
+    const btn = e.target.closest('.code-copy');
+    if (!btn) return;
+    const code = btn.parentElement.querySelector('code');
+    if (code) copyText(code.textContent, btn);
   });
 
   init();
