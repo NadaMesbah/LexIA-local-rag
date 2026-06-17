@@ -116,6 +116,24 @@ async def rename_session(session_id: str, req: RenameSessionRequest):
     return {"message": "Session renamed.", "title": req.title}
 
 
+@app.post("/sessions/{session_id}/autotitle")
+async def autotitle_session(session_id: str):
+    """Generate a short, LLM-written title from the conversation's first message."""
+    session = db.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    messages = db.get_messages(session_id)
+    first_user = next((m for m in messages if m["role"] == "user"), None)
+    if not first_user:
+        return {"title": session["title"]}
+
+    import asyncio
+    loop = asyncio.get_event_loop()
+    title = await loop.run_in_executor(None, rag.generate_title, first_user["content"])
+    db.rename_session(session_id, title)
+    return {"title": title}
+
+
 @app.delete("/sessions/{session_id}")
 async def delete_session(session_id: str):
     if not db.delete_session(session_id):
