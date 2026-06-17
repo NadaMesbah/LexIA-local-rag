@@ -1,23 +1,33 @@
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-python-multipart==0.0.9
-pydantic==2.8.2
+# ── Web framework ──────────────────────────────────────────────────────────
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+pydantic==2.10.4
 
-# LlamaIndex core + integrations
-llama-index-core==0.11.0
-llama-index-llms-ollama==0.3.0
-llama-index-embeddings-ollama==0.3.0
-llama-index-vector-stores-milvus==0.2.0
+# ── LlamaIndex core + integrations ───────────────────────────────────────────
+# Pinned to the 0.12.x line (mutually compatible).
+llama-index-core==0.12.11
+llama-index-llms-ollama==0.5.0
+llama-index-embeddings-ollama==0.5.0
+llama-index-vector-stores-chroma==0.4.1
+llama-index-readers-file==0.4.3
 
-# Document readers
-llama-index-readers-file==0.2.0
-pypdf==4.3.1
-python-docx==1.1.2
+# ── Reranker (cross-encoder) ──────────────────────────────────────────────────
+# Pulls in sentence-transformers + torch (CPU). Used for bge-reranker-v2-m3.
+llama-index-postprocessor-sbert-rerank==0.3.0
+
+# ── Vector store ──────────────────────────────────────────────────────────────
+chromadb==0.5.23
+
+# ── Document parsing ──────────────────────────────────────────────────────────
+# These are the exact backends LlamaIndex's SimpleDirectoryReader uses:
+#   .pdf  -> pypdf      .docx -> docx2txt
+#   .csv/.xlsx -> pandas (+ openpyxl for .xlsx)    .txt/.md -> built-in
+pypdf==5.1.0
+docx2txt==0.8
+pandas==2.2.3
 openpyxl==3.1.5
 
-# Milvus client
-pymilvus==2.4.5
-
-# Utilities
+# ── Utilities ─────────────────────────────────────────────────────────────────
 python-dotenv==1.0.1
 aiofiles==24.1.0

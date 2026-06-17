@@ -1,23 +1,45 @@
 """
-RAG Local - Backend API
-FastAPI server for the persistent knowledge base RAG system.
+RAG Local — Backend API (FastAPI).
+
+Endpoints:
+  GET    /                       status + KB stats
+  GET    /health                 liveness probe
+
+  POST   /sessions               create a chat session
+  GET    /sessions               list sessions (most recent first)
+  GET    /sessions/{id}          session + full message history
+  PATCH  /sessions/{id}          rename a session
+  DELETE /sessions/{id}          delete a session (+ its messages)
+  POST   /sessions/{id}/chat     ask a question (streaming NDJSON, with memory)
+
+  POST   /upload                 add a document to the knowledge base
+  GET    /documents              list indexed documents
+  DELETE /documents/{name}       remove a document (+ its vectors)
+  DELETE /reset                  wipe the entire knowledge base
+
+The chat endpoint streams newline-delimited JSON (NDJSON). Each line is one of:
+  {"type":"token",   "data":"<text>"}
+  {"type":"sources", "data":[ ... ]}
+  {"type":"done",    "session_id":"...", "title":"..."}
+  {"type":"error",   "data":"<message>"}
 """
 
 import os
+import json
 import shutil
 import tempfile
 from pathlib import Path
 from typing import Optional
-import asyncio
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from rag_engine import RAGEngine
+import db
+from rag_engine import RAGEngine, SUPPORTED_EXTS
 
-app = FastAPI(title="RAG Local API", version="1.0.0")
+app = FastAPI(title="RAG Local API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,86 +48,158 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Single global RAG engine instance — knowledge base persists in Milvus
+# Initialise persistence + the (single) RAG engine on startup.
+db.init_db()
 rag = RAGEngine()
 
 
 # ─── Models ──────────────────────────────────────────────────────────────────
 
-class QueryRequest(BaseModel):
-    question: str
-    top_k: Optional[int] = 5
-
-class QueryResponse(BaseModel):
-    answer: str
-    sources: list[dict]
-
-class StatusResponse(BaseModel):
-    status: str
-    doc_count: int
-    collection_name: str
+class CreateSessionRequest(BaseModel):
+    title: Optional[str] = None
 
 
-# ─── Routes ──────────────────────────────────────────────────────────────────
+class RenameSessionRequest(BaseModel):
+    title: str
 
-@app.get("/", response_model=StatusResponse)
+
+class ChatRequest(BaseModel):
+    message: str
+
+
+# ─── Status ──────────────────────────────────────────────────────────────────
+
+@app.get("/")
 async def root():
-    """Health check + knowledge base status."""
     info = rag.get_status()
+    info["total_documents"] = len(db.list_documents())
     return info
 
 
-@app.post("/query", response_model=QueryResponse)
-async def query(req: QueryRequest):
-    """
-    Ask a question against the persistent knowledge base.
-    No document upload needed — uses pre-indexed docs.
-    """
-    if not rag.is_ready():
-        raise HTTPException(
-            status_code=503,
-            detail="Knowledge base is empty. Add documents first via /upload."
-        )
-    result = await rag.query(req.question, top_k=req.top_k)
-    return result
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 
-@app.post("/query/stream")
-async def query_stream(req: QueryRequest):
-    """Streaming version of /query — tokens arrive progressively."""
-    if not rag.is_ready():
-        raise HTTPException(status_code=503, detail="Knowledge base is empty.")
+# ─── Sessions ──────────────────────────────────────────────────────────────
 
-    async def token_generator():
-        async for token in rag.query_stream(req.question, top_k=req.top_k):
-            yield token
+@app.post("/sessions")
+async def create_session(req: CreateSessionRequest):
+    return db.create_session(req.title)
 
-    return StreamingResponse(token_generator(), media_type="text/plain")
 
+@app.get("/sessions")
+async def list_sessions():
+    return {"sessions": db.list_sessions()}
+
+
+@app.get("/sessions/{session_id}")
+async def get_session(session_id: str):
+    session = db.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    messages = db.get_messages(session_id)
+    for m in messages:
+        if m.get("sources"):
+            try:
+                m["sources"] = json.loads(m["sources"])
+            except Exception:
+                m["sources"] = []
+    session["messages"] = messages
+    return session
+
+
+@app.patch("/sessions/{session_id}")
+async def rename_session(session_id: str, req: RenameSessionRequest):
+    if not db.rename_session(session_id, req.title):
+        raise HTTPException(status_code=404, detail="Session not found or empty title.")
+    return {"message": "Session renamed.", "title": req.title}
+
+
+@app.delete("/sessions/{session_id}")
+async def delete_session(session_id: str):
+    if not db.delete_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found.")
+    return {"message": "Session deleted."}
+
+
+def _derive_title(text: str) -> str:
+    text = " ".join(text.strip().split())
+    return (text[:48] + "…") if len(text) > 48 else (text or "Nouvelle conversation")
+
+
+@app.post("/sessions/{session_id}/chat")
+async def chat(session_id: str, req: ChatRequest):
+    """Session-aware, streaming RAG chat with conversation memory."""
+    session = db.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found.")
+
+    message = (req.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Empty message.")
+
+    # History BEFORE this turn (multi-turn memory).
+    prior = db.get_messages(session_id)
+    history = [{"role": m["role"], "content": m["content"]} for m in prior]
+
+    # Auto-name a brand-new conversation from its first message.
+    is_first = len(prior) == 0
+
+    # Persist the user message immediately.
+    db.add_message(session_id, "user", message)
+    if is_first:
+        db.rename_session(session_id, _derive_title(message))
+
+    async def ndjson_stream():
+        answer_parts: list[str] = []
+        sources: list[dict] = []
+        try:
+            async for kind, payload in rag.stream_chat(message, history):
+                if kind == "token":
+                    answer_parts.append(payload)
+                    yield json.dumps({"type": "token", "data": payload}) + "\n"
+                elif kind == "sources":
+                    sources = payload
+                    yield json.dumps({"type": "sources", "data": payload}) + "\n"
+        except Exception as e:
+            yield json.dumps({"type": "error", "data": str(e)}) + "\n"
+
+        # Persist the assistant message (with its sources) once complete.
+        answer = "".join(answer_parts).strip()
+        if answer:
+            db.add_message(session_id, "assistant", answer, json.dumps(sources))
+
+        current = db.get_session(session_id)
+        yield json.dumps(
+            {
+                "type": "done",
+                "session_id": session_id,
+                "title": current["title"] if current else session["title"],
+            }
+        ) + "\n"
+
+    return StreamingResponse(ndjson_stream(), media_type="application/x-ndjson")
+
+
+# ─── Documents ─────────────────────────────────────────────────────────────
 
 @app.post("/upload")
 async def upload_document(file: UploadFile = File(...)):
-    """
-    Upload a new document to permanently add to the knowledge base.
-    Supported: PDF, TXT, DOCX, MD, CSV
-    """
-    allowed = {".pdf", ".txt", ".docx", ".md", ".csv"}
     suffix = Path(file.filename).suffix.lower()
-
-    if suffix not in allowed:
+    if suffix not in SUPPORTED_EXTS:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported file type '{suffix}'. Allowed: {', '.join(allowed)}"
+            detail=f"Unsupported file type '{suffix}'. Allowed: {', '.join(sorted(SUPPORTED_EXTS))}",
         )
 
-    # Save to a temp file then ingest
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        content = await file.read()
-        tmp.write(content)
+        shutil.copyfileobj(file.file, tmp)
         tmp_path = tmp.name
 
     try:
         result = await rag.ingest_document(tmp_path, original_name=file.filename)
+        db.upsert_document(file.filename, result["chunks"])
         return {
             "message": f"Document '{file.filename}' indexed successfully.",
             "chunks_added": result["chunks"],
@@ -117,37 +211,22 @@ async def upload_document(file: UploadFile = File(...)):
         os.unlink(tmp_path)
 
 
-@app.post("/ingest-folder")
-async def ingest_folder(folder_path: str = "./docs"):
-    """
-    Bulk-ingest an entire folder into the knowledge base.
-    Use this once to seed the KB from your existing documents.
-    """
-    result = await rag.ingest_folder(folder_path)
-    return result
-
-
 @app.get("/documents")
 async def list_documents():
-    """List all documents currently in the knowledge base."""
-    return rag.list_documents()
+    return {"documents": db.list_documents()}
 
 
 @app.delete("/documents/{doc_name}")
 async def delete_document(doc_name: str):
-    """Remove a document and all its chunks from the knowledge base."""
-    success = rag.delete_document(doc_name)
-    if not success:
+    if not db.document_exists(doc_name):
         raise HTTPException(status_code=404, detail=f"Document '{doc_name}' not found.")
+    rag.delete_document(doc_name)
+    db.delete_document(doc_name)
     return {"message": f"Document '{doc_name}' removed from knowledge base."}
 
 
 @app.delete("/reset")
 async def reset_knowledge_base():
-    """⚠️ Wipe the entire knowledge base. Irreversible."""
     rag.reset()
+    db.clear_documents()
     return {"message": "Knowledge base has been reset."}
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
