@@ -64,6 +64,7 @@ COLLECTION_NAME = os.getenv("COLLECTION_NAME", "rag_knowledge_base")
 CONTEXT_WINDOW  = int(os.getenv("CONTEXT_WINDOW", "8192"))
 NUM_OUTPUT      = int(os.getenv("NUM_OUTPUT", "1024"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "600"))
+TEMPERATURE     = float(os.getenv("TEMPERATURE", "0.3"))   # low = focused, less drift
 
 # Chunking — paragraph/sentence-aware splitting
 CHUNK_SIZE      = int(os.getenv("CHUNK_SIZE", "512"))
@@ -85,14 +86,12 @@ MEMORY_TOKEN_LIMIT = int(os.getenv("MEMORY_TOKEN_LIMIT", "3000"))
 SUPPORTED_EXTS = {".pdf", ".txt", ".docx", ".md", ".csv", ".xlsx"}
 
 SYSTEM_PROMPT = (
-    "You are a friendly, helpful AI assistant for a private knowledge base. "
-    "Behave like a normal conversational assistant: greet the user, make small talk, "
-    "and answer general questions naturally. "
-    "When the user's question relates to their documents, ground your answer in the "
-    "context provided below and cite the document names. If the relevant information "
-    "is not in the context, say so honestly instead of inventing facts — but you may "
-    "still answer general-knowledge or conversational questions normally. "
-    "Always reply in the SAME LANGUAGE the user used. Be clear, concise and well structured."
+    "You are a precise, helpful assistant for a private knowledge base. "
+    "Answer the user's question using the context provided below, and mention the "
+    "document name(s) you relied on. If the context does NOT contain the answer, say "
+    "clearly that you couldn't find it in the documents — do NOT invent or guess. "
+    "CRITICAL: reply ENTIRELY in the SAME LANGUAGE the user used, and never switch to "
+    "another language in the middle of your answer. Be clear, concise and structured."
 )
 
 # Context block injected into the system message on each turn (may be empty
@@ -108,23 +107,24 @@ CONTEXT_TEMPLATE = (
 
 # Prompt for plain conversation (no document retrieval).
 CONV_SYSTEM_PROMPT = (
-    "You are a friendly, helpful AI assistant. Chat naturally: greet the user, "
-    "answer general questions, help with reasoning, coding and explanations. "
-    "Always reply in the SAME LANGUAGE the user used. Be clear and concise."
+    "You are a friendly, helpful AI assistant. Chat naturally and answer clearly. "
+    "CRITICAL: reply ENTIRELY in the SAME LANGUAGE the user used, and never switch to "
+    "another language in the middle of your answer. Be concise."
 )
 
 # Router prompt: decides if a message needs the private documents.
+# Biased toward YES so real questions are never answered without the documents.
 ROUTER_PROMPT = (
-    "You are a routing classifier for an assistant that can search the user's "
-    "private uploaded documents.\n"
-    "Decide whether answering the user's LAST message requires those documents.\n"
-    "Answer NO for greetings, small talk, thanks, general knowledge, coding, math, "
-    "definitions — anything answerable without their specific files.\n"
-    "Answer YES only when the message is about the content of their documents or "
-    "clearly needs information that would live in their uploaded files.\n"
+    "Decide whether a user message should trigger a search in the user's private "
+    "uploaded documents.\n"
+    "Reply NO ONLY for pure greetings, thanks or social small talk "
+    "(e.g. 'bonjour', 'merci', 'how are you', 'ok').\n"
+    "Reply YES for ANY real question, request or task — especially anything that "
+    "mentions a project, file, topic, or asks to explain / summarize / list / analyze / "
+    "describe something. When unsure, reply YES.\n"
     "Reply with exactly one word: YES or NO.\n\n"
     "{conversation}"
-    "User: {message}\n"
+    "Message: {message}\n"
     "Answer:"
 )
 
@@ -158,8 +158,10 @@ class RAGEngine:
             base_url=OLLAMA_BASE_URL,
             request_timeout=REQUEST_TIMEOUT,
             context_window=CONTEXT_WINDOW,
-            # keep the model warm so we don't pay reload latency between turns
-            additional_kwargs={"keep_alive": "30m"},
+            temperature=TEMPERATURE,
+            keep_alive="30m",   # keep the model warm between turns
+            # lower top_p + a repeat penalty reduce rambling and language drift
+            additional_kwargs={"top_p": 0.9, "repeat_penalty": 1.1},
         )
         Settings.embed_model = OllamaEmbedding(
             model_name=EMBED_MODEL,

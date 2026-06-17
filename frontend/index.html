@@ -127,6 +127,16 @@
     .msg.user .msg-actions { justify-content:flex-end; }
     .msg-action { background:transparent; border:1px solid var(--border); color:var(--muted); font-size:11px; font-family:var(--mono); padding:3px 9px; border-radius:5px; cursor:pointer; transition:border-color .15s,color .15s; user-select:none; }
     .msg-action:hover { border-color:var(--accent); color:var(--text); }
+    /* Markdown rendering inside assistant messages */
+    .msg-body.md { white-space:normal; }
+    .msg-body.md strong { font-weight:600; color:#fff; }
+    .msg-body.md em { font-style:italic; }
+    .md-list { margin:6px 0 6px 22px; }
+    .md-list li { margin:3px 0; }
+    .md-h { font-weight:600; margin:10px 0 4px; color:#fff; }
+    .md-code { background:var(--surface2); border:1px solid var(--border); border-radius:4px; padding:1px 5px; font-family:var(--mono); font-size:12.5px; }
+    .md-pre { background:var(--surface2); border:1px solid var(--border); border-radius:8px; padding:10px 12px; overflow-x:auto; margin:8px 0; }
+    .md-pre code { font-family:var(--mono); font-size:12.5px; background:none; border:none; padding:0; }
     .msg-body.thinking { display:flex; align-items:center; gap:6px; color:var(--muted); font-style:italic; }
     .cursor::after { content:'▋'; color:var(--accent); animation:blink 1s steps(2) infinite; }
     @keyframes blink { 0%,50%{opacity:1}50.01%,100%{opacity:0} }
@@ -484,7 +494,7 @@
     } else if (activeStream.thinking && !activeStream.answer) {
       el.innerHTML = role + `<div class="msg-body thinking"><div class="dots"><span></span><span></span><span></span></div>${escHtml(t('searching'))}</div>`;
     } else {
-      el.innerHTML = role + `<div class="msg-body${activeStream.done ? '' : ' cursor'}">${escHtml(activeStream.answer)}</div>` + renderSourcesHtml(activeStream.sources);
+      el.innerHTML = role + `<div class="msg-body md${activeStream.done ? '' : ' cursor'}">${renderMarkdown(activeStream.answer)}</div>` + renderSourcesHtml(activeStream.sources);
     }
     if (activeStream.done && !activeStream.error && activeStream.answer) {
       el.appendChild(buildActions(activeStream.answer, false));
@@ -508,7 +518,7 @@
     const el = document.createElement('div');
     el.className = 'msg assistant';
     el.innerHTML = `<div class="msg-role">${escHtml(t('role_assistant'))}</div>
-      <div class="msg-body">${escHtml(answer)}</div>${renderSourcesHtml(sources)}`;
+      <div class="msg-body md">${renderMarkdown(answer)}</div>${renderSourcesHtml(sources)}`;
     el.appendChild(buildActions(answer, false));
     msgs.appendChild(el);
     msgs.scrollTop = msgs.scrollHeight;
@@ -739,6 +749,37 @@
   // ─── Utils ───────────────────────────────────────────────────────────────────
   function escHtml(str) {
     return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  // Minimal, safe Markdown renderer (escapes first, then applies a subset:
+  // code blocks, inline code, bold, italic, headings, ordered/unordered lists).
+  function renderMarkdown(src) {
+    let s = escHtml(src == null ? '' : String(src));
+    const blocks = [];
+    s = s.replace(/```[^\n]*\n?([\s\S]*?)```/g, (_, code) => {
+      blocks.push('<pre class="md-pre"><code>' + code.replace(/\n+$/, '') + '</code></pre>');
+      return '\u0000B' + (blocks.length - 1) + '\u0000';
+    });
+    s = s.replace(/`([^`\n]+)`/g, '<code class="md-code">$1</code>');
+    s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    s = s.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+    s = s.replace(/(^|[^*])\*(?!\s)([^*\n]+?)\*/g, '$1<em>$2</em>');
+    const out = [];
+    let list = null;
+    const close = () => { if (list) { out.push('</' + list + '>'); list = null; } };
+    for (const raw of s.split('\n')) {
+      let m;
+      if ((m = raw.match(/^\s*#{1,6}\s+(.*)$/))) { close(); out.push('<div class="md-h">' + m[1] + '</div>'); }
+      else if ((m = raw.match(/^\s*\d+[.)]\s+(.*)$/))) { if (list !== 'ol') { close(); out.push('<ol class="md-list">'); list = 'ol'; } out.push('<li>' + m[1] + '</li>'); }
+      else if ((m = raw.match(/^\s*[-*+]\s+(.*)$/))) { if (list !== 'ul') { close(); out.push('<ul class="md-list">'); list = 'ul'; } out.push('<li>' + m[1] + '</li>'); }
+      else { close(); out.push(raw); }
+    }
+    close();
+    let html = out.join('\n').replace(/\u0000B(\d+)\u0000/g, (_, i) => blocks[i]);
+    html = html.replace(/\n/g, '<br>');
+    html = html.replace(/(<\/(?:ul|ol|li|pre|div)>)<br>/g, '$1');
+    html = html.replace(/<br>(<(?:ul|ol|pre|div|li))/g, '$1');
+    return html;
   }
   function escAttr(str) { return String(str).replace(/'/g,"\\'").replace(/"/g,'&quot;'); }
 
