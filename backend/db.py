@@ -86,20 +86,40 @@ def init_db() -> None:
                 chunks      INTEGER NOT NULL DEFAULT 0,
                 created_at  REAL NOT NULL
             );
-
-            CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
-            CREATE INDEX IF NOT EXISTS idx_messages_parent  ON messages(parent_id);
             """
         )
-        # Migrate older databases that predate the tree columns.
+        # Migrate older databases that predate the tree columns. This MUST run
+        # before creating any index that references the new columns.
         scols = _columns(conn, "sessions")
         if "active_root_id" not in scols:
             conn.execute("ALTER TABLE sessions ADD COLUMN active_root_id TEXT")
         mcols = _columns(conn, "messages")
-        if "parent_id" not in mcols:
+        added_parent = "parent_id" not in mcols
+        if added_parent:
             conn.execute("ALTER TABLE messages ADD COLUMN parent_id TEXT")
         if "active_child_id" not in mcols:
             conn.execute("ALTER TABLE messages ADD COLUMN active_child_id TEXT")
+
+        # Legacy flat conversations: link each session's messages into a single
+        # chain (preserve order) so they display correctly under the tree model.
+        if added_parent:
+            for srow in conn.execute("SELECT id FROM sessions").fetchall():
+                sid = srow["id"]
+                ids = [r["id"] for r in conn.execute(
+                    "SELECT id FROM messages WHERE session_id=? ORDER BY created_at ASC", (sid,)
+                ).fetchall()]
+                prev = None
+                for mid in ids:
+                    conn.execute("UPDATE messages SET parent_id=? WHERE id=?", (prev, mid))
+                    if prev is not None:
+                        conn.execute("UPDATE messages SET active_child_id=? WHERE id=?", (mid, prev))
+                    prev = mid
+                if ids:
+                    conn.execute("UPDATE sessions SET active_root_id=? WHERE id=?", (ids[0], sid))
+
+        # Indexes (safe now that the columns are guaranteed to exist).
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_id)")
 
 
 # ─── Sessions ──────────────────────────────────────────────────────────────
