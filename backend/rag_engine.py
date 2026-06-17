@@ -70,12 +70,25 @@ MEMORY_TOKEN_LIMIT = int(os.getenv("MEMORY_TOKEN_LIMIT", "3000"))
 SUPPORTED_EXTS = {".pdf", ".txt", ".docx", ".md", ".csv", ".xlsx"}
 
 SYSTEM_PROMPT = (
-    "You are a precise, helpful assistant for a private knowledge base. "
-    "Answer using ONLY the information in the provided context when the question "
-    "concerns the documents. If the answer is not in the context, say so clearly "
-    "instead of inventing facts. "
-    "Always reply in the SAME LANGUAGE the user used in their question. "
-    "Be concise, structured, and cite document names when relevant."
+    "You are a friendly, helpful AI assistant for a private knowledge base. "
+    "Behave like a normal conversational assistant: greet the user, make small talk, "
+    "and answer general questions naturally. "
+    "When the user's question relates to their documents, ground your answer in the "
+    "context provided below and cite the document names. If the relevant information "
+    "is not in the context, say so honestly instead of inventing facts — but you may "
+    "still answer general-knowledge or conversational questions normally. "
+    "Always reply in the SAME LANGUAGE the user used. Be clear, concise and well structured."
+)
+
+# Context block injected into the system message on each turn (may be empty
+# when the knowledge base has no relevant content — that's fine, the assistant
+# then just chats normally).
+CONTEXT_TEMPLATE = (
+    "Voici des extraits potentiellement pertinents de la base de connaissance "
+    "(ils peuvent être vides ou hors-sujet — utilise-les seulement s'ils aident) :\n"
+    "---------------------\n"
+    "{context_str}\n"
+    "---------------------"
 )
 
 
@@ -175,12 +188,20 @@ class RAGEngine:
 
         postprocessors = [self._reranker] if self._reranker else []
 
+        # "context" chat engine = conversational RAG:
+        #   * retrieves relevant chunks for the latest message
+        #   * injects them into the system message (CONTEXT_TEMPLATE)
+        #   * calls the LLM with the full chat history (memory)
+        # Unlike "condense_plus_context", it does NOT force every message into a
+        # standalone document query, so greetings / small talk work normally and
+        # we never get the "Empty Response" placeholder on an empty knowledge base.
         return self._index.as_chat_engine(
-            chat_mode="condense_plus_context",
+            chat_mode="context",
             memory=memory,
             similarity_top_k=RETRIEVE_TOP_K,
             node_postprocessors=postprocessors,
             system_prompt=SYSTEM_PROMPT,
+            context_template=CONTEXT_TEMPLATE,
             streaming=True,
         )
 
