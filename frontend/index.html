@@ -576,6 +576,7 @@
 
     if (!currentSessionId) { await newSession(); if (!currentSessionId) return; }
     const sid = currentSessionId;
+    const firstTurn = !document.querySelector('#messages .msg.user'); // no user message yet
 
     const welcome = document.querySelector('#messages .welcome');
     if (welcome) welcome.remove();
@@ -650,7 +651,12 @@
         }
       }
       updateSendBtn();
-      refreshSessions();
+      await refreshSessions();
+      // After the first exchange, ask the backend for a concise generated title.
+      if (firstTurn) {
+        fetch(`${API}/sessions/${sid}/autotitle`, { method: 'POST' })
+          .then(() => refreshSessions()).catch(() => {});
+      }
     }
   }
 

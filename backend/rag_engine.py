@@ -39,6 +39,17 @@ from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.llms.ollama import Ollama
 from llama_index.embeddings.ollama import OllamaEmbedding
 
+# ── Compatibility shim ───────────────────────────────────────────────────────
+# Some llama-index-llms-ollama versions set additional_kwargs["tool_calls"]=None.
+# llama-index-core's is_function() then calls len(None) and crashes during
+# streaming ("object of type 'NoneType' has no len()"). Make it None-safe.
+import llama_index.core.chat_engine.types as _chat_types  # noqa: E402
+
+def _safe_is_function(message) -> bool:
+    return bool(getattr(message, "additional_kwargs", {}).get("tool_calls"))
+
+_chat_types.is_function = _safe_is_function
+
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -115,6 +126,15 @@ ROUTER_PROMPT = (
     "{conversation}"
     "User: {message}\n"
     "Answer:"
+)
+
+# Prompt to generate a short conversation title.
+TITLE_PROMPT = (
+    "Generate a very short, descriptive title for a conversation that starts with "
+    "the user message below. Rules: 3 to 6 words, no surrounding quotes, no trailing "
+    "punctuation, and write it in the SAME LANGUAGE as the message.\n\n"
+    "Message: {message}\n\n"
+    "Title:"
 )
 
 
@@ -222,6 +242,18 @@ class RAGEngine:
             memory=memory,
             system_prompt=CONV_SYSTEM_PROMPT,
         )
+
+    def generate_title(self, message: str) -> str:
+        """Make a short, human-friendly conversation title from the first message."""
+        fallback = " ".join((message or "").split())[:48] or "Conversation"
+        try:
+            resp = Settings.llm.complete(TITLE_PROMPT.format(message=(message or "")[:500]))
+            title = (resp.text or "").strip().strip('"').strip()
+            title = title.splitlines()[0][:60] if title else ""
+            return title or fallback
+        except Exception as e:
+            print(f"[RAG] title generation error ({e})")
+            return fallback
 
     def _should_use_docs(self, message: str, history: list[dict]) -> bool:
         """Fast YES/NO: does this message actually need the private documents?"""
