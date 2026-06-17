@@ -1,1 +1,10 @@
+# Local config (use .env.example as the template)
 .env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Local data (Chroma vectors, SQLite, model cache) — lives in Docker volume
+data/
