@@ -35,6 +35,7 @@ from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.llms import ChatMessage, MessageRole
 from llama_index.core.memory import ChatMemoryBuffer
 from llama_index.core.chat_engine import SimpleChatEngine
+from llama_index.core.postprocessor import SimilarityPostprocessor
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.llms.ollama import Ollama
 from llama_index.embeddings.ollama import OllamaEmbedding
@@ -77,6 +78,9 @@ RERANK_TOP_N    = int(os.getenv("RERANK_TOP_N", "4"))      # kept after rerank
 # message (incl. greetings) + a one-time ~2.2 GB download. Turn it on only if
 # you want maximum retrieval quality and can accept slower replies.
 RERANK_ENABLED  = os.getenv("RERANK_ENABLED", "false").lower() in ("1", "true", "yes")
+# Minimum similarity for a chunk to count as "relevant". Below this, the question
+# is treated as general → answered without documents and WITHOUT sources.
+RELEVANCE_CUTOFF = float(os.getenv("RELEVANCE_CUTOFF", "0.6"))
 RERANK_MODEL    = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
 RERANK_DEVICE   = os.getenv("RERANK_DEVICE", "cpu")        # keep VRAM free for the LLM
 
@@ -227,7 +231,9 @@ class RAGEngine:
 
     def _build_doc_engine(self, memory):
         """Conversational RAG: retrieves doc chunks and answers grounded in them."""
-        postprocessors = [self._reranker] if self._reranker else []
+        postprocessors = [SimilarityPostprocessor(similarity_cutoff=RELEVANCE_CUTOFF)]
+        if self._reranker:
+            postprocessors.append(self._reranker)
         return self._index.as_chat_engine(
             chat_mode="context",
             memory=memory,
@@ -237,6 +243,19 @@ class RAGEngine:
             context_template=CONTEXT_TEMPLATE,
             streaming=True,
         )
+
+    def _relevant_nodes(self, message: str):
+        """Retrieve and keep only chunks above the relevance cutoff (may be empty)."""
+        try:
+            retriever = self._index.as_retriever(similarity_top_k=RETRIEVE_TOP_K)
+            nodes = retriever.retrieve(message)
+            nodes = SimilarityPostprocessor(
+                similarity_cutoff=RELEVANCE_CUTOFF
+            ).postprocess_nodes(nodes)
+            return nodes
+        except Exception as e:
+            print(f"[RAG] retrieval check error ({e})")
+            return []
 
     def _build_chat_only_engine(self, memory):
         """Plain conversation: NO retrieval (greetings, small talk, general questions)."""
@@ -277,18 +296,26 @@ class RAGEngine:
         Async generator yielding ("token", str) events, then a final
         ("sources", list[dict]) event.
 
-        Smart routing: the documents are searched ONLY when the question needs
-        them. Greetings / small talk / general questions are answered instantly
-        with no retrieval and no sources.
+        Routing:
+          1. Greetings / small talk -> plain chat, no retrieval, no sources.
+          2. Otherwise, retrieve and check relevance:
+             - relevant chunks found -> grounded answer + sources
+             - nothing relevant (e.g. general knowledge not in the docs) ->
+               plain chat answer, NO sources.
         """
         loop = asyncio.get_event_loop()
 
-        use_docs = False
+        relevant = []
         if self.doc_count() > 0:
-            use_docs = await loop.run_in_executor(
+            wants_docs = await loop.run_in_executor(
                 None, self._should_use_docs, message, history
             )
+            if wants_docs:
+                relevant = await loop.run_in_executor(
+                    None, self._relevant_nodes, message
+                )
 
+        use_docs = len(relevant) > 0
         memory = self._memory(history)
         engine = self._build_doc_engine(memory) if use_docs else self._build_chat_only_engine(memory)
 

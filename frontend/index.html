@@ -6,6 +6,14 @@
   <title>RAG Local — Base de Connaissance</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+  <script>
+    window.MathJax = {
+      tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]'], ['$$', '$$']] },
+      options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] },
+      startup: { typeset: false }
+    };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -125,8 +133,10 @@
     .msg-actions { display:flex; gap:6px; margin-top:6px; opacity:0; transition:opacity .15s; }
     .msg:hover .msg-actions { opacity:1; }
     .msg.user .msg-actions { justify-content:flex-end; }
-    .msg-action { background:transparent; border:1px solid var(--border); color:var(--muted); font-size:11px; font-family:var(--mono); padding:3px 9px; border-radius:5px; cursor:pointer; transition:border-color .15s,color .15s; user-select:none; }
+    .msg-action { display:inline-flex; align-items:center; justify-content:center; width:28px; height:28px; padding:0; background:transparent; border:1px solid var(--border); color:var(--muted); border-radius:6px; cursor:pointer; transition:border-color .15s,color .15s; }
     .msg-action:hover { border-color:var(--accent); color:var(--text); }
+    .msg-action.ok { color:var(--success); border-color:var(--success); }
+    .msg-action svg { display:block; width:14px; height:14px; }
     /* Markdown rendering inside assistant messages */
     .msg-body.md { white-space:normal; }
     .msg-body.md strong { font-weight:600; color:#fff; }
@@ -137,6 +147,19 @@
     .md-code { background:var(--surface2); border:1px solid var(--border); border-radius:4px; padding:1px 5px; font-family:var(--mono); font-size:12.5px; }
     .md-pre { background:var(--surface2); border:1px solid var(--border); border-radius:8px; padding:10px 12px; overflow-x:auto; margin:8px 0; }
     .md-pre code { font-family:var(--mono); font-size:12.5px; background:none; border:none; padding:0; }
+    .msg-body.md mjx-container { margin:2px 0; }
+    .msg-body.md mjx-container[display="true"] { margin:10px 0; overflow-x:auto; overflow-y:hidden; }
+
+    /* Confirmation modal */
+    .modal-overlay { position:fixed; inset:0; background:rgba(0,0,0,.55); backdrop-filter:blur(2px); display:none; align-items:center; justify-content:center; z-index:200; }
+    .modal-overlay.open { display:flex; animation:fadeIn .15s ease; }
+    .modal { background:var(--surface); border:1px solid var(--border2); border-radius:14px; padding:22px; width:340px; max-width:90vw; box-shadow:0 16px 48px rgba(0,0,0,.5); }
+    .modal-msg { font-size:14px; line-height:1.6; margin-bottom:20px; }
+    .modal-actions { display:flex; gap:10px; justify-content:flex-end; }
+    .modal-btn { padding:8px 16px; border-radius:8px; font-family:var(--sans); font-size:13px; cursor:pointer; border:1px solid var(--border2); background:transparent; color:var(--text); transition:background .15s,border-color .15s; }
+    .modal-btn.cancel:hover { background:var(--surface2); }
+    .modal-btn.danger { background:rgba(224,82,82,.15); border-color:rgba(224,82,82,.4); color:#ff8585; }
+    .modal-btn.danger:hover { background:rgba(224,82,82,.25); }
     .msg-body.thinking { display:flex; align-items:center; gap:6px; color:var(--muted); font-style:italic; }
     .cursor::after { content:'▋'; color:var(--accent); animation:blink 1s steps(2) infinite; }
     @keyframes blink { 0%,50%{opacity:1}50.01%,100%{opacity:0} }
@@ -227,6 +250,17 @@
   </aside>
 </div>
 
+<!-- Confirmation modal -->
+<div class="modal-overlay" id="modalOverlay">
+  <div class="modal">
+    <div class="modal-msg" id="modalMsg"></div>
+    <div class="modal-actions">
+      <button class="modal-btn cancel" id="modalCancel">Annuler</button>
+      <button class="modal-btn danger" id="modalConfirm">Supprimer</button>
+    </div>
+  </div>
+</div>
+
 <script>
   const API = '/api';
   let activeStream = null; // single in-flight generation: {sessionId, answer, sources, done, error, thinking, controller}
@@ -260,6 +294,7 @@
       sources:'Sources',
       copy:'Copier', copied:'Copié', edit:'Modifier', copy_failed:'Échec de la copie',
       reply_ready:'Réponse prête : « {title} »',
+      delete:'Supprimer', cancel:'Annuler',
       searching:'Recherche dans la base…',
       no_response:'(aucune réponse)',
       greeting:"Bonjour 👋 Je suis votre assistant. Posez-moi une question, ou ajoutez des documents et je m'appuierai dessus pour vous répondre.",
@@ -297,6 +332,7 @@
       sources:'Sources',
       copy:'Copy', copied:'Copied', edit:'Edit', copy_failed:'Copy failed',
       reply_ready:'Reply ready: "{title}"',
+      delete:'Delete', cancel:'Cancel',
       searching:'Searching the knowledge base…',
       no_response:'(no response)',
       greeting:"Hi 👋 I'm your assistant. Ask me anything, or add documents and I'll use them to answer.",
@@ -427,7 +463,7 @@
 
   async function deleteSession(id, ev) {
     ev.stopPropagation();
-    if (!confirm(t('confirm_del_session'))) return;
+    if (!(await showConfirm(t('confirm_del_session')))) return;
     // Abort an in-flight generation that belongs to the session being deleted.
     if (activeStream && activeStream.sessionId === id) {
       try { activeStream.controller.abort(); } catch (e) {}
@@ -499,7 +535,7 @@
     if (activeStream.done && !activeStream.error && activeStream.answer) {
       el.appendChild(buildActions(activeStream.answer, false));
     }
-    if (activeStream.done) el.removeAttribute('id'); // becomes a normal message
+    if (activeStream.done) { el.removeAttribute('id'); typesetMath(el); } // becomes a normal message
     msgs.scrollTop = msgs.scrollHeight;
   }
 
@@ -521,22 +557,29 @@
       <div class="msg-body md">${renderMarkdown(answer)}</div>${renderSourcesHtml(sources)}`;
     el.appendChild(buildActions(answer, false));
     msgs.appendChild(el);
+    typesetMath(el);
     msgs.scrollTop = msgs.scrollHeight;
   }
 
-  // Copy (all messages) + Edit (user messages) action row.
+  // Copy (all messages) + Edit (user messages) icon actions.
+  const ICON_COPY = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>';
+  const ICON_CHECK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>';
+  const ICON_EDIT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>';
+
   function buildActions(text, isUser) {
     const row = document.createElement('div');
     row.className = 'msg-actions';
     const copyBtn = document.createElement('button');
     copyBtn.className = 'msg-action';
-    copyBtn.textContent = t('copy');
+    copyBtn.innerHTML = ICON_COPY;
+    copyBtn.title = t('copy');
     copyBtn.onclick = () => copyText(text, copyBtn);
     row.appendChild(copyBtn);
     if (isUser) {
       const editBtn = document.createElement('button');
       editBtn.className = 'msg-action';
-      editBtn.textContent = t('edit');
+      editBtn.innerHTML = ICON_EDIT;
+      editBtn.title = t('edit');
       editBtn.onclick = () => editMessage(text);
       row.appendChild(editBtn);
     }
@@ -544,12 +587,15 @@
   }
 
   function copyText(text, btn) {
-    const done = () => { const old = btn.textContent; btn.textContent = t('copied'); setTimeout(() => { btn.textContent = old; }, 1500); };
+    const ok = () => {
+      btn.classList.add('ok'); btn.innerHTML = ICON_CHECK; btn.title = t('copied');
+      setTimeout(() => { btn.classList.remove('ok'); btn.innerHTML = ICON_COPY; btn.title = t('copy'); }, 1500);
+    };
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text).then(done).catch(() => showToast(t('copy_failed'), 'error'));
+      navigator.clipboard.writeText(text).then(ok).catch(() => showToast(t('copy_failed'), 'error'));
     } else {
       const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta);
-      ta.select(); try { document.execCommand('copy'); done(); } catch (e) { showToast(t('copy_failed'), 'error'); }
+      ta.select(); try { document.execCommand('copy'); ok(); } catch (e) { showToast(t('copy_failed'), 'error'); }
       ta.remove();
     }
   }
@@ -703,7 +749,7 @@
   }
 
   async function deleteDoc(name) {
-    if (!confirm(t('confirm_del_doc', { name }))) return;
+    if (!(await showConfirm(t('confirm_del_doc', { name })))) return;
     try {
       await fetch(`${API}/documents/${encodeURIComponent(name)}`, { method: 'DELETE' });
       showToast(t('toast_deleted', { name }), 'success');
@@ -751,10 +797,17 @@
     return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
 
-  // Minimal, safe Markdown renderer (escapes first, then applies a subset:
-  // code blocks, inline code, bold, italic, headings, ordered/unordered lists).
+  // Minimal, safe Markdown renderer. Math (\(..\), \[..\], $$..$$) is extracted
+  // first so neither escaping nor markdown corrupts it; MathJax typesets it after.
   function renderMarkdown(src) {
-    let s = escHtml(src == null ? '' : String(src));
+    src = src == null ? '' : String(src);
+    const math = [];
+    const stash = (mm) => { math.push(mm.replace(/\s*\n\s*/g, ' ')); return '\u0000M' + (math.length - 1) + '\u0000'; };
+    src = src.replace(/\\\[[\s\S]*?\\\]/g, stash);
+    src = src.replace(/\$\$[\s\S]*?\$\$/g, stash);
+    src = src.replace(/\\\([\s\S]*?\\\)/g, stash);
+
+    let s = escHtml(src);
     const blocks = [];
     s = s.replace(/```[^\n]*\n?([\s\S]*?)```/g, (_, code) => {
       blocks.push('<pre class="md-pre"><code>' + code.replace(/\n+$/, '') + '</code></pre>');
@@ -776,10 +829,17 @@
     }
     close();
     let html = out.join('\n').replace(/\u0000B(\d+)\u0000/g, (_, i) => blocks[i]);
+    html = html.replace(/\u0000M(\d+)\u0000/g, (_, i) => math[i]); // restore raw math for MathJax
     html = html.replace(/\n/g, '<br>');
     html = html.replace(/(<\/(?:ul|ol|li|pre|div)>)<br>/g, '$1');
     html = html.replace(/<br>(<(?:ul|ol|pre|div|li))/g, '$1');
     return html;
+  }
+
+  function typesetMath(el) {
+    if (window.MathJax && window.MathJax.typesetPromise) {
+      window.MathJax.typesetPromise(el ? [el] : undefined).catch(() => {});
+    }
   }
   function escAttr(str) { return String(str).replace(/'/g,"\\'").replace(/"/g,'&quot;'); }
 
@@ -790,6 +850,30 @@
     document.body.appendChild(el);
     setTimeout(() => el.remove(), 4000);
   }
+
+  // ─── Confirmation modal ───────────────────────────────────────────────────
+  let _modalResolve = null;
+  function showConfirm(message) {
+    return new Promise(resolve => {
+      _modalResolve = resolve;
+      document.getElementById('modalMsg').textContent = message;
+      document.getElementById('modalConfirm').textContent = t('delete');
+      document.getElementById('modalCancel').textContent = t('cancel');
+      document.getElementById('modalOverlay').classList.add('open');
+    });
+  }
+  function closeModal(result) {
+    document.getElementById('modalOverlay').classList.remove('open');
+    if (_modalResolve) { _modalResolve(result); _modalResolve = null; }
+  }
+  document.getElementById('modalConfirm').addEventListener('click', () => closeModal(true));
+  document.getElementById('modalCancel').addEventListener('click', () => closeModal(false));
+  document.getElementById('modalOverlay').addEventListener('click', e => {
+    if (e.target.id === 'modalOverlay') closeModal(false);
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && document.getElementById('modalOverlay').classList.contains('open')) closeModal(false);
+  });
 
   init();
 </script>
