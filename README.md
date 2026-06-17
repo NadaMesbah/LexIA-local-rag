@@ -46,7 +46,7 @@ docker compose up --build
 Open **http://localhost:3000**.
 
 > First chat with reranking enabled downloads the reranker (~2.2 GB) into the
-> `rag_data` volume. Subsequent runs are instant.
+> `rag_data` volume. (Reranking is off by default.)
 
 ## Usage
 1. Upload documents (right panel). They are chunked, embedded and stored permanently.
@@ -55,9 +55,12 @@ Open **http://localhost:3000**.
 3. Conversations and documents persist across restarts.
 
 ## Tuning for your hardware (8 GB VRAM)
-- Qwen 2.5 7B (Q4) + bge-m3 fit in 8 GB with the reranker kept on **CPU** (default).
+- Qwen 2.5 7B (Q4) + bge-m3 fit in 8 GB.
+- The cross-encoder **reranker is OFF by default** for fast, normal-assistant
+  responsiveness (it runs on CPU and adds latency to every message). Turn it on
+  with `RERANK_ENABLED=true` (and raise `RETRIEVE_TOP_K=10`) for higher retrieval
+  quality at the cost of slower replies + a one-time ~2.2 GB model download.
 - If you hit VRAM pressure: set `LLM_MODEL=qwen2.5:3b` in `.env`.
-- For maximum speed (lower quality): `RERANK_ENABLED=false`.
 
 ## Verify it's working
 ```bash
