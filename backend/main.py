@@ -149,17 +149,14 @@ async def delete_session(session_id: str):
     return {"message": "Session deleted."}
 
 
-def _turn_stream(session_id: str, fallback_title: str, user_content: str,
-                 history: list[dict], parent_id: Optional[str]):
+def _reply_generator(session_id: str, fallback_title: str, parent_user_id: str,
+                     user_content: str, history: list[dict]):
     """
-    Shared streaming generator for a conversation turn.
-
-    Creates the user message under `parent_id` (a new branch), streams the
-    assistant reply, and persists it as the user message's child — so the
-    answer is never lost even if the client disconnects mid-stream.
+    Stream an assistant reply as a child of an EXISTING user message and persist
+    it (the answer survives a client disconnect via the `finally` block). Shared
+    by chat, edit and regenerate.
     """
     async def gen():
-        uid = db.add_message(session_id, "user", user_content, parent_id=parent_id)["id"]
         answer_parts: list[str] = []
         sources: list[dict] = []
         saved = {"done": False}
@@ -169,7 +166,7 @@ def _turn_stream(session_id: str, fallback_title: str, user_content: str,
                 return
             ans = "".join(answer_parts).strip()
             if ans:
-                db.add_message(session_id, "assistant", ans, parent_id=uid,
+                db.add_message(session_id, "assistant", ans, parent_id=parent_user_id,
                                sources=json.dumps(sources))
             saved["done"] = True
 
@@ -196,13 +193,21 @@ def _turn_stream(session_id: str, fallback_title: str, user_content: str,
     return gen
 
 
+def _history_before(session_id: str, message_id: str) -> list[dict]:
+    history: list[dict] = []
+    for m in db.get_active_path(session_id):
+        if m["id"] == message_id:
+            break
+        history.append({"role": m["role"], "content": m["content"]})
+    return history
+
+
 @app.post("/sessions/{session_id}/chat")
 async def chat(session_id: str, req: ChatRequest):
     """Session-aware, streaming RAG chat with conversation memory."""
     session = db.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found.")
-
     message = (req.message or "").strip()
     if not message:
         raise HTTPException(status_code=400, detail="Empty message.")
@@ -210,8 +215,9 @@ async def chat(session_id: str, req: ChatRequest):
     path = db.get_active_path(session_id)
     history = [{"role": m["role"], "content": m["content"]} for m in path]
     parent_id = path[-1]["id"] if path else None
+    uid = db.add_message(session_id, "user", message, parent_id=parent_id)["id"]
 
-    gen = _turn_stream(session_id, session["title"], message, history, parent_id)
+    gen = _reply_generator(session_id, session["title"], uid, message, history)
     return StreamingResponse(gen(), media_type="application/x-ndjson")
 
 
@@ -224,24 +230,34 @@ async def edit_message(session_id: str, message_id: str, req: ChatRequest):
     session = db.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found.")
-
     target = db.get_message(message_id)
     if not target or target["session_id"] != session_id or target["role"] != "user":
         raise HTTPException(status_code=404, detail="Editable user message not found.")
-
     content = (req.message or "").strip()
     if not content:
         raise HTTPException(status_code=400, detail="Empty message.")
 
-    # History = active path up to (but not including) the edited message.
-    path = db.get_active_path(session_id)
-    history: list[dict] = []
-    for m in path:
-        if m["id"] == message_id:
-            break
-        history.append({"role": m["role"], "content": m["content"]})
+    history = _history_before(session_id, message_id)
+    uid = db.add_message(session_id, "user", content, parent_id=target["parent_id"])["id"]
+    gen = _reply_generator(session_id, session["title"], uid, content, history)
+    return StreamingResponse(gen(), media_type="application/x-ndjson")
 
-    gen = _turn_stream(session_id, session["title"], content, history, target["parent_id"])
+
+@app.post("/sessions/{session_id}/messages/{message_id}/regenerate")
+async def regenerate_message(session_id: str, message_id: str):
+    """
+    (Re)generate the assistant reply to a user message. Recovers an interrupted
+    answer, or creates a fresh variant (new assistant branch).
+    """
+    session = db.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    target = db.get_message(message_id)
+    if not target or target["session_id"] != session_id or target["role"] != "user":
+        raise HTTPException(status_code=404, detail="User message not found.")
+
+    history = _history_before(session_id, message_id)
+    gen = _reply_generator(session_id, session["title"], message_id, target["content"], history)
     return StreamingResponse(gen(), media_type="application/x-ndjson")
 
 
