@@ -278,6 +278,7 @@ def get_active_path(session_id: str) -> list[dict]:
         sib_ids = [s["id"] for s in sibs]
         path.append({
             "id": cur["id"],
+            "parent_id": cur["parent_id"],
             "role": cur["role"],
             "content": cur["content"],
             "sources": cur["sources"],
