@@ -771,6 +771,10 @@
     if (!userId || (activeStream && !activeStream.done)) return;
     const sid = currentSessionId;
     const dp = document.getElementById('regenPrompt'); if (dp) dp.remove();
+    // Replace the current reply in place: drop the existing answer (and anything
+    // after it) so the regenerated one streams where the old one was.
+    const userEl = document.querySelector(`.msg[data-id="${userId}"]`);
+    if (userEl) { while (userEl.nextElementSibling) userEl.nextElementSibling.remove(); }
     await runStream(`${API}/sessions/${sid}/messages/${userId}/regenerate`, {}, sid, {});
   }
 
