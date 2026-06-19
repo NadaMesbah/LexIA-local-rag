@@ -50,6 +50,7 @@ def create_access_token(user: dict) -> str:
     payload = {
         "sub": user["id"],
         "username": user["username"],
+        "email": user.get("email", ""),
         "role": user["role"],
         "exp": int(time.time()) + JWT_TTL_SECONDS,
     }
@@ -60,14 +61,18 @@ def ensure_default_admin() -> None:
     """Seed an admin account and adopt any pre-auth data (idempotent)."""
     username = os.getenv("ADMIN_USERNAME", "admin")
     password = os.getenv("ADMIN_PASSWORD", "admin")
+    email = os.getenv("ADMIN_EMAIL", "admin@local.host").strip()
     existing = db.get_user_by_username(username)
     if existing:
         admin_id = existing["id"]
+        # Backfill the admin email on databases created before email login.
+        if email and not (existing.get("email") or "").strip():
+            db.set_user_email(admin_id, email)
     else:
         admin = db.create_user(username, hash_password(password), role="admin",
-                               first_name="Admin", last_name="")
+                               first_name="Admin", last_name="", email=email)
         admin_id = admin["id"]
-        print(f"[AUTH] Seeded admin user '{username}'.")
+        print(f"[AUTH] Seeded admin user '{username}' (login email: {email}).")
         if os.getenv("ADMIN_PASSWORD") is None:
             print("[AUTH] WARNING: default admin password 'admin' in use — set ADMIN_PASSWORD.")
     # Adopt legacy (pre-auth) sessions/documents so they remain reachable.
@@ -78,6 +83,7 @@ def _public(user: dict) -> dict:
     return {
         "id": user["id"],
         "username": user["username"],
+        "email": user.get("email", ""),
         "first_name": user.get("first_name", ""),
         "last_name": user.get("last_name", ""),
         "role": user["role"],

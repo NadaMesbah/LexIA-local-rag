@@ -78,23 +78,26 @@ async function asAuth(res: Response): Promise<AuthResponse> {
 }
 
 // ─── Auth ────────────────────────────────────────────────────────────────────
-export const login = (username: string, password: string) =>
+export const login = (email: string, password: string) =>
   fetch(`${API_BASE}/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username, password }),
+    body: JSON.stringify({ email, password }),
   }).then(asAuth);
 
 export interface RegisterInput {
   first_name: string;
   last_name: string;
   username: string;
+  email: string;
   password: string;
 }
 
 // Registration creates the account but does NOT log in — the UI sends the user
 // to the sign-in screen afterwards.
-export const register = async (data: RegisterInput): Promise<{ ok: boolean; username: string }> => {
+export const register = async (
+  data: RegisterInput
+): Promise<{ ok: boolean; username: string; email: string }> => {
   const res = await fetch(`${API_BASE}/auth/register`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

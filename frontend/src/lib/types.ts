@@ -3,6 +3,7 @@ export type Role = 'admin' | 'user';
 export interface User {
   id: string;
   username: string;
+  email?: string;
   first_name?: string;
   last_name?: string;
   role: Role;
@@ -58,7 +59,9 @@ export interface DocumentVersion {
   chunks: number;
   error: string | null;
   uploaded_at: number;
-  stored_path?: string | null;
+  // True when the original file was stored and can be downloaded. Versions that
+  // predate file storage have no original on disk and are not downloadable.
+  downloadable?: boolean;
 }
 
 export interface DocumentItem {

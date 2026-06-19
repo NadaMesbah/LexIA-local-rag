@@ -299,10 +299,25 @@ export default function DocumentsPage() {
       field: 'actions', headerName: '', width: 180, sortable: false, filterable: false, align: 'right',
       renderCell: (p) => {
         const manageable = isAdmin || p.row.scope === 'personal';
+        const canDownload = p.row.doc.latest?.downloadable ?? false;
         const downloadBtn = (
-          <Tooltip title="Télécharger">
-            <IconButton size="small" onClick={() => handleDownload(p.row.doc)}
-              sx={{ '&:hover': { color: 'primary.main' } }}><DownloadRoundedIcon fontSize="small" /></IconButton>
+          <Tooltip
+            title={
+              canDownload
+                ? 'Télécharger'
+                : 'Original non disponible — re-téléversez ce document pour activer le téléchargement.'
+            }
+          >
+            <span>
+              <IconButton
+                size="small"
+                disabled={!canDownload}
+                onClick={() => handleDownload(p.row.doc)}
+                sx={{ '&:hover': { color: 'primary.main' } }}
+              >
+                <DownloadRoundedIcon fontSize="small" />
+              </IconButton>
+            </span>
           </Tooltip>
         );
         if (tab === 'trash') {
@@ -433,11 +448,19 @@ export default function DocumentsPage() {
             {versions.map((v) => (
               <ListItem key={v.id} secondaryAction={
                 <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-                  <Tooltip title="Télécharger cette version">
-                    <IconButton edge="end" size="small"
-                      onClick={() => historyDoc && handleDownloadVersion(historyDoc, v)}>
-                      <DownloadRoundedIcon fontSize="small" />
-                    </IconButton>
+                  <Tooltip
+                    title={
+                      v.downloadable
+                        ? 'Télécharger cette version'
+                        : 'Original non disponible (version antérieure au stockage des fichiers).'
+                    }
+                  >
+                    <span>
+                      <IconButton edge="end" size="small" disabled={!v.downloadable}
+                        onClick={() => historyDoc && handleDownloadVersion(historyDoc, v)}>
+                        <DownloadRoundedIcon fontSize="small" />
+                      </IconButton>
+                    </span>
                   </Tooltip>
                   {v.is_latest ? (
                     <Chip label="Actuelle" color="primary" size="small" sx={{ fontWeight: 700 }} />

@@ -98,10 +98,14 @@ def _strip_inline_sources(text: str) -> str:
     return _INLINE_SOURCES_RE.sub("", text).rstrip()
 
 
+# Pragmatic email validation (used at registration). Good enough for a local app.
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
 # ─── Models ──────────────────────────────────────────────────────────────────
 
 class LoginRequest(BaseModel):
-    username: str
+    email: str
     password: str
 
 
@@ -109,6 +113,7 @@ class RegisterRequest(BaseModel):
     first_name: str
     last_name: str
     username: str
+    email: str
     password: str
 
 
@@ -172,12 +177,14 @@ def _manageable_document(document_id: str, user: dict) -> dict:
 
 @app.post("/auth/login")
 async def login(req: LoginRequest):
-    user = db.get_user_by_username(req.username.strip())
+    email = (req.email or "").strip()
+    user = db.get_user_by_email(email)
     if not user or not auth.verify_password(req.password, user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid username or password.")
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
     pub = {
         "id": user["id"],
         "username": user["username"],
+        "email": user.get("email", ""),
         "first_name": user.get("first_name", ""),
         "last_name": user.get("last_name", ""),
         "role": user["role"],
@@ -189,22 +196,27 @@ async def login(req: LoginRequest):
 async def register(req: RegisterRequest):
     """Create a regular user account. Does NOT log in — the client redirects to
     the sign-in screen afterwards. There is exactly one admin (seeded from env);
-    self-registration always creates the `user` role."""
+    self-registration always creates the `user` role. Login is by email."""
     first_name = req.first_name.strip()
     last_name = req.last_name.strip()
     username = req.username.strip()
+    email = (req.email or "").strip()
     password = req.password
     if not first_name or not last_name:
         raise HTTPException(status_code=400, detail="First and last name are required.")
     if len(username) < 3:
         raise HTTPException(status_code=400, detail="Username must be at least 3 characters.")
+    if not _EMAIL_RE.match(email):
+        raise HTTPException(status_code=400, detail="A valid email address is required.")
     if len(password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
     if db.get_user_by_username(username):
         raise HTTPException(status_code=409, detail="Username already taken.")
+    if db.get_user_by_email(email):
+        raise HTTPException(status_code=409, detail="Email already registered.")
     db.create_user(username, auth.hash_password(password), role="user",
-                   first_name=first_name, last_name=last_name)
-    return {"ok": True, "username": username}
+                   first_name=first_name, last_name=last_name, email=email)
+    return {"ok": True, "username": username, "email": email}
 
 
 @app.get("/auth/me")
