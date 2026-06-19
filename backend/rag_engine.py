@@ -20,6 +20,7 @@ Design notes:
 """
 
 import os
+import re
 import asyncio
 from typing import Optional
 
@@ -65,7 +66,7 @@ COLLECTION_NAME = os.getenv("COLLECTION_NAME", "rag_knowledge_base")
 CONTEXT_WINDOW  = int(os.getenv("CONTEXT_WINDOW", "8192"))
 NUM_OUTPUT      = int(os.getenv("NUM_OUTPUT", "1024"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "600"))
-TEMPERATURE     = float(os.getenv("TEMPERATURE", "0.3"))   # low = focused, less drift
+TEMPERATURE     = float(os.getenv("TEMPERATURE", "0.2"))   # low = focused, less language drift
 
 # Chunking — paragraph/sentence-aware splitting
 CHUNK_SIZE      = int(os.getenv("CHUNK_SIZE", "512"))
@@ -142,6 +143,69 @@ TITLE_PROMPT = (
 )
 
 
+# ─── Language lock (prevents Qwen from drifting into Chinese) ─────────────────
+_CJK = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
+_JP = re.compile(r"[\u3040-\u30ff]")
+_KR = re.compile(r"[\uac00-\ud7af]")
+_AR = re.compile(r"[\u0600-\u06ff]")
+_CYR = re.compile(r"[\u0400-\u04ff]")
+_FR_ACC = re.compile(r"[àâçéèêëîïôûùüœ]")
+_ES_ACC = re.compile(r"[ñ¿¡]")
+
+
+def _detect_language(text: str) -> Optional[str]:
+    """Best-effort language guess from a short message (script + stopwords)."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    if _CJK.search(t):
+        return "Chinese"
+    if _JP.search(t):
+        return "Japanese"
+    if _KR.search(t):
+        return "Korean"
+    if _AR.search(t):
+        return "Arabic"
+    if _CYR.search(t):
+        return "Russian"
+    low = " " + t.lower() + " "
+    fr = sum(m in low for m in (
+        " le ", " la ", " les ", " un ", " une ", " des ", " du ", " et ", " est ",
+        " que ", " qui ", " pour ", " avec ", " vous ", " je ", " tu ", " ne ", " pas ",
+        " bonjour ", " salut ", " merci ", " quoi ", " pourquoi ", " comment ", " quel ",
+        " quelle ", " ça ", " c'est ", " explique ", " résume ",
+    )) + len(_FR_ACC.findall(low)) * 2
+    es = sum(m in low for m in (
+        " el ", " los ", " las ", " una ", " uno ", " que ", " por ", " para ", " con ",
+        " como ", " qué ", " hola ", " gracias ", " usted ", " es ", " está ", " pero ",
+        " muy ", " explica ",
+    )) + len(_ES_ACC.findall(low)) * 2
+    en = sum(m in low for m in (
+        " the ", " is ", " are ", " you ", " what ", " why ", " how ", " please ",
+        " hello ", " hi ", " thanks ", " and ", " to ", " of ", " in ", " for ", " with ",
+        " this ", " that ", " do ", " does ", " explain ", " summarize ",
+    ))
+    best = max((fr, "French"), (es, "Spanish"), (en, "English"), key=lambda x: x[0])
+    return best[1] if best[0] > 0 else None
+
+
+def _language_directive(text: str) -> str:
+    """A hard instruction appended to the system prompt to lock the output language."""
+    lang = _detect_language(text)
+    if lang == "Chinese":
+        return ""  # the user genuinely wrote Chinese
+    if lang:
+        return (
+            f"\n\nABSOLUTE RULE — LANGUAGE: The user is writing in {lang}. Write your "
+            f"ENTIRE answer in {lang} only. Do NOT output any Chinese characters and do "
+            f"NOT switch to another language. This rule overrides everything else."
+        )
+    return (
+        "\n\nABSOLUTE RULE — LANGUAGE: Reply only in the exact same language as the "
+        "user's message. Do NOT output any Chinese characters and do NOT switch languages."
+    )
+
+
 class RAGEngine:
     """Persistent, session-aware RAG engine."""
 
@@ -164,8 +228,9 @@ class RAGEngine:
             context_window=CONTEXT_WINDOW,
             temperature=TEMPERATURE,
             keep_alive="30m",   # keep the model warm between turns
-            # lower top_p + a repeat penalty reduce rambling and language drift
-            additional_kwargs={"top_p": 0.9, "repeat_penalty": 1.1},
+            # Tight sampling + repeat penalty curb rambling and Qwen's tendency
+            # to code-switch into Chinese on short prompts.
+            additional_kwargs={"top_p": 0.85, "top_k": 40, "repeat_penalty": 1.15},
         )
         Settings.embed_model = OllamaEmbedding(
             model_name=EMBED_MODEL,
@@ -229,7 +294,7 @@ class RAGEngine:
             chat_history=chat_history, token_limit=MEMORY_TOKEN_LIMIT
         )
 
-    def _build_doc_engine(self, memory):
+    def _build_doc_engine(self, memory, lang_directive: str = ""):
         """Conversational RAG: retrieves doc chunks and answers grounded in them."""
         postprocessors = [SimilarityPostprocessor(similarity_cutoff=RELEVANCE_CUTOFF)]
         if self._reranker:
@@ -239,7 +304,7 @@ class RAGEngine:
             memory=memory,
             similarity_top_k=RETRIEVE_TOP_K,
             node_postprocessors=postprocessors,
-            system_prompt=SYSTEM_PROMPT,
+            system_prompt=SYSTEM_PROMPT + lang_directive,
             context_template=CONTEXT_TEMPLATE,
             streaming=True,
         )
@@ -257,18 +322,21 @@ class RAGEngine:
             print(f"[RAG] retrieval check error ({e})")
             return []
 
-    def _build_chat_only_engine(self, memory):
+    def _build_chat_only_engine(self, memory, lang_directive: str = ""):
         """Plain conversation: NO retrieval (greetings, small talk, general questions)."""
         return SimpleChatEngine.from_defaults(
             memory=memory,
-            system_prompt=CONV_SYSTEM_PROMPT,
+            system_prompt=CONV_SYSTEM_PROMPT + lang_directive,
         )
 
     def generate_title(self, message: str) -> str:
         """Make a short, human-friendly conversation title from the first message."""
         fallback = " ".join((message or "").split())[:48] or "Conversation"
         try:
-            resp = Settings.llm.complete(TITLE_PROMPT.format(message=(message or "")[:500]))
+            prompt = _language_directive(message) + "\n\n" + TITLE_PROMPT.format(
+                message=(message or "")[:500]
+            )
+            resp = Settings.llm.complete(prompt.strip())
             title = (resp.text or "").strip().strip('"').strip()
             title = title.splitlines()[0][:60] if title else ""
             return title or fallback
@@ -317,7 +385,12 @@ class RAGEngine:
 
         use_docs = len(relevant) > 0
         memory = self._memory(history)
-        engine = self._build_doc_engine(memory) if use_docs else self._build_chat_only_engine(memory)
+        lang_directive = _language_directive(message)
+        engine = (
+            self._build_doc_engine(memory, lang_directive)
+            if use_docs
+            else self._build_chat_only_engine(memory, lang_directive)
+        )
 
         streaming_response = await loop.run_in_executor(
             None, lambda: engine.stream_chat(message)
