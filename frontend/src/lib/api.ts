@@ -1,16 +1,54 @@
 import type {
+  AuthResponse,
   DocumentItem,
   DocumentVersion,
   SessionDetail,
   SessionSummary,
   Status,
   StreamEvent,
+  User,
 } from './types';
 
 export const API_BASE =
   process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, '') || 'http://localhost:8000';
 
+// ─── Auth token storage + 401 handling ──────────────────────────────────────
+const TOKEN_KEY = 'rag_token';
+
+export const getToken = (): string | null =>
+  typeof window !== 'undefined' ? window.localStorage.getItem(TOKEN_KEY) : null;
+export const setToken = (t: string) => {
+  if (typeof window !== 'undefined') window.localStorage.setItem(TOKEN_KEY, t);
+};
+export const clearToken = () => {
+  if (typeof window !== 'undefined') window.localStorage.removeItem(TOKEN_KEY);
+};
+
+let unauthorizedHandler: (() => void) | null = null;
+export const setUnauthorizedHandler = (fn: (() => void) | null) => {
+  unauthorizedHandler = fn;
+};
+
+// Called when a protected request returns 401: drop the token and bounce to login.
+function handleUnauthorized() {
+  clearToken();
+  if (unauthorizedHandler) {
+    unauthorizedHandler();
+  } else if (typeof window !== 'undefined' && window.location.pathname !== '/login') {
+    window.location.href = '/login';
+  }
+}
+
+function authHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  const t = getToken();
+  return t ? { ...extra, Authorization: `Bearer ${t}` } : extra;
+}
+
 async function asJson<T>(res: Response): Promise<T> {
+  if (res.status === 401) {
+    handleUnauthorized();
+    throw new Error('Session expirée — veuillez vous reconnecter.');
+  }
   if (!res.ok) {
     let detail = `HTTP ${res.status}`;
     try {
@@ -24,75 +62,141 @@ async function asJson<T>(res: Response): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+// Parse a public auth response WITHOUT triggering the 401 redirect (so a wrong
+// password shows an inline error on the login screen instead of bouncing).
+async function asAuth(res: Response): Promise<AuthResponse> {
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      detail = (await res.json())?.detail || detail;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(detail);
+  }
+  return res.json() as Promise<AuthResponse>;
+}
+
+// ─── Auth ────────────────────────────────────────────────────────────────────
+export const login = (username: string, password: string) =>
+  fetch(`${API_BASE}/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  }).then(asAuth);
+
+export const register = (username: string, password: string) =>
+  fetch(`${API_BASE}/auth/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  }).then(asAuth);
+
+export const me = () =>
+  fetch(`${API_BASE}/auth/me`, { headers: authHeaders() }).then((r) => asJson<User>(r));
+
 // ─── Status ────────────────────────────────────────────────────────────────
-export const getStatus = () => fetch(`${API_BASE}/`).then((r) => asJson<Status>(r));
+export const getStatus = () =>
+  fetch(`${API_BASE}/`).then((r) => asJson<Status>(r));
 
 // ─── Sessions ──────────────────────────────────────────────────────────────
 export const listSessions = () =>
-  fetch(`${API_BASE}/sessions`).then((r) => asJson<{ sessions: SessionSummary[] }>(r));
+  fetch(`${API_BASE}/sessions`, { headers: authHeaders() }).then((r) =>
+    asJson<{ sessions: SessionSummary[] }>(r)
+  );
 
 export const createSession = (title?: string) =>
   fetch(`${API_BASE}/sessions`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ title: title ?? null }),
   }).then((r) => asJson<SessionSummary>(r));
 
 export const getSession = (id: string) =>
-  fetch(`${API_BASE}/sessions/${id}`).then((r) => asJson<SessionDetail>(r));
+  fetch(`${API_BASE}/sessions/${id}`, { headers: authHeaders() }).then((r) =>
+    asJson<SessionDetail>(r)
+  );
 
 export const renameSession = (id: string, title: string) =>
   fetch(`${API_BASE}/sessions/${id}`, {
     method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ title }),
   }).then((r) => asJson(r));
 
 export const deleteSession = (id: string) =>
-  fetch(`${API_BASE}/sessions/${id}`, { method: 'DELETE' }).then((r) => asJson(r));
+  fetch(`${API_BASE}/sessions/${id}`, { method: 'DELETE', headers: authHeaders() }).then((r) =>
+    asJson(r)
+  );
 
 export const autotitleSession = (id: string) =>
-  fetch(`${API_BASE}/sessions/${id}/autotitle`, { method: 'POST' }).then((r) =>
-    asJson<{ title: string }>(r)
+  fetch(`${API_BASE}/sessions/${id}/autotitle`, { method: 'POST', headers: authHeaders() }).then(
+    (r) => asJson<{ title: string }>(r)
   );
 
 export const selectVersion = (sessionId: string, messageId: string) =>
   fetch(`${API_BASE}/sessions/${sessionId}/messages/${messageId}/select`, {
     method: 'POST',
+    headers: authHeaders(),
   }).then((r) => asJson(r));
 
 // ─── Documents (versioned) ───────────────────────────────────────────────────
 export const listDocuments = () =>
-  fetch(`${API_BASE}/documents`).then((r) => asJson<{ documents: DocumentItem[] }>(r));
+  fetch(`${API_BASE}/documents`, { headers: authHeaders() }).then((r) =>
+    asJson<{ documents: DocumentItem[] }>(r)
+  );
 
 export const listTrash = () =>
-  fetch(`${API_BASE}/documents/trash`).then((r) => asJson<{ documents: DocumentItem[] }>(r));
+  fetch(`${API_BASE}/documents/trash`, { headers: authHeaders() }).then((r) =>
+    asJson<{ documents: DocumentItem[] }>(r)
+  );
 
 export const undeleteDocument = (documentId: string) =>
-  fetch(`${API_BASE}/documents/${documentId}/undelete`, { method: 'POST' }).then((r) => asJson(r));
+  fetch(`${API_BASE}/documents/${documentId}/undelete`, {
+    method: 'POST',
+    headers: authHeaders(),
+  }).then((r) => asJson(r));
 
 export const listVersions = (documentId: string) =>
-  fetch(`${API_BASE}/documents/${documentId}/versions`).then((r) =>
+  fetch(`${API_BASE}/documents/${documentId}/versions`, { headers: authHeaders() }).then((r) =>
     asJson<{ versions: DocumentVersion[] }>(r)
   );
 
 export const restoreVersion = (documentId: string, version: number) =>
   fetch(`${API_BASE}/documents/${documentId}/versions/${version}/restore`, {
     method: 'POST',
+    headers: authHeaders(),
   }).then((r) => asJson(r));
 
 export const softDeleteDocument = (documentId: string) =>
-  fetch(`${API_BASE}/documents/${documentId}`, { method: 'DELETE' }).then((r) => asJson(r));
+  fetch(`${API_BASE}/documents/${documentId}`, { method: 'DELETE', headers: authHeaders() }).then(
+    (r) => asJson(r)
+  );
 
 export const purgeDocument = (documentId: string) =>
-  fetch(`${API_BASE}/documents/${documentId}/purge`, { method: 'DELETE' }).then((r) => asJson(r));
+  fetch(`${API_BASE}/documents/${documentId}/purge`, {
+    method: 'DELETE',
+    headers: authHeaders(),
+  }).then((r) => asJson(r));
 
-// Upload a brand-new document (same filename → a new version of it).
-export const uploadDocument = (file: File) => {
+// Upload a brand-new document. `scope` is honoured for admins (org | personal);
+// regular users always create personal documents server-side.
+export const uploadDocument = (file: File, scope?: 'org' | 'personal') => {
   const form = new FormData();
   form.append('file', file);
-  return fetch(`${API_BASE}/documents`, { method: 'POST', body: form }).then((r) =>
-    asJson<{ document_id: string; version: number; indexing_status: string; filename: string }>(r)
+  if (scope) form.append('scope', scope);
+  return fetch(`${API_BASE}/documents`, {
+    method: 'POST',
+    headers: authHeaders(),
+    body: form,
+  }).then((r) =>
+    asJson<{
+      document_id: string;
+      version: number;
+      scope: string;
+      indexing_status: string;
+      filename: string;
+    }>(r)
   );
 };
 
@@ -102,6 +206,7 @@ export const uploadNewVersion = (documentId: string, file: File) => {
   form.append('file', file);
   return fetch(`${API_BASE}/documents/${documentId}/versions`, {
     method: 'POST',
+    headers: authHeaders(),
     body: form,
   }).then((r) => asJson<{ version: number; indexing_status: string }>(r));
 };
@@ -116,10 +221,14 @@ export async function streamNdjson(
 ): Promise<void> {
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify(body ?? {}),
     signal,
   });
+  if (res.status === 401) {
+    handleUnauthorized();
+    throw new Error('Session expirée — veuillez vous reconnecter.');
+  }
   if (!res.ok || !res.body) {
     let detail = `HTTP ${res.status}`;
     try {

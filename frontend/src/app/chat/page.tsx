@@ -212,7 +212,7 @@ export default function ChatPage() {
     setUploading(true);
     let n = 0;
     for (const f of Array.from(files)) {
-      try { await api.uploadDocument(f); n += 1; }
+      try { await api.uploadDocument(f, 'personal'); n += 1; }
       catch (e: any) { setToast({ msg: `Échec : ${e?.message || f.name}`, sev: 'error' }); }
     }
     setUploading(false);

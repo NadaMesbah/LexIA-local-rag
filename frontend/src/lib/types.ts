@@ -1,3 +1,17 @@
+export type Role = 'admin' | 'user';
+
+export interface User {
+  id: string;
+  username: string;
+  role: Role;
+}
+
+export interface AuthResponse {
+  access_token: string;
+  token_type: string;
+  user: User;
+}
+
 export interface SessionSummary {
   id: string;
   title: string;
@@ -47,6 +61,8 @@ export interface DocumentVersion {
 export interface DocumentItem {
   id: string;
   name: string;
+  scope?: 'org' | 'personal';
+  owner_id?: string | null;
   current_version: number;
   status: 'active' | 'deleted';
   created_at: number;

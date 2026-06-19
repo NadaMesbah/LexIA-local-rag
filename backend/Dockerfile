@@ -18,8 +18,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Persistent data (Chroma vectors + SQLite) lives under /app/data (a volume).
-RUN mkdir -p /app/data
+# Run as a non-root user (defence in depth — relevant for the "bank" framing).
+# Create the data dir and hand it to the app user BEFORE the volume mounts; a
+# fresh named volume inherits this ownership so the app can write to it.
+RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /app/data \
+    && chown -R appuser:appuser /app
+
+USER appuser
 
 EXPOSE 8000
 

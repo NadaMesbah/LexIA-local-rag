@@ -34,7 +34,12 @@ import UploadFileRoundedIcon from '@mui/icons-material/UploadFileRounded';
 import RestoreRoundedIcon from '@mui/icons-material/RestoreRounded';
 import RestoreFromTrashRoundedIcon from '@mui/icons-material/RestoreFromTrashRounded';
 import SearchRoundedIcon from '@mui/icons-material/SearchRounded';
+import ToggleButton from '@mui/material/ToggleButton';
+import ToggleButtonGroup from '@mui/material/ToggleButtonGroup';
+import PublicRoundedIcon from '@mui/icons-material/PublicRounded';
+import PersonRoundedIcon from '@mui/icons-material/PersonRounded';
 import * as api from '@/lib/api';
+import { useAuth } from '@/lib/auth';
 import type { DocumentItem, DocumentVersion, IndexingStatus } from '@/lib/types';
 
 const EXT_COLOR: Record<string, 'error' | 'primary' | 'success' | 'warning' | 'default'> = {
@@ -65,10 +70,13 @@ function StatusChip({ s }: { s?: IndexingStatus }) {
 }
 
 export default function DocumentsPage() {
+  const { user } = useAuth();
+  const isAdmin = user?.role === 'admin';
   const [docs, setDocs] = useState<DocumentItem[]>([]);
   const [trash, setTrash] = useState<DocumentItem[]>([]);
   const [tab, setTab] = useState<'active' | 'trash'>('active');
   const [query, setQuery] = useState('');
+  const [uploadScope, setUploadScope] = useState<'org' | 'personal'>('org');
   const [uploading, setUploading] = useState(false);
   const [toast, setToast] = useState<{ msg: string; sev: 'success' | 'error' } | null>(null);
   const [confirm, setConfirm] = useState<{ doc: DocumentItem; mode: 'soft' | 'purge' } | null>(null);
@@ -130,7 +138,7 @@ export default function DocumentsPage() {
       setUploading(true);
       for (const f of files) {
         try {
-          await api.uploadDocument(f);
+          await api.uploadDocument(f, isAdmin ? uploadScope : 'personal');
           setToast({ msg: `« ${f.name} » envoyé — indexation en cours.`, sev: 'success' });
         } catch (e: any) {
           setToast({ msg: `Échec : ${e?.message || f.name}`, sev: 'error' });
@@ -139,7 +147,7 @@ export default function DocumentsPage() {
       setUploading(false);
       refresh();
     },
-    [refresh]
+    [refresh, isAdmin, uploadScope]
   );
 
   const { getRootProps, getInputProps, isDragActive, open } = useDropzone({
@@ -217,6 +225,7 @@ export default function DocumentsPage() {
           id: d.id,
           doc: d,
           name: d.name,
+          scope: d.scope || 'org',
           version: d.current_version,
           versionCount: d.version_count,
           status: d.latest?.indexing_status || 'pending',
@@ -250,6 +259,19 @@ export default function DocumentsPage() {
         </Tooltip>
       ),
     },
+    {
+      field: 'scope',
+      headerName: 'Portée',
+      width: 130,
+      renderCell: (p) =>
+        p.row.scope === 'personal' ? (
+          <Chip icon={<PersonRoundedIcon />} label="Perso" size="small" variant="outlined"
+            color="default" sx={{ height: 22, fontWeight: 700 }} />
+        ) : (
+          <Chip icon={<PublicRoundedIcon />} label="Org" size="small" variant="outlined"
+            color="primary" sx={{ height: 22, fontWeight: 700 }} />
+        ),
+    },
     { field: 'status', headerName: 'Statut', width: 150, renderCell: (p) => <StatusChip s={p.row.status} /> },
     { field: 'chunks', headerName: 'Chunks', width: 100, type: 'number' },
     {
@@ -258,7 +280,16 @@ export default function DocumentsPage() {
     },
     {
       field: 'actions', headerName: '', width: 130, sortable: false, filterable: false, align: 'right',
-      renderCell: (p) => (
+      renderCell: (p) => {
+        const manageable = isAdmin || p.row.scope === 'personal';
+        if (!manageable) {
+          return (
+            <Tooltip title="Document de l'organisation — géré par un administrateur">
+              <Chip label="Lecture seule" size="small" variant="outlined" sx={{ height: 22 }} />
+            </Tooltip>
+          );
+        }
+        return (
         tab === 'trash' ? (
           <Box>
             <Tooltip title="Restaurer">
@@ -285,7 +316,8 @@ export default function DocumentsPage() {
             </Tooltip>
           </Box>
         )
-      ),
+        );
+      },
     },
   ];
 
@@ -313,6 +345,28 @@ export default function DocumentsPage() {
           <CloudUploadRoundedIcon sx={{ fontSize: 40, color: 'primary.main', mb: 1 }} />
           <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>Glissez vos fichiers ici</Typography>
           <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>PDF · TXT · DOCX · MD · CSV · XLSX</Typography>
+          {isAdmin && (
+            <Box sx={{ mb: 1.5, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 0.5 }}>
+              <ToggleButtonGroup
+                size="small"
+                exclusive
+                value={uploadScope}
+                onChange={(_, v) => v && setUploadScope(v)}
+              >
+                <ToggleButton value="org">
+                  <PublicRoundedIcon fontSize="small" sx={{ mr: 0.5 }} /> Organisation
+                </ToggleButton>
+                <ToggleButton value="personal">
+                  <PersonRoundedIcon fontSize="small" sx={{ mr: 0.5 }} /> Personnel
+                </ToggleButton>
+              </ToggleButtonGroup>
+              <Typography variant="caption" color="text.disabled">
+                {uploadScope === 'org'
+                  ? 'Visible par tous les utilisateurs (base canonique).'
+                  : 'Visible uniquement par vous.'}
+              </Typography>
+            </Box>
+          )}
           <Button variant="contained" onClick={open} disabled={uploading}>Parcourir les fichiers</Button>
           {uploading && <LinearProgress sx={{ mt: 2, borderRadius: 1 }} />}
         </Box>
