@@ -1,7 +1,8 @@
 """
 Authentication & authorization.
 
-- Passwords hashed with bcrypt (passlib).
+- Passwords hashed with bcrypt (the `bcrypt` library directly — passlib is
+  unmaintained and breaks against modern bcrypt wheels).
 - Stateless JWT (HS256) issued on login; sent as `Authorization: Bearer <token>`.
 - FastAPI dependencies: `current_user` (any authenticated user) and `admin_user`.
 - A default admin is seeded from env on startup (ADMIN_USERNAME / ADMIN_PASSWORD).
@@ -15,9 +16,9 @@ import time
 from typing import Optional
 
 import jwt
+import bcrypt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from passlib.context import CryptContext
 
 import db
 
@@ -25,17 +26,22 @@ JWT_SECRET = os.getenv("JWT_SECRET", "dev-insecure-change-me")
 JWT_ALG = "HS256"
 JWT_TTL_SECONDS = int(os.getenv("JWT_TTL_HOURS", "12")) * 3600
 
-_pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
 _bearer = HTTPBearer(auto_error=False)
 
 
+def _to_bytes(password: str) -> bytes:
+    # bcrypt only considers the first 72 bytes and raises on longer input, so we
+    # truncate consistently for both hashing and verification.
+    return password.encode("utf-8")[:72]
+
+
 def hash_password(password: str) -> str:
-    return _pwd.hash(password)
+    return bcrypt.hashpw(_to_bytes(password), bcrypt.gensalt()).decode("utf-8")
 
 
 def verify_password(password: str, password_hash: str) -> bool:
     try:
-        return _pwd.verify(password, password_hash)
+        return bcrypt.checkpw(_to_bytes(password), password_hash.encode("utf-8"))
     except Exception:
         return False
 
