@@ -30,6 +30,7 @@ import shutil
 import tempfile
 from pathlib import Path
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -39,7 +40,7 @@ from pydantic import BaseModel
 import db
 from rag_engine import RAGEngine, SUPPORTED_EXTS
 
-app = FastAPI(title="RAG Local API", version="2.0.0")
+app = FastAPI(title="RAG Local API", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -51,6 +52,10 @@ app.add_middleware(
 # Initialise persistence + the (single) RAG engine on startup.
 db.init_db()
 rag = RAGEngine()
+
+# Single-worker pool: document indexing runs in the background, serialized so it
+# never thrashes the GPU or races on the vector store.
+_indexer = ThreadPoolExecutor(max_workers=1)
 
 
 # ─── Models ──────────────────────────────────────────────────────────────────
@@ -65,6 +70,7 @@ class RenameSessionRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
+    scope: Optional[dict] = None   # {"type": "all"} | {"type": "document", "id": "..."}
 
 
 # ─── Status ──────────────────────────────────────────────────────────────────
@@ -72,7 +78,7 @@ class ChatRequest(BaseModel):
 @app.get("/")
 async def root():
     info = rag.get_status()
-    info["total_documents"] = len(db.list_documents())
+    info["total_documents"] = db.total_active_documents()
     return info
 
 
@@ -150,7 +156,7 @@ async def delete_session(session_id: str):
 
 
 def _reply_generator(session_id: str, fallback_title: str, parent_user_id: str,
-                     user_content: str, history: list[dict]):
+                     user_content: str, history: list[dict], scope: Optional[dict] = None):
     """
     Stream an assistant reply as a child of an EXISTING user message and persist
     it (the answer survives a client disconnect via the `finally` block). Shared
@@ -171,7 +177,7 @@ def _reply_generator(session_id: str, fallback_title: str, parent_user_id: str,
             saved["done"] = True
 
         try:
-            async for kind, payload in rag.stream_chat(user_content, history):
+            async for kind, payload in rag.stream_chat(user_content, history, scope):
                 if kind == "token":
                     answer_parts.append(payload)
                     yield json.dumps({"type": "token", "data": payload}) + "\n"
@@ -217,7 +223,7 @@ async def chat(session_id: str, req: ChatRequest):
     parent_id = path[-1]["id"] if path else None
     uid = db.add_message(session_id, "user", message, parent_id=parent_id)["id"]
 
-    gen = _reply_generator(session_id, session["title"], uid, message, history)
+    gen = _reply_generator(session_id, session["title"], uid, message, history, req.scope)
     return StreamingResponse(gen(), media_type="application/x-ndjson")
 
 
@@ -239,7 +245,7 @@ async def edit_message(session_id: str, message_id: str, req: ChatRequest):
 
     history = _history_before(session_id, message_id)
     uid = db.add_message(session_id, "user", content, parent_id=target["parent_id"])["id"]
-    gen = _reply_generator(session_id, session["title"], uid, content, history)
+    gen = _reply_generator(session_id, session["title"], uid, content, history, req.scope)
     return StreamingResponse(gen(), media_type="application/x-ndjson")
 
 
@@ -261,33 +267,76 @@ async def regenerate_message(session_id: str, message_id: str):
     return StreamingResponse(gen(), media_type="application/x-ndjson")
 
 
-# ─── Documents ─────────────────────────────────────────────────────────────
+# ─── Documents (versioned) ───────────────────────────────────────────────────
 
-@app.post("/upload")
-async def upload_document(file: UploadFile = File(...)):
-    suffix = Path(file.filename).suffix.lower()
+def _save_temp(file: UploadFile, suffix: str) -> str:
+    fd, path = tempfile.mkstemp(suffix=suffix)
+    with os.fdopen(fd, "wb") as out:
+        shutil.copyfileobj(file.file, out)
+    return path
+
+
+def _index_job(version_id: str, document_id: str, version: int, file_path: str, filename: str):
+    """Background: chunk → embed → index a version, then flip it to latest."""
+    db.set_version_status(version_id, "processing")
+    try:
+        n = rag.index_version(file_path, filename, document_id, version)
+        db.set_version_status(version_id, "indexed", chunks=n)
+        db.mark_version_latest(document_id, version)
+    except Exception as e:
+        db.set_version_status(version_id, "failed", error=str(e))
+        print(f"[API] indexing failed for {filename} v{version}: {e}")
+    finally:
+        try:
+            os.unlink(file_path)
+        except Exception:
+            pass
+
+
+def _check_ext(filename: str) -> str:
+    suffix = Path(filename or "").suffix.lower()
     if suffix not in SUPPORTED_EXTS:
         raise HTTPException(
             status_code=400,
             detail=f"Unsupported file type '{suffix}'. Allowed: {', '.join(sorted(SUPPORTED_EXTS))}",
         )
+    return suffix
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        shutil.copyfileobj(file.file, tmp)
-        tmp_path = tmp.name
 
-    try:
-        result = await rag.ingest_document(tmp_path, original_name=file.filename)
-        db.upsert_document(file.filename, result["chunks"])
-        return {
-            "message": f"Document '{file.filename}' indexed successfully.",
-            "chunks_added": result["chunks"],
-            "filename": file.filename,
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        os.unlink(tmp_path)
+@app.post("/documents")
+async def create_document(file: UploadFile = File(...)):
+    """Upload a file. Same name as an existing document → a new version of it."""
+    suffix = _check_ext(file.filename)
+    doc = db.get_or_create_document(file.filename)
+    ver = db.add_version(doc["id"], file.filename)
+    path = _save_temp(file, suffix)
+    _indexer.submit(_index_job, ver["id"], doc["id"], ver["version"], path, file.filename)
+    return {
+        "document_id": doc["id"],
+        "version_id": ver["id"],
+        "version": ver["version"],
+        "indexing_status": "pending",
+        "filename": file.filename,
+    }
+
+
+@app.post("/documents/{document_id}/versions")
+async def add_document_version(document_id: str, file: UploadFile = File(...)):
+    """Explicitly upload a new version for an existing document."""
+    doc = db.get_document(document_id)
+    if not doc or doc["status"] == "deleted":
+        raise HTTPException(status_code=404, detail="Document not found.")
+    suffix = _check_ext(file.filename)
+    ver = db.add_version(document_id, file.filename)
+    path = _save_temp(file, suffix)
+    _indexer.submit(_index_job, ver["id"], document_id, ver["version"], path, file.filename)
+    return {
+        "document_id": document_id,
+        "version_id": ver["id"],
+        "version": ver["version"],
+        "indexing_status": "pending",
+        "filename": file.filename,
+    }
 
 
 @app.get("/documents")
@@ -295,13 +344,44 @@ async def list_documents():
     return {"documents": db.list_documents()}
 
 
-@app.delete("/documents/{doc_name}")
-async def delete_document(doc_name: str):
-    if not db.document_exists(doc_name):
-        raise HTTPException(status_code=404, detail=f"Document '{doc_name}' not found.")
-    rag.delete_document(doc_name)
-    db.delete_document(doc_name)
-    return {"message": f"Document '{doc_name}' removed from knowledge base."}
+@app.get("/documents/{document_id}/versions")
+async def document_versions(document_id: str):
+    if not db.get_document(document_id):
+        raise HTTPException(status_code=404, detail="Document not found.")
+    return {"versions": db.list_versions(document_id)}
+
+
+@app.post("/documents/{document_id}/versions/{version}/restore")
+async def restore_version(document_id: str, version: int):
+    """Rollback: make an older version the latest one used for retrieval."""
+    doc = db.get_document(document_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    if not any(v["version"] == version for v in db.list_versions(document_id)):
+        raise HTTPException(status_code=404, detail="Version not found.")
+    rag.restore_version(document_id, version)
+    db.mark_version_latest(document_id, version)
+    return {"ok": True, "current_version": version}
+
+
+@app.delete("/documents/{document_id}")
+async def soft_delete_document(document_id: str):
+    """Soft-delete: hide from retrieval and the active list (vectors kept)."""
+    if not db.get_document(document_id):
+        raise HTTPException(status_code=404, detail="Document not found.")
+    rag.set_document_hidden(document_id)
+    db.set_document_status(document_id, "deleted")
+    return {"ok": True}
+
+
+@app.delete("/documents/{document_id}/purge")
+async def purge_document(document_id: str):
+    """Hard-delete: permanently remove vectors + records."""
+    if not db.get_document(document_id):
+        raise HTTPException(status_code=404, detail="Document not found.")
+    rag.purge_document(document_id)
+    db.hard_delete_document(document_id)
+    return {"ok": True}
 
 
 @app.delete("/reset")

@@ -20,7 +20,7 @@ import ConversationsRail from '@/components/chat/ConversationsRail';
 import MessageItem from '@/components/chat/MessageItem';
 import SourcesPanel from '@/components/chat/SourcesPanel';
 import Composer from '@/components/chat/Composer';
-import type { DocumentItem, Message, SessionSummary, Source, Status, StreamEvent } from '@/lib/types';
+import type { DocumentItem, Message, Scope, SessionSummary, Source, Status, StreamEvent } from '@/lib/types';
 import * as api from '@/lib/api';
 
 interface StreamState {
@@ -49,6 +49,7 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [stream, setStream] = useState<StreamState>(EMPTY_STREAM);
   const [sourcesOpen, setSourcesOpen] = useState(true);
+  const [scope, setScope] = useState<Scope>({ type: 'all' });
   const [confirmId, setConfirmId] = useState<string | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
@@ -170,9 +171,9 @@ export default function ChatPage() {
         ...m,
         { id: `tmp-${Date.now()}`, parent_id: null, role: 'user', content: text, version_index: 1, version_count: 1, sibling_ids: [] },
       ]);
-      await runStream(api.chatUrl(sid!), { message: text }, sid!, { firstTurn });
+      await runStream(api.chatUrl(sid!), { message: text, scope }, sid!, { firstTurn });
     },
-    [currentId, messages.length, stream.active, runStream, refreshSessions]
+    [currentId, messages.length, stream.active, runStream, refreshSessions, scope]
   );
 
   const handleEdit = useCallback(
@@ -185,9 +186,9 @@ export default function ChatPage() {
         copy[i] = { ...copy[i], content: text };
         return copy;
       });
-      await runStream(api.editUrl(currentId, id), { message: text }, currentId, {});
+      await runStream(api.editUrl(currentId, id), { message: text, scope }, currentId, {});
     },
-    [currentId, stream.active, runStream]
+    [currentId, stream.active, runStream, scope]
   );
 
   const handleRegenerate = useCallback(
@@ -360,6 +361,8 @@ export default function ChatPage() {
         <SourcesPanel
           documents={documents}
           lastSources={lastSources}
+          scope={scope}
+          onScopeChange={setScope}
           uploadFn={api.uploadDocument}
           onUploaded={() => {
             refreshDocuments();

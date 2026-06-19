@@ -11,6 +11,8 @@ export interface Source {
   score: number;
   filename: string;
   page: string | number;
+  document_id?: string | null;
+  version?: number | null;
 }
 
 export interface Message {
@@ -28,11 +30,32 @@ export interface SessionDetail extends SessionSummary {
   messages: Message[];
 }
 
-export interface DocumentItem {
-  name: string;
+export type IndexingStatus = 'pending' | 'processing' | 'indexed' | 'failed';
+
+export interface DocumentVersion {
+  id: string;
+  document_id: string;
+  version: number;
+  filename: string;
+  indexing_status: IndexingStatus;
+  is_latest: number; // 0 | 1
   chunks: number;
-  created_at: number;
+  error: string | null;
+  uploaded_at: number;
 }
+
+export interface DocumentItem {
+  id: string;
+  name: string;
+  current_version: number;
+  status: 'active' | 'deleted';
+  created_at: number;
+  updated_at: number;
+  version_count: number;
+  latest: DocumentVersion | null;
+}
+
+export type Scope = { type: 'all' } | { type: 'document'; id: string; name: string };
 
 export interface Status {
   status: string;

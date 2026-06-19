@@ -80,12 +80,6 @@ def init_db() -> None:
                 created_at      REAL NOT NULL,
                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
             );
-
-            CREATE TABLE IF NOT EXISTS documents (
-                name        TEXT PRIMARY KEY,
-                chunks      INTEGER NOT NULL DEFAULT 0,
-                created_at  REAL NOT NULL
-            );
             """
         )
         # Migrate older databases that predate the tree columns. This MUST run
@@ -120,6 +114,58 @@ def init_db() -> None:
         # Indexes (safe now that the columns are guaranteed to exist).
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_id)")
+
+        # ── Documents: versioned model (migrate legacy flat table if present) ──
+        doc_cols = _columns(conn, "documents")
+        legacy_docs = bool(doc_cols) and ("id" not in doc_cols)
+        legacy_rows: list[dict] = []
+        if legacy_docs:
+            legacy_rows = [dict(r) for r in conn.execute(
+                "SELECT name, chunks, created_at FROM documents"
+            ).fetchall()]
+            conn.execute("ALTER TABLE documents RENAME TO documents_legacy")
+
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS documents (
+                id              TEXT PRIMARY KEY,
+                name            TEXT NOT NULL,
+                current_version INTEGER NOT NULL DEFAULT 0,
+                status          TEXT NOT NULL DEFAULT 'active',   -- active | deleted
+                created_at      REAL NOT NULL,
+                updated_at      REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS document_versions (
+                id              TEXT PRIMARY KEY,
+                document_id     TEXT NOT NULL,
+                version         INTEGER NOT NULL,
+                filename        TEXT NOT NULL,
+                indexing_status TEXT NOT NULL DEFAULT 'pending',  -- pending|processing|indexed|failed
+                is_latest       INTEGER NOT NULL DEFAULT 0,
+                chunks          INTEGER NOT NULL DEFAULT 0,
+                error           TEXT,
+                uploaded_at     REAL NOT NULL,
+                FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_versions_doc ON document_versions(document_id);
+            """
+        )
+
+        if legacy_docs:
+            for r in legacy_rows:
+                did = _new_id()
+                ts = r.get("created_at") or _now()
+                conn.execute(
+                    "INSERT INTO documents (id,name,current_version,status,created_at,updated_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (did, r["name"], 1, "active", ts, ts),
+                )
+                conn.execute(
+                    "INSERT INTO document_versions (id,document_id,version,filename,indexing_status,"
+                    "is_latest,chunks,error,uploaded_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (_new_id(), did, 1, r["name"], "indexed", 1, r.get("chunks") or 0, None, ts),
+                )
+            conn.execute("DROP TABLE documents_legacy")
 
 
 # ─── Sessions ──────────────────────────────────────────────────────────────
@@ -308,45 +354,183 @@ def count_messages(session_id: str) -> int:
     return int(row["c"]) if row else 0
 
 
-# ─── Document registry ───────────────────────────────────────────────────────
+# ─── Documents (versioned) ───────────────────────────────────────────────────
 
-def upsert_document(name: str, chunks: int) -> None:
+def get_or_create_document(name: str) -> dict:
+    """Return the active document for `name`, creating it (version 0) if needed."""
+    ts = _now()
     with _connect() as conn:
-        row = conn.execute("SELECT chunks FROM documents WHERE name=?", (name,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM documents WHERE name=? AND status!='deleted'", (name,)
+        ).fetchone()
         if row:
-            conn.execute("UPDATE documents SET chunks=chunks+? WHERE name=?", (chunks, name))
+            return dict(row)
+        did = _new_id()
+        conn.execute(
+            "INSERT INTO documents (id,name,current_version,status,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (did, name, 0, "active", ts, ts),
+        )
+        return {"id": did, "name": name, "current_version": 0, "status": "active",
+                "created_at": ts, "updated_at": ts}
+
+
+def add_version(document_id: str, filename: str) -> dict:
+    """Create a new pending version for a document. Returns {id, version}."""
+    ts = _now()
+    with _connect() as conn:
+        mx = conn.execute(
+            "SELECT COALESCE(MAX(version),0) AS mx FROM document_versions WHERE document_id=?",
+            (document_id,),
+        ).fetchone()["mx"]
+        version = int(mx) + 1
+        vid = _new_id()
+        conn.execute(
+            "INSERT INTO document_versions (id,document_id,version,filename,indexing_status,"
+            "is_latest,chunks,error,uploaded_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (vid, document_id, version, filename, "pending", 0, 0, None, ts),
+        )
+        conn.execute("UPDATE documents SET updated_at=?, status='active' WHERE id=?", (ts, document_id))
+    return {"id": vid, "document_id": document_id, "version": version}
+
+
+def set_version_status(version_id: str, status: str, chunks: Optional[int] = None,
+                       error: Optional[str] = None) -> None:
+    with _connect() as conn:
+        if chunks is not None:
+            conn.execute(
+                "UPDATE document_versions SET indexing_status=?, chunks=?, error=? WHERE id=?",
+                (status, chunks, error, version_id),
+            )
         else:
             conn.execute(
-                "INSERT INTO documents (name, chunks, created_at) VALUES (?,?,?)",
-                (name, chunks, _now()),
+                "UPDATE document_versions SET indexing_status=?, error=? WHERE id=?",
+                (status, error, version_id),
             )
 
 
-def list_documents() -> list[dict]:
+def mark_version_latest(document_id: str, version: int) -> None:
+    """Make `version` the only is_latest version and the document's current_version."""
+    with _connect() as conn:
+        conn.execute("UPDATE document_versions SET is_latest=0 WHERE document_id=?", (document_id,))
+        conn.execute(
+            "UPDATE document_versions SET is_latest=1 WHERE document_id=? AND version=?",
+            (document_id, version),
+        )
+        conn.execute(
+            "UPDATE documents SET current_version=?, status='active', updated_at=? WHERE id=?",
+            (version, _now(), document_id),
+        )
+
+
+def get_document(document_id: str) -> Optional[dict]:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM documents WHERE id=?", (document_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_version(version_id: str) -> Optional[dict]:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM document_versions WHERE id=?", (version_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_versions(document_id: str) -> list[dict]:
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT name, chunks, created_at FROM documents ORDER BY created_at DESC"
+            "SELECT * FROM document_versions WHERE document_id=? ORDER BY version DESC",
+            (document_id,),
         ).fetchall()
     return [dict(r) for r in rows]
 
 
-def document_exists(name: str) -> bool:
+def list_documents(include_deleted: bool = False) -> list[dict]:
+    """One row per document, enriched with its latest version + version count."""
     with _connect() as conn:
-        return conn.execute("SELECT 1 FROM documents WHERE name=?", (name,)).fetchone() is not None
+        q = "SELECT * FROM documents"
+        if not include_deleted:
+            q += " WHERE status!='deleted'"
+        docs = [dict(r) for r in conn.execute(q + " ORDER BY updated_at DESC").fetchall()]
+        for d in docs:
+            v = conn.execute(
+                "SELECT * FROM document_versions WHERE document_id=? "
+                "ORDER BY is_latest DESC, version DESC LIMIT 1",
+                (d["id"],),
+            ).fetchone()
+            c = conn.execute(
+                "SELECT COUNT(*) AS c FROM document_versions WHERE document_id=?", (d["id"],)
+            ).fetchone()["c"]
+            d["latest"] = dict(v) if v else None
+            d["version_count"] = int(c)
+    return docs
 
 
-def delete_document(name: str) -> bool:
+def active_documents() -> list[dict]:
+    """Lightweight list for the chat scope selector."""
     with _connect() as conn:
-        cur = conn.execute("DELETE FROM documents WHERE name=?", (name,))
+        rows = conn.execute(
+            "SELECT id, name, current_version FROM documents WHERE status='active' ORDER BY name"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_document_status(document_id: str, status: str) -> bool:
+    with _connect() as conn:
+        cur = conn.execute(
+            "UPDATE documents SET status=?, updated_at=? WHERE id=?", (status, _now(), document_id)
+        )
         return cur.rowcount > 0
 
 
-def total_chunks() -> int:
+def hard_delete_document(document_id: str) -> bool:
     with _connect() as conn:
-        row = conn.execute("SELECT COALESCE(SUM(chunks),0) AS total FROM documents").fetchone()
-    return int(row["total"]) if row else 0
+        conn.execute("DELETE FROM document_versions WHERE document_id=?", (document_id,))
+        cur = conn.execute("DELETE FROM documents WHERE id=?", (document_id,))
+        return cur.rowcount > 0
+
+
+def total_active_documents() -> int:
+    with _connect() as conn:
+        return int(conn.execute(
+            "SELECT COUNT(*) AS c FROM documents WHERE status='active'"
+        ).fetchone()["c"])
 
 
 def clear_documents() -> None:
     with _connect() as conn:
+        conn.execute("DELETE FROM document_versions")
         conn.execute("DELETE FROM documents")
+
+
+def ensure_legacy_document(name: str, chunks: int) -> dict:
+    """For startup backfill: return {document_id, version} for a file, creating rows if missing."""
+    ts = _now()
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM documents WHERE name=?", (name,)).fetchone()
+        if row:
+            did = row["id"]
+            v = conn.execute(
+                "SELECT version FROM document_versions WHERE document_id=? AND is_latest=1",
+                (did,),
+            ).fetchone()
+            if v:
+                return {"document_id": did, "version": int(v["version"])}
+            conn.execute(
+                "INSERT INTO document_versions (id,document_id,version,filename,indexing_status,"
+                "is_latest,chunks,error,uploaded_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (_new_id(), did, 1, name, "indexed", 1, chunks, None, ts),
+            )
+            conn.execute("UPDATE documents SET current_version=1 WHERE id=?", (did,))
+            return {"document_id": did, "version": 1}
+        did = _new_id()
+        conn.execute(
+            "INSERT INTO documents (id,name,current_version,status,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (did, name, 1, "active", ts, ts),
+        )
+        conn.execute(
+            "INSERT INTO document_versions (id,document_id,version,filename,indexing_status,"
+            "is_latest,chunks,error,uploaded_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (_new_id(), did, 1, name, "indexed", 1, chunks, None, ts),
+        )
+        return {"document_id": did, "version": 1}

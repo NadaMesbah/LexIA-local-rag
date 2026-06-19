@@ -1,5 +1,6 @@
 import type {
   DocumentItem,
+  DocumentVersion,
   SessionDetail,
   SessionSummary,
   Status,
@@ -60,21 +61,43 @@ export const selectVersion = (sessionId: string, messageId: string) =>
     method: 'POST',
   }).then((r) => asJson(r));
 
-// ─── Documents ───────────────────────────────────────────────────────────────
+// ─── Documents (versioned) ───────────────────────────────────────────────────
 export const listDocuments = () =>
   fetch(`${API_BASE}/documents`).then((r) => asJson<{ documents: DocumentItem[] }>(r));
 
-export const deleteDocument = (name: string) =>
-  fetch(`${API_BASE}/documents/${encodeURIComponent(name)}`, { method: 'DELETE' }).then((r) =>
-    asJson(r)
+export const listVersions = (documentId: string) =>
+  fetch(`${API_BASE}/documents/${documentId}/versions`).then((r) =>
+    asJson<{ versions: DocumentVersion[] }>(r)
   );
 
+export const restoreVersion = (documentId: string, version: number) =>
+  fetch(`${API_BASE}/documents/${documentId}/versions/${version}/restore`, {
+    method: 'POST',
+  }).then((r) => asJson(r));
+
+export const softDeleteDocument = (documentId: string) =>
+  fetch(`${API_BASE}/documents/${documentId}`, { method: 'DELETE' }).then((r) => asJson(r));
+
+export const purgeDocument = (documentId: string) =>
+  fetch(`${API_BASE}/documents/${documentId}/purge`, { method: 'DELETE' }).then((r) => asJson(r));
+
+// Upload a brand-new document (same filename → a new version of it).
 export const uploadDocument = (file: File) => {
   const form = new FormData();
   form.append('file', file);
-  return fetch(`${API_BASE}/upload`, { method: 'POST', body: form }).then((r) =>
-    asJson<{ chunks_added: number; filename: string }>(r)
+  return fetch(`${API_BASE}/documents`, { method: 'POST', body: form }).then((r) =>
+    asJson<{ document_id: string; version: number; indexing_status: string; filename: string }>(r)
   );
+};
+
+// Upload a new version of an existing document.
+export const uploadNewVersion = (documentId: string, file: File) => {
+  const form = new FormData();
+  form.append('file', file);
+  return fetch(`${API_BASE}/documents/${documentId}/versions`, {
+    method: 'POST',
+    body: form,
+  }).then((r) => asJson<{ version: number; indexing_status: string }>(r));
 };
 
 // ─── Streaming (NDJSON) ──────────────────────────────────────────────────────
