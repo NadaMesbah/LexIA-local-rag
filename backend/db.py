@@ -130,6 +130,8 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS documents (
                 id              TEXT PRIMARY KEY,
                 name            TEXT NOT NULL,
+                owner_id        TEXT,                             -- NULL for org-wide docs
+                scope           TEXT NOT NULL DEFAULT 'org',      -- org | personal
                 current_version INTEGER NOT NULL DEFAULT 0,
                 status          TEXT NOT NULL DEFAULT 'active',   -- active | deleted
                 created_at      REAL NOT NULL,
@@ -167,23 +169,133 @@ def init_db() -> None:
                 )
             conn.execute("DROP TABLE documents_legacy")
 
+        # ── Auth / ownership (users, audit, and owner columns) ─────────────────
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id            TEXT PRIMARY KEY,
+                username      TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                first_name    TEXT NOT NULL DEFAULT '',
+                last_name     TEXT NOT NULL DEFAULT '',
+                role          TEXT NOT NULL DEFAULT 'user',   -- admin | user
+                created_at    REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id          TEXT PRIMARY KEY,
+                user_id     TEXT,
+                username    TEXT,
+                action      TEXT NOT NULL,
+                document_id TEXT,
+                version     INTEGER,
+                detail      TEXT,
+                created_at  REAL NOT NULL
+            );
+            """
+        )
+        if "user_id" not in _columns(conn, "sessions"):
+            conn.execute("ALTER TABLE sessions ADD COLUMN user_id TEXT")
+        dcols = _columns(conn, "documents")
+        if "owner_id" not in dcols:
+            conn.execute("ALTER TABLE documents ADD COLUMN owner_id TEXT")
+        if "scope" not in dcols:
+            conn.execute("ALTER TABLE documents ADD COLUMN scope TEXT NOT NULL DEFAULT 'org'")
+        # Names on users (migrate older auth schema that only had username).
+        ucols = _columns(conn, "users")
+        if "first_name" not in ucols:
+            conn.execute("ALTER TABLE users ADD COLUMN first_name TEXT NOT NULL DEFAULT ''")
+        if "last_name" not in ucols:
+            conn.execute("ALTER TABLE users ADD COLUMN last_name TEXT NOT NULL DEFAULT ''")
+        # Persisted original file path (so versions can be downloaded later).
+        if "stored_path" not in _columns(conn, "document_versions"):
+            conn.execute("ALTER TABLE document_versions ADD COLUMN stored_path TEXT")
+
+
+# ─── Users & auth ────────────────────────────────────────────────────────────
+
+def create_user(username: str, password_hash: str, role: str = "user",
+                first_name: str = "", last_name: str = "") -> dict:
+    uid = _new_id()
+    ts = _now()
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO users (id, username, password_hash, first_name, last_name, role, created_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (uid, username, password_hash, first_name, last_name, role, ts),
+        )
+    return {"id": uid, "username": username, "first_name": first_name,
+            "last_name": last_name, "role": role, "created_at": ts}
+
+
+def get_user(user_id: str) -> Optional[dict]:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_user_by_username(username: str) -> Optional[dict]:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_users() -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, username, first_name, last_name, role, created_at FROM users ORDER BY created_at"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_users() -> int:
+    with _connect() as conn:
+        return int(conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"])
+
+
+def log_audit(user_id: Optional[str], username: Optional[str], action: str,
+              document_id: Optional[str] = None, version: Optional[int] = None,
+              detail: Optional[str] = None) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO audit_log (id,user_id,username,action,document_id,version,detail,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (_new_id(), user_id, username, action, document_id, version, detail, _now()),
+        )
+
+
+def list_audit(limit: int = 200) -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def assign_legacy_owner(admin_id: str) -> None:
+    """Give pre-auth sessions/documents an owner so they remain accessible."""
+    with _connect() as conn:
+        conn.execute("UPDATE sessions SET user_id=? WHERE user_id IS NULL", (admin_id,))
+        conn.execute(
+            "UPDATE documents SET owner_id=?, scope='org' WHERE owner_id IS NULL", (admin_id,)
+        )
+
 
 # ─── Sessions ──────────────────────────────────────────────────────────────
 
-def create_session(title: Optional[str] = None) -> dict:
+def create_session(user_id: str, title: Optional[str] = None) -> dict:
     sid = _new_id()
     ts = _now()
     title = (title or "Nouvelle conversation").strip() or "Nouvelle conversation"
     with _connect() as conn:
         conn.execute(
-            "INSERT INTO sessions (id, title, active_root_id, created_at, updated_at) "
-            "VALUES (?,?,?,?,?)",
-            (sid, title, None, ts, ts),
+            "INSERT INTO sessions (id, user_id, title, active_root_id, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (sid, user_id, title, None, ts, ts),
         )
-    return {"id": sid, "title": title, "created_at": ts, "updated_at": ts, "message_count": 0}
+    return {"id": sid, "user_id": user_id, "title": title, "created_at": ts, "updated_at": ts, "message_count": 0}
 
 
-def list_sessions() -> list[dict]:
+def list_sessions(user_id: str) -> list[dict]:
     with _connect() as conn:
         rows = conn.execute(
             """
@@ -191,9 +303,11 @@ def list_sessions() -> list[dict]:
                    COUNT(m.id) AS message_count
             FROM sessions s
             LEFT JOIN messages m ON m.session_id = s.id
+            WHERE s.user_id = ?
             GROUP BY s.id
             ORDER BY s.updated_at DESC
-            """
+            """,
+            (user_id,),
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -201,7 +315,7 @@ def list_sessions() -> list[dict]:
 def get_session(session_id: str) -> Optional[dict]:
     with _connect() as conn:
         row = conn.execute(
-            "SELECT id, title, active_root_id, created_at, updated_at "
+            "SELECT id, user_id, title, active_root_id, created_at, updated_at "
             "FROM sessions WHERE id=?",
             (session_id,),
         ).fetchone()
@@ -356,26 +470,38 @@ def count_messages(session_id: str) -> int:
 
 # ─── Documents (versioned) ───────────────────────────────────────────────────
 
-def get_or_create_document(name: str) -> dict:
-    """Return the active document for `name`, creating it (version 0) if needed."""
+def get_or_create_document(name: str, scope: str = "org", owner_id: Optional[str] = None) -> dict:
+    """
+    Return the active document identified by (scope, owner, name), creating it
+    (version 0) if needed. Org docs are keyed by name globally; personal docs are
+    keyed by (owner_id, name) so two users' same-named files never collide.
+    """
     ts = _now()
     with _connect() as conn:
-        row = conn.execute(
-            "SELECT * FROM documents WHERE name=? AND status!='deleted'", (name,)
-        ).fetchone()
+        if scope == "personal":
+            row = conn.execute(
+                "SELECT * FROM documents WHERE name=? AND scope='personal' AND owner_id=? "
+                "AND status!='deleted'",
+                (name, owner_id),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM documents WHERE name=? AND scope='org' AND status!='deleted'",
+                (name,),
+            ).fetchone()
         if row:
             return dict(row)
         did = _new_id()
         conn.execute(
-            "INSERT INTO documents (id,name,current_version,status,created_at,updated_at) "
-            "VALUES (?,?,?,?,?,?)",
-            (did, name, 0, "active", ts, ts),
+            "INSERT INTO documents (id,name,owner_id,scope,current_version,status,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (did, name, owner_id, scope, 0, "active", ts, ts),
         )
-        return {"id": did, "name": name, "current_version": 0, "status": "active",
-                "created_at": ts, "updated_at": ts}
+        return {"id": did, "name": name, "owner_id": owner_id, "scope": scope,
+                "current_version": 0, "status": "active", "created_at": ts, "updated_at": ts}
 
 
-def add_version(document_id: str, filename: str) -> dict:
+def add_version(document_id: str, filename: str, stored_path: Optional[str] = None) -> dict:
     """Create a new pending version for a document. Returns {id, version}."""
     ts = _now()
     with _connect() as conn:
@@ -387,11 +513,28 @@ def add_version(document_id: str, filename: str) -> dict:
         vid = _new_id()
         conn.execute(
             "INSERT INTO document_versions (id,document_id,version,filename,indexing_status,"
-            "is_latest,chunks,error,uploaded_at) VALUES (?,?,?,?,?,?,?,?,?)",
-            (vid, document_id, version, filename, "pending", 0, 0, None, ts),
+            "is_latest,chunks,error,uploaded_at,stored_path) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (vid, document_id, version, filename, "pending", 0, 0, None, ts, stored_path),
         )
         conn.execute("UPDATE documents SET updated_at=?, status='active' WHERE id=?", (ts, document_id))
     return {"id": vid, "document_id": document_id, "version": version}
+
+
+def set_version_file(version_id: str, stored_path: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE document_versions SET stored_path=? WHERE id=?", (stored_path, version_id)
+        )
+
+
+def document_stored_paths(document_id: str) -> list[str]:
+    """All on-disk file paths for a document's versions (for cleanup on purge)."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT stored_path FROM document_versions WHERE document_id=? AND stored_path IS NOT NULL",
+            (document_id,),
+        ).fetchall()
+    return [r["stored_path"] for r in rows]
 
 
 def set_version_status(version_id: str, status: str, chunks: Optional[int] = None,
@@ -435,6 +578,25 @@ def get_version(version_id: str) -> Optional[dict]:
     return dict(row) if row else None
 
 
+def get_version_by_number(document_id: str, version: int) -> Optional[dict]:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM document_versions WHERE document_id=? AND version=?",
+            (document_id, version),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def latest_version(document_id: str) -> Optional[dict]:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM document_versions WHERE document_id=? "
+            "ORDER BY is_latest DESC, version DESC LIMIT 1",
+            (document_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
 def list_versions(document_id: str) -> list[dict]:
     with _connect() as conn:
         rows = conn.execute(
@@ -444,13 +606,23 @@ def list_versions(document_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def list_documents(include_deleted: bool = False) -> list[dict]:
-    """One row per document, enriched with its latest version + version count."""
+def list_documents(include_deleted: bool = False, owner_id: Optional[str] = None,
+                   role: Optional[str] = None) -> list[dict]:
+    """
+    One row per document (latest version + count). Visibility: admins see all;
+    everyone else sees org docs + their own personal docs.
+    """
+    where = ["1=1"]
+    params: list = []
+    if not include_deleted:
+        where.append("status!='deleted'")
+    if role != "admin":
+        where.append("(scope='org' OR owner_id=?)")
+        params.append(owner_id)
     with _connect() as conn:
-        q = "SELECT * FROM documents"
-        if not include_deleted:
-            q += " WHERE status!='deleted'"
-        docs = [dict(r) for r in conn.execute(q + " ORDER BY updated_at DESC").fetchall()]
+        docs = [dict(r) for r in conn.execute(
+            f"SELECT * FROM documents WHERE {' AND '.join(where)} ORDER BY updated_at DESC", params
+        ).fetchall()]
         for d in docs:
             v = conn.execute(
                 "SELECT * FROM document_versions WHERE document_id=? "
@@ -465,11 +637,17 @@ def list_documents(include_deleted: bool = False) -> list[dict]:
     return docs
 
 
-def active_documents() -> list[dict]:
-    """Lightweight list for the chat scope selector."""
+def active_documents(owner_id: Optional[str] = None, role: Optional[str] = None) -> list[dict]:
+    """Lightweight visible-documents list for the chat scope selector."""
+    where = ["status='active'"]
+    params: list = []
+    if role != "admin":
+        where.append("(scope='org' OR owner_id=?)")
+        params.append(owner_id)
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT id, name, current_version FROM documents WHERE status='active' ORDER BY name"
+            f"SELECT id, name, scope, owner_id, current_version FROM documents "
+            f"WHERE {' AND '.join(where)} ORDER BY name", params
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -503,34 +681,37 @@ def clear_documents() -> None:
 
 
 def ensure_legacy_document(name: str, chunks: int) -> dict:
-    """For startup backfill: return {document_id, version} for a file, creating rows if missing."""
+    """For startup backfill: return {document_id, version, owner_id, scope} for a
+    file, creating org-scoped rows if missing."""
     ts = _now()
     with _connect() as conn:
         row = conn.execute("SELECT * FROM documents WHERE name=?", (name,)).fetchone()
         if row:
             did = row["id"]
+            owner_id = row["owner_id"] if "owner_id" in row.keys() else None
+            scope = row["scope"] if "scope" in row.keys() else "org"
             v = conn.execute(
                 "SELECT version FROM document_versions WHERE document_id=? AND is_latest=1",
                 (did,),
             ).fetchone()
             if v:
-                return {"document_id": did, "version": int(v["version"])}
+                return {"document_id": did, "version": int(v["version"]), "owner_id": owner_id, "scope": scope}
             conn.execute(
                 "INSERT INTO document_versions (id,document_id,version,filename,indexing_status,"
                 "is_latest,chunks,error,uploaded_at) VALUES (?,?,?,?,?,?,?,?,?)",
                 (_new_id(), did, 1, name, "indexed", 1, chunks, None, ts),
             )
             conn.execute("UPDATE documents SET current_version=1 WHERE id=?", (did,))
-            return {"document_id": did, "version": 1}
+            return {"document_id": did, "version": 1, "owner_id": owner_id, "scope": scope}
         did = _new_id()
         conn.execute(
-            "INSERT INTO documents (id,name,current_version,status,created_at,updated_at) "
-            "VALUES (?,?,?,?,?,?)",
-            (did, name, 1, "active", ts, ts),
+            "INSERT INTO documents (id,name,owner_id,scope,current_version,status,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (did, name, None, "org", 1, "active", ts, ts),
         )
         conn.execute(
             "INSERT INTO document_versions (id,document_id,version,filename,indexing_status,"
             "is_latest,chunks,error,uploaded_at) VALUES (?,?,?,?,?,?,?,?,?)",
             (_new_id(), did, 1, name, "indexed", 1, chunks, None, ts),
         )
-        return {"document_id": did, "version": 1}
+        return {"document_id": did, "version": 1, "owner_id": None, "scope": "org"}

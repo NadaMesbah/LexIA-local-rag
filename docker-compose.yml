@@ -35,6 +35,13 @@ services:
       - RERANK_MODEL=${RERANK_MODEL:-BAAI/bge-reranker-v2-m3}
       - RERANK_DEVICE=${RERANK_DEVICE:-cpu}
       - MEMORY_TOKEN_LIMIT=${MEMORY_TOKEN_LIMIT:-3000}
+      # Auth / RBAC
+      - JWT_SECRET=${JWT_SECRET:-change-me-to-a-long-random-secret}
+      - JWT_TTL_HOURS=${JWT_TTL_HOURS:-12}
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000}
+      - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-25}
       # Cache HuggingFace reranker weights inside the volume (download once).
       - HF_HOME=/app/data/hf_cache
     volumes:

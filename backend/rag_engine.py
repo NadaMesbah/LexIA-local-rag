@@ -30,10 +30,6 @@ from llama_index.core import (
 )
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.llms import ChatMessage, MessageRole
-from llama_index.core.memory import ChatMemoryBuffer
-from llama_index.core.chat_engine import SimpleChatEngine, ContextChatEngine
-from llama_index.core.postprocessor import SimilarityPostprocessor
-from llama_index.core.vector_stores import MetadataFilters, MetadataFilter, FilterOperator
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.llms.ollama import Ollama
 from llama_index.embeddings.ollama import OllamaEmbedding
@@ -169,14 +165,21 @@ def _language_directive(text: str) -> str:
     )
 
 
-def _scope_filters(scope: Optional[dict]) -> MetadataFilters:
-    """Always restrict to is_latest=true; optionally to one document (scope)."""
-    filters = [MetadataFilter(key="is_latest", value=True, operator=FilterOperator.EQ)]
-    if scope and scope.get("type") == "document" and scope.get("id"):
-        filters.append(
-            MetadataFilter(key="document_id", value=scope["id"], operator=FilterOperator.EQ)
-        )
-    return MetadataFilters(filters=filters)
+def _trim_history(history: list[dict]) -> list[dict]:
+    """Keep the most recent turns within the memory budget (~4 chars/token)."""
+    budget = MEMORY_TOKEN_LIMIT * 4
+    out: list[dict] = []
+    total = 0
+    for m in reversed(history):
+        content = m.get("content") or ""
+        if not content:
+            continue
+        total += len(content)
+        if total > budget and out:
+            break
+        out.append(m)
+    out.reverse()
+    return out
 
 
 class RAGEngine:
@@ -241,7 +244,8 @@ class RAGEngine:
             return None
 
     def _backfill_legacy(self):
-        """Give pre-Phase-2 chunks the version metadata so they stay retrievable."""
+        """Give pre-auth chunks the metadata (version + owner/scope) they need to
+        stay retrievable and correctly visibility-filtered."""
         try:
             got = self._chroma_collection.get(include=["metadatas"])
             ids = got.get("ids", []) or []
@@ -249,18 +253,27 @@ class RAGEngine:
             up_ids, up_mds = [], []
             for cid, md in zip(ids, mds):
                 md = dict(md or {})
+                changed = False
                 if "is_latest" not in md or "document_id" not in md:
                     name = md.get("file_name") or md.get("source") or "Unknown"
                     info = db.ensure_legacy_document(name, 0)
                     md["file_name"] = name
                     md["document_id"] = info["document_id"]
-                    md["version"] = info["version"]
+                    md.setdefault("version", info["version"])
                     md["is_latest"] = True
-                    up_ids.append(cid)
-                    up_mds.append(md)
+                    md["owner_id"] = info["owner_id"] or ""
+                    md["scope"] = info["scope"]
+                    changed = True
+                if "scope" not in md or "owner_id" not in md:
+                    doc = db.get_document(md.get("document_id")) if md.get("document_id") else None
+                    md["scope"] = (doc or {}).get("scope") or "org"
+                    md["owner_id"] = (doc or {}).get("owner_id") or ""
+                    changed = True
+                if changed:
+                    up_ids.append(cid); up_mds.append(md)
             if up_ids:
                 self._chroma_collection.update(ids=up_ids, metadatas=up_mds)
-                print(f"[RAG] Backfilled {len(up_ids)} legacy chunks with version metadata.")
+                print(f"[RAG] Backfilled {len(up_ids)} chunks with version/owner metadata.")
         except Exception as e:
             print(f"[RAG] backfill skipped ({e})")
 
@@ -293,62 +306,71 @@ class RAGEngine:
 
     # ─── Chat ──────────────────────────────────────────────────────────────────
 
-    def _memory(self, history: list[dict]):
-        chat_history = [
-            ChatMessage(
-                role=MessageRole.USER if m["role"] == "user" else MessageRole.ASSISTANT,
-                content=m["content"],
-            )
-            for m in history if m.get("content")
-        ]
-        return ChatMemoryBuffer.from_defaults(chat_history=chat_history, token_limit=MEMORY_TOKEN_LIMIT)
-
-    def _rerank(self, nodes, query: str):
-        if self._reranker and nodes:
-            try:
-                from llama_index.core.schema import QueryBundle
-                return self._reranker.postprocess_nodes(nodes, query_bundle=QueryBundle(query))
-            except Exception as e:
-                print(f"[RAG] rerank error ({e})")
-        return nodes
-
-    def _relevant_nodes(self, message: str, scope: Optional[dict]):
+    @staticmethod
+    def _visibility_where(user: Optional[dict], scope: Optional[dict]) -> dict:
         """
-        Retrieve candidates, then keep only LATEST-version chunks (optionally
-        scoped to one document) above the relevance cutoff. Pure-Python filtering
-        so correctness never depends on vector-store filter translation.
+        Chroma `where` clause: only latest chunks, restricted to the documents the
+        user may see (admins see all; others see org docs + their own), optionally
+        narrowed to one document. Pushed down into the vector store so a user's
+        nearest-neighbour set is never polluted by chunks they can't access.
         """
+        conds: list[dict] = [{"is_latest": True}]
+        if scope and scope.get("type") == "document" and scope.get("id"):
+            conds.append({"document_id": scope["id"]})
+        if user and user.get("role") != "admin":
+            conds.append({"$or": [{"scope": "org"}, {"owner_id": user["id"]}]})
+        return {"$and": conds} if len(conds) > 1 else conds[0]
+
+    def _rerank(self, items: list[dict], query: str) -> list[dict]:
+        if not (self._reranker and items):
+            return items
         try:
-            retriever = self._index.as_retriever(similarity_top_k=max(RETRIEVE_TOP_K * 3, 12))
-            nodes = retriever.retrieve(message)
+            from llama_index.core.schema import TextNode, NodeWithScore, QueryBundle
+            nodes = [NodeWithScore(node=TextNode(text=it["text"], metadata=it["metadata"]),
+                                   score=it["score"]) for it in items]
+            ranked = self._reranker.postprocess_nodes(nodes, query_bundle=QueryBundle(query))
+            return [{"text": n.node.get_content(), "metadata": n.node.metadata,
+                     "score": float(n.score or 0)} for n in ranked]
+        except Exception as e:
+            print(f"[RAG] rerank error ({e})")
+            return items
+
+    def _relevant_nodes(self, message: str, scope: Optional[dict], user: Optional[dict]) -> list[dict]:
+        """Vector search with the visibility filter pushed into Chroma, then cutoff + rerank."""
+        where = self._visibility_where(user, scope)
+        try:
+            emb = Settings.embed_model.get_query_embedding(message)
+            n = max(RETRIEVE_TOP_K * 3, 12) if self._reranker else RETRIEVE_TOP_K
+            res = self._chroma_collection.query(
+                query_embeddings=[emb], n_results=n, where=where,
+                include=["documents", "metadatas", "distances"],
+            )
         except Exception as e:
             print(f"[RAG] retrieval error ({e})")
             return []
-        scoped_id = scope.get("id") if (scope and scope.get("type") == "document") else None
-        kept = []
-        for n in nodes:
-            md = n.node.metadata or {}
-            if md.get("is_latest") is False:   # missing -> treat as latest (legacy safety)
-                continue
-            if scoped_id and md.get("document_id") != scoped_id:
-                continue
-            kept.append(n)
-        kept = [n for n in kept if (n.score or 0) >= RELEVANCE_CUTOFF]
-        kept = self._rerank(kept, message)
-        return kept[:RETRIEVE_TOP_K]
+        docs = (res.get("documents") or [[]])[0]
+        metas = (res.get("metadatas") or [[]])[0]
+        dists = (res.get("distances") or [[]])[0]
+        items = [
+            {"text": t or "", "metadata": m or {}, "score": 1.0 - float(d)}
+            for t, m, d in zip(docs, metas, dists)
+        ]
+        items = [it for it in items if it["score"] >= RELEVANCE_CUTOFF]
+        items = self._rerank(items, message)
+        return items[:RETRIEVE_TOP_K]
 
     @staticmethod
-    def _context_block(nodes) -> str:
+    def _context_block(items: list[dict]) -> str:
         parts = []
-        for n in nodes:
-            md = n.node.metadata or {}
+        for it in items:
+            md = it["metadata"]
             head = md.get("file_name", "document")
             if md.get("version"):
                 head += f" v{md['version']}"
             page = md.get("page_label")
             if page and page != "?":
                 head += f" p.{page}"
-            parts.append(f"[{head}]\n{n.node.get_content()}")
+            parts.append(f"[{head}]\n{it['text']}")
         return "\n\n".join(parts)
 
     def generate_title(self, message: str) -> str:
@@ -377,41 +399,38 @@ class RAGEngine:
             print(f"[RAG] router error ({e}); defaulting to document search")
             return True
 
-    async def stream_chat(self, message: str, history: list[dict], scope: Optional[dict] = None):
+    async def stream_chat(self, message: str, history: list[dict],
+                          scope: Optional[dict] = None, user: Optional[dict] = None):
         """
         Yields ("token", str)… then ("sources", list).
 
-        Retrieves over latest-version chunks (optionally scoped to one document)
-        and streams the answer directly from the LLM with the retrieved context
-        injected — no chat-engine wrapper, so the stream can't silently come back
-        empty. Grounds + cites when relevant chunks exist; otherwise answers
-        generally with no sources.
+        Retrieves over latest-version chunks the user is allowed to see (visibility
+        pushed into Chroma), optionally scoped to one document, and streams the
+        answer directly from the LLM with the retrieved context injected.
         """
         loop = asyncio.get_event_loop()
         directive = _language_directive(message)
         scoped = bool(scope and scope.get("type") == "document")
 
-        nodes = []
+        items = []
         if self.doc_count() > 0:
             wants = scoped or await loop.run_in_executor(
                 None, self._should_use_docs, message, history
             )
             if wants:
-                nodes = await loop.run_in_executor(None, self._relevant_nodes, message, scope)
+                items = await loop.run_in_executor(None, self._relevant_nodes, message, scope, user)
 
-        use_docs = len(nodes) > 0
+        use_docs = len(items) > 0
         if use_docs:
             system_text = (
                 SYSTEM_PROMPT + directive + "\n\n"
-                + CONTEXT_TEMPLATE.format(context_str=self._context_block(nodes))
+                + CONTEXT_TEMPLATE.format(context_str=self._context_block(items))
             )
         else:
             system_text = CONV_SYSTEM_PROMPT + directive
 
         msgs = [ChatMessage(role=MessageRole.SYSTEM, content=system_text)]
-        for m in history[-12:]:
-            if not m.get("content"):
-                continue
+        for m in _trim_history(history):
             msgs.append(ChatMessage(
                 role=MessageRole.USER if m["role"] == "user" else MessageRole.ASSISTANT,
                 content=m["content"],
@@ -428,22 +447,22 @@ class RAGEngine:
             if delta:
                 yield ("token", delta)
 
-        yield ("sources", self._format_sources(nodes) if use_docs else [])
+        yield ("sources", self._format_sources(items) if use_docs else [])
 
     @staticmethod
-    def _format_sources(source_nodes) -> list[dict]:
+    def _format_sources(items: list[dict]) -> list[dict]:
         sources = []
         seen = set()  # one source per document (best-scoring chunk)
-        for node in source_nodes or []:
-            md = node.node.metadata or {}
+        for it in items or []:
+            md = it["metadata"]
             key = md.get("document_id") or md.get("file_name")
             if key in seen:
                 continue
             seen.add(key)
-            content = node.node.get_content() or ""
+            text = it.get("text") or ""
             sources.append({
-                "text": content[:320] + ("…" if len(content) > 320 else ""),
-                "score": round(float(node.score or 0), 4),
+                "text": text[:320] + ("…" if len(text) > 320 else ""),
+                "score": round(float(it.get("score") or 0), 4),
                 "filename": md.get("file_name", "Unknown"),
                 "page": md.get("page_label", "?"),
                 "document_id": md.get("document_id"),
@@ -453,7 +472,8 @@ class RAGEngine:
 
     # ─── Ingestion & version management ────────────────────────────────────────
 
-    def index_version(self, file_path: str, filename: str, document_id: str, version: int) -> int:
+    def index_version(self, file_path: str, filename: str, document_id: str, version: int,
+                      owner_id: Optional[str] = None, scope: str = "org") -> int:
         """Chunk/embed a file as a new version, mark it is_latest, demote older ones."""
         with self._write_lock:
             documents = SimpleDirectoryReader(input_files=[file_path]).load_data()
@@ -465,6 +485,8 @@ class RAGEngine:
                     "document_id": document_id,
                     "version": version,
                     "is_latest": True,
+                    "owner_id": owner_id or "",   # Chroma metadata can't be None
+                    "scope": scope,
                 })
             self._index.insert_nodes(nodes)
             self._demote_other_versions(document_id, keep_version=version)
