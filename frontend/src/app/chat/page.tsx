@@ -54,6 +54,8 @@ export default function ChatPage() {
 
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const currentIdRef = useRef<string | null>(null);
+  useEffect(() => { currentIdRef.current = currentId; }, [currentId]);
 
   const refreshSessions = useCallback(async () => {
     try {
@@ -116,6 +118,8 @@ export default function ChatPage() {
       setStream({ ...EMPTY_STREAM, active: true, thinking: true, sessionId: sid });
       let acc = '';
       let srcs: Source[] = [];
+      let errored = false;
+      let errMsg = '';
       try {
         await api.streamNdjson(
           url,
@@ -128,23 +132,37 @@ export default function ChatPage() {
               srcs = e.data;
               setStream((s) => ({ ...s, sources: srcs }));
             } else if (e.type === 'error') {
+              errored = true;
+              errMsg = e.data;
               setStream((s) => ({ ...s, error: e.data }));
             }
           },
           controller.signal
         );
       } catch (err: any) {
-        if (err?.name !== 'AbortError') setStream((s) => ({ ...s, error: err?.message || 'Erreur' }));
+        if (err?.name !== 'AbortError') {
+          errored = true;
+          errMsg = err?.message || 'Erreur';
+          setStream((s) => ({ ...s, error: errMsg }));
+        }
       } finally {
         abortRef.current = null;
-        setStream((s) => ({ ...s, active: false }));
-        if (opts.firstTurn) await api.autotitleSession(sid).catch(() => {});
+        const ok = !errored && acc.trim().length > 0;
+        if (opts.firstTurn && ok) await api.autotitleSession(sid).catch(() => {});
         await refreshSessions();
-        // Reload the canonical tree (ids, version arrows) for the viewed session.
-        setCurrentId((cur) => {
-          if (cur === sid) reloadCurrent(sid);
-          return cur;
-        });
+        if (currentIdRef.current === sid) {
+          if (ok) {
+            // success: reload canonical tree (ids, version arrows)
+            reloadCurrent(sid);
+          } else {
+            // failure/empty: surface it instead of a silent "interrupted" state
+            const text = errored ? `⚠️ ${errMsg || 'Erreur'}` : (acc.trim() || '⚠️ Aucune réponse générée.');
+            setMessages((m) => [
+              ...m,
+              { id: `tmp-a-${Date.now()}`, parent_id: null, role: 'assistant', content: text, version_index: 1, version_count: 1, sibling_ids: [] },
+            ]);
+          }
+        }
         setStream(EMPTY_STREAM);
       }
     },

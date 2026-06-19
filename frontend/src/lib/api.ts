@@ -65,6 +65,12 @@ export const selectVersion = (sessionId: string, messageId: string) =>
 export const listDocuments = () =>
   fetch(`${API_BASE}/documents`).then((r) => asJson<{ documents: DocumentItem[] }>(r));
 
+export const listTrash = () =>
+  fetch(`${API_BASE}/documents/trash`).then((r) => asJson<{ documents: DocumentItem[] }>(r));
+
+export const undeleteDocument = (documentId: string) =>
+  fetch(`${API_BASE}/documents/${documentId}/undelete`, { method: 'POST' }).then((r) => asJson(r));
+
 export const listVersions = (documentId: string) =>
   fetch(`${API_BASE}/documents/${documentId}/versions`).then((r) =>
     asJson<{ versions: DocumentVersion[] }>(r)

@@ -344,6 +344,23 @@ async def list_documents():
     return {"documents": db.list_documents()}
 
 
+@app.get("/documents/trash")
+async def trashed_documents():
+    return {"documents": [d for d in db.list_documents(include_deleted=True) if d["status"] == "deleted"]}
+
+
+@app.post("/documents/{document_id}/undelete")
+async def undelete_document(document_id: str):
+    """Restore a soft-deleted document from the trash (re-enables its latest version)."""
+    doc = db.get_document(document_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    db.set_document_status(document_id, "active")
+    if doc["current_version"]:
+        rag.restore_version(document_id, doc["current_version"])
+    return {"ok": True}
+
+
 @app.get("/documents/{document_id}/versions")
 async def document_versions(document_id: str):
     if not db.get_document(document_id):

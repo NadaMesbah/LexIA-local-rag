@@ -273,35 +273,53 @@ class RAGEngine:
         ]
         return ChatMemoryBuffer.from_defaults(chat_history=chat_history, token_limit=MEMORY_TOKEN_LIMIT)
 
-    def _postprocessors(self):
-        pps = [SimilarityPostprocessor(similarity_cutoff=RELEVANCE_CUTOFF)]
-        if self._reranker:
-            pps.append(self._reranker)
-        return pps
+    def _rerank(self, nodes, query: str):
+        if self._reranker and nodes:
+            try:
+                from llama_index.core.schema import QueryBundle
+                return self._reranker.postprocess_nodes(nodes, query_bundle=QueryBundle(query))
+            except Exception as e:
+                print(f"[RAG] rerank error ({e})")
+        return nodes
 
-    def _build_doc_engine(self, memory, filters: MetadataFilters, lang_directive: str = ""):
-        retriever = self._index.as_retriever(similarity_top_k=RETRIEVE_TOP_K, filters=filters)
-        return ContextChatEngine.from_defaults(
-            retriever=retriever,
-            memory=memory,
-            system_prompt=SYSTEM_PROMPT + lang_directive,
-            context_template=CONTEXT_TEMPLATE,
-            node_postprocessors=self._postprocessors(),
-        )
-
-    def _build_chat_only_engine(self, memory, lang_directive: str = ""):
-        return SimpleChatEngine.from_defaults(
-            memory=memory, system_prompt=CONV_SYSTEM_PROMPT + lang_directive
-        )
-
-    def _relevant_nodes(self, message: str, filters: MetadataFilters):
+    def _relevant_nodes(self, message: str, scope: Optional[dict]):
+        """
+        Retrieve candidates, then keep only LATEST-version chunks (optionally
+        scoped to one document) above the relevance cutoff. Pure-Python filtering
+        so correctness never depends on vector-store filter translation.
+        """
         try:
-            retriever = self._index.as_retriever(similarity_top_k=RETRIEVE_TOP_K, filters=filters)
+            retriever = self._index.as_retriever(similarity_top_k=max(RETRIEVE_TOP_K * 3, 12))
             nodes = retriever.retrieve(message)
-            return SimilarityPostprocessor(similarity_cutoff=RELEVANCE_CUTOFF).postprocess_nodes(nodes)
         except Exception as e:
-            print(f"[RAG] retrieval check error ({e})")
+            print(f"[RAG] retrieval error ({e})")
             return []
+        scoped_id = scope.get("id") if (scope and scope.get("type") == "document") else None
+        kept = []
+        for n in nodes:
+            md = n.node.metadata or {}
+            if md.get("is_latest") is False:   # missing -> treat as latest (legacy safety)
+                continue
+            if scoped_id and md.get("document_id") != scoped_id:
+                continue
+            kept.append(n)
+        kept = [n for n in kept if (n.score or 0) >= RELEVANCE_CUTOFF]
+        kept = self._rerank(kept, message)
+        return kept[:RETRIEVE_TOP_K]
+
+    @staticmethod
+    def _context_block(nodes) -> str:
+        parts = []
+        for n in nodes:
+            md = n.node.metadata or {}
+            head = md.get("file_name", "document")
+            if md.get("version"):
+                head += f" v{md['version']}"
+            page = md.get("page_label")
+            if page and page != "?":
+                head += f" p.{page}"
+            parts.append(f"[{head}]\n{n.node.get_content()}")
+        return "\n\n".join(parts)
 
     def generate_title(self, message: str) -> str:
         fallback = " ".join((message or "").split())[:48] or "Conversation"
@@ -333,42 +351,54 @@ class RAGEngine:
         """
         Yields ("token", str)… then ("sources", list).
 
-        Always retrieves over is_latest chunks (optionally scoped to one document).
-        Grounds + cites when relevant chunks exist; otherwise answers generally
-        with no sources.
+        Retrieves over latest-version chunks (optionally scoped to one document)
+        and streams the answer directly from the LLM with the retrieved context
+        injected — no chat-engine wrapper, so the stream can't silently come back
+        empty. Grounds + cites when relevant chunks exist; otherwise answers
+        generally with no sources.
         """
         loop = asyncio.get_event_loop()
-        filters = _scope_filters(scope)
+        directive = _language_directive(message)
         scoped = bool(scope and scope.get("type") == "document")
 
-        relevant = []
+        nodes = []
         if self.doc_count() > 0:
-            wants = scoped or await loop.run_in_executor(None, self._should_use_docs, message, history)
+            wants = scoped or await loop.run_in_executor(
+                None, self._should_use_docs, message, history
+            )
             if wants:
-                relevant = await loop.run_in_executor(None, self._relevant_nodes, message, filters)
+                nodes = await loop.run_in_executor(None, self._relevant_nodes, message, scope)
 
-        use_docs = len(relevant) > 0
-        memory = self._memory(history)
-        directive = _language_directive(message)
-        engine = (
-            self._build_doc_engine(memory, filters, directive)
-            if use_docs
-            else self._build_chat_only_engine(memory, directive)
-        )
+        use_docs = len(nodes) > 0
+        if use_docs:
+            system_text = (
+                SYSTEM_PROMPT + directive + "\n\n"
+                + CONTEXT_TEMPLATE.format(context_str=self._context_block(nodes))
+            )
+        else:
+            system_text = CONV_SYSTEM_PROMPT + directive
 
-        streaming_response = await loop.run_in_executor(None, lambda: engine.stream_chat(message))
-        gen = streaming_response.response_gen
+        msgs = [ChatMessage(role=MessageRole.SYSTEM, content=system_text)]
+        for m in history[-12:]:
+            if not m.get("content"):
+                continue
+            msgs.append(ChatMessage(
+                role=MessageRole.USER if m["role"] == "user" else MessageRole.ASSISTANT,
+                content=m["content"],
+            ))
+        msgs.append(ChatMessage(role=MessageRole.USER, content=message))
+
+        gen = await loop.run_in_executor(None, lambda: Settings.llm.stream_chat(msgs))
         sentinel = object()
         while True:
-            token = await loop.run_in_executor(None, next, gen, sentinel)
-            if token is sentinel:
+            resp = await loop.run_in_executor(None, next, gen, sentinel)
+            if resp is sentinel:
                 break
-            yield ("token", token)
+            delta = getattr(resp, "delta", None)
+            if delta:
+                yield ("token", delta)
 
-        sources = (
-            self._format_sources(getattr(streaming_response, "source_nodes", [])) if use_docs else []
-        )
-        yield ("sources", sources)
+        yield ("sources", self._format_sources(nodes) if use_docs else [])
 
     @staticmethod
     def _format_sources(source_nodes) -> list[dict]:

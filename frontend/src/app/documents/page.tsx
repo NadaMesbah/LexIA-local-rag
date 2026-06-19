@@ -23,6 +23,8 @@ import Alert from '@mui/material/Alert';
 import List from '@mui/material/List';
 import ListItem from '@mui/material/ListItem';
 import ListItemText from '@mui/material/ListItemText';
+import Tabs from '@mui/material/Tabs';
+import Tab from '@mui/material/Tab';
 import { DataGrid, type GridColDef } from '@mui/x-data-grid';
 import CloudUploadRoundedIcon from '@mui/icons-material/CloudUploadRounded';
 import DeleteOutlineRoundedIcon from '@mui/icons-material/DeleteOutlineRounded';
@@ -30,6 +32,7 @@ import DeleteForeverRoundedIcon from '@mui/icons-material/DeleteForeverRounded';
 import HistoryRoundedIcon from '@mui/icons-material/HistoryRounded';
 import UploadFileRoundedIcon from '@mui/icons-material/UploadFileRounded';
 import RestoreRoundedIcon from '@mui/icons-material/RestoreRounded';
+import RestoreFromTrashRoundedIcon from '@mui/icons-material/RestoreFromTrashRounded';
 import SearchRoundedIcon from '@mui/icons-material/SearchRounded';
 import * as api from '@/lib/api';
 import type { DocumentItem, DocumentVersion, IndexingStatus } from '@/lib/types';
@@ -63,6 +66,8 @@ function StatusChip({ s }: { s?: IndexingStatus }) {
 
 export default function DocumentsPage() {
   const [docs, setDocs] = useState<DocumentItem[]>([]);
+  const [trash, setTrash] = useState<DocumentItem[]>([]);
+  const [tab, setTab] = useState<'active' | 'trash'>('active');
   const [query, setQuery] = useState('');
   const [uploading, setUploading] = useState(false);
   const [toast, setToast] = useState<{ msg: string; sev: 'success' | 'error' } | null>(null);
@@ -78,9 +83,35 @@ export default function DocumentsPage() {
     } catch {/* ignore */}
   }, []);
 
+  const refreshTrash = useCallback(async () => {
+    try {
+      const { documents } = await api.listTrash();
+      setTrash(documents);
+    } catch {/* ignore */}
+  }, []);
+
   useEffect(() => {
     refresh();
-  }, [refresh]);
+    refreshTrash();
+  }, [refresh, refreshTrash]);
+
+  useEffect(() => {
+    if (tab === 'trash') refreshTrash();
+  }, [tab, refreshTrash]);
+
+  const undelete = useCallback(
+    async (doc: DocumentItem) => {
+      try {
+        await api.undeleteDocument(doc.id);
+        setToast({ msg: `« ${doc.name} » restauré.`, sev: 'success' });
+        refresh();
+        refreshTrash();
+      } catch (e: any) {
+        setToast({ msg: `Échec : ${e?.message}`, sev: 'error' });
+      }
+    },
+    [refresh, refreshTrash]
+  );
 
   // Poll while any document is still indexing.
   const anyPending = useMemo(
@@ -154,11 +185,12 @@ export default function DocumentsPage() {
       else await api.purgeDocument(confirm.doc.id);
       setToast({ msg: `« ${confirm.doc.name} » supprimé.`, sev: 'success' });
       refresh();
+      refreshTrash();
     } catch (e: any) {
       setToast({ msg: `Échec : ${e?.message}`, sev: 'error' });
     }
     setConfirm(null);
-  }, [confirm, refresh]);
+  }, [confirm, refresh, refreshTrash]);
 
   const onPickNewVersion = useCallback(
     async (files: FileList | null) => {
@@ -179,7 +211,7 @@ export default function DocumentsPage() {
 
   const rows = useMemo(
     () =>
-      docs
+      (tab === 'trash' ? trash : docs)
         .filter((d) => d.name.toLowerCase().includes(query.toLowerCase()))
         .map((d) => ({
           id: d.id,
@@ -191,7 +223,7 @@ export default function DocumentsPage() {
           chunks: d.latest?.chunks ?? 0,
           updated: d.updated_at ? new Date(d.updated_at * 1000) : null,
         })),
-    [docs, query]
+    [docs, trash, tab, query]
   );
 
   const columns: GridColDef[] = [
@@ -227,19 +259,32 @@ export default function DocumentsPage() {
     {
       field: 'actions', headerName: '', width: 130, sortable: false, filterable: false, align: 'right',
       renderCell: (p) => (
-        <Box>
-          <Tooltip title="Versions / restaurer">
-            <IconButton size="small" onClick={() => openHistory(p.row.doc)}><HistoryRoundedIcon fontSize="small" /></IconButton>
-          </Tooltip>
-          <Tooltip title="Supprimer (corbeille)">
-            <IconButton size="small" onClick={() => setConfirm({ doc: p.row.doc, mode: 'soft' })}
-              sx={{ '&:hover': { color: 'warning.main' } }}><DeleteOutlineRoundedIcon fontSize="small" /></IconButton>
-          </Tooltip>
-          <Tooltip title="Supprimer définitivement">
-            <IconButton size="small" onClick={() => setConfirm({ doc: p.row.doc, mode: 'purge' })}
-              sx={{ '&:hover': { color: 'error.main' } }}><DeleteForeverRoundedIcon fontSize="small" /></IconButton>
-          </Tooltip>
-        </Box>
+        tab === 'trash' ? (
+          <Box>
+            <Tooltip title="Restaurer">
+              <IconButton size="small" onClick={() => undelete(p.row.doc)}
+                sx={{ '&:hover': { color: 'success.main' } }}><RestoreFromTrashRoundedIcon fontSize="small" /></IconButton>
+            </Tooltip>
+            <Tooltip title="Supprimer définitivement">
+              <IconButton size="small" onClick={() => setConfirm({ doc: p.row.doc, mode: 'purge' })}
+                sx={{ '&:hover': { color: 'error.main' } }}><DeleteForeverRoundedIcon fontSize="small" /></IconButton>
+            </Tooltip>
+          </Box>
+        ) : (
+          <Box>
+            <Tooltip title="Versions / restaurer">
+              <IconButton size="small" onClick={() => openHistory(p.row.doc)}><HistoryRoundedIcon fontSize="small" /></IconButton>
+            </Tooltip>
+            <Tooltip title="Supprimer (corbeille)">
+              <IconButton size="small" onClick={() => setConfirm({ doc: p.row.doc, mode: 'soft' })}
+                sx={{ '&:hover': { color: 'warning.main' } }}><DeleteOutlineRoundedIcon fontSize="small" /></IconButton>
+            </Tooltip>
+            <Tooltip title="Supprimer définitivement">
+              <IconButton size="small" onClick={() => setConfirm({ doc: p.row.doc, mode: 'purge' })}
+                sx={{ '&:hover': { color: 'error.main' } }}><DeleteForeverRoundedIcon fontSize="small" /></IconButton>
+            </Tooltip>
+          </Box>
+        )
       ),
     },
   ];
@@ -253,6 +298,12 @@ export default function DocumentsPage() {
           toujours la dernière version indexée.
         </Typography>
 
+        <Tabs value={tab} onChange={(_, v) => setTab(v)} sx={{ mb: 2 }}>
+          <Tab value="active" label="Actifs" />
+          <Tab value="trash" label={`Corbeille${trash.length ? ' (' + trash.length + ')' : ''}`} />
+        </Tabs>
+
+        {tab === 'active' && (
         <Box {...getRootProps()} sx={{
           p: 4, mb: 3, borderRadius: 2, border: '1.5px dashed',
           borderColor: isDragActive ? 'primary.main' : 'rgba(145,158,171,0.32)',
@@ -265,6 +316,7 @@ export default function DocumentsPage() {
           <Button variant="contained" onClick={open} disabled={uploading}>Parcourir les fichiers</Button>
           {uploading && <LinearProgress sx={{ mt: 2, borderRadius: 1 }} />}
         </Box>
+        )}
 
         <Card sx={{ p: 0 }}>
           <Box sx={{ p: 2 }}>
