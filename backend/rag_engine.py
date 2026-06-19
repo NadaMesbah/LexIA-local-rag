@@ -224,6 +224,7 @@ class RAGEngine:
 
         self._reranker = self._build_reranker()
         self._backfill_legacy()
+        self._reconcile_latest()
         print("[RAG] Engine ready.")
 
     def _build_reranker(self):
@@ -262,6 +263,33 @@ class RAGEngine:
                 print(f"[RAG] Backfilled {len(up_ids)} legacy chunks with version metadata.")
         except Exception as e:
             print(f"[RAG] backfill skipped ({e})")
+
+    def _reconcile_latest(self):
+        """
+        Repair is_latest across all chunks using the DB as source of truth:
+        only the active document's current_version stays is_latest=true. Fixes
+        stale/duplicate-version chunks left by older code or failed flips.
+        """
+        try:
+            latest = {}  # document_id -> current_version (None if deleted/inactive)
+            for d in db.list_documents(include_deleted=True):
+                latest[d["id"]] = d["current_version"] if d["status"] == "active" else None
+            got = self._chroma_collection.get(include=["metadatas"])
+            ids = got.get("ids", []) or []
+            mds = got.get("metadatas", []) or []
+            cids, cmds = [], []
+            for cid, md in zip(ids, mds):
+                md = dict(md or {})
+                did = md.get("document_id")
+                want = did in latest and latest[did] is not None and md.get("version") == latest[did]
+                if bool(md.get("is_latest")) != want:
+                    md["is_latest"] = want
+                    cids.append(cid); cmds.append(md)
+            if cids:
+                self._chroma_collection.update(ids=cids, metadatas=cmds)
+                print(f"[RAG] Reconciled is_latest on {len(cids)} chunks.")
+        except Exception as e:
+            print(f"[RAG] reconcile skipped ({e})")
 
     # ─── Chat ──────────────────────────────────────────────────────────────────
 
@@ -405,9 +433,14 @@ class RAGEngine:
     @staticmethod
     def _format_sources(source_nodes) -> list[dict]:
         sources = []
+        seen = set()  # one source per document (best-scoring chunk)
         for node in source_nodes or []:
-            content = node.node.get_content() or ""
             md = node.node.metadata or {}
+            key = md.get("document_id") or md.get("file_name")
+            if key in seen:
+                continue
+            seen.add(key)
+            content = node.node.get_content() or ""
             sources.append({
                 "text": content[:320] + ("…" if len(content) > 320 else ""),
                 "score": round(float(node.score or 0), 4),
@@ -437,63 +470,35 @@ class RAGEngine:
             self._demote_other_versions(document_id, keep_version=version)
             return len(nodes)
 
-    def _demote_other_versions(self, document_id: str, keep_version: int):
+    def _set_latest_for_document(self, document_id: str, latest_version):
+        """Set is_latest=true only for chunks of `latest_version` (None => none)."""
         try:
-            got = self._chroma_collection.get(
-                where={"$and": [{"document_id": document_id}, {"version": {"$ne": keep_version}}]},
-                include=["metadatas"],
-            )
+            got = self._chroma_collection.get(where={"document_id": document_id}, include=["metadatas"])
             ids = got.get("ids", []) or []
             mds = got.get("metadatas", []) or []
             cids, cmds = [], []
             for cid, md in zip(ids, mds):
-                if md and md.get("is_latest"):
-                    md = dict(md); md["is_latest"] = False
+                want = latest_version is not None and md.get("version") == latest_version
+                if bool(md.get("is_latest")) != want:
+                    md = dict(md); md["is_latest"] = want
                     cids.append(cid); cmds.append(md)
             if cids:
                 self._chroma_collection.update(ids=cids, metadatas=cmds)
         except Exception as e:
-            print(f"[RAG] demote error ({e})")
+            print(f"[RAG] set-latest error ({e})")
+
+    def _demote_other_versions(self, document_id: str, keep_version: int):
+        self._set_latest_for_document(document_id, keep_version)
 
     def set_document_hidden(self, document_id: str):
-        """Soft-delete: remove all of a document's chunks from retrieval (is_latest=false)."""
+        """Soft-delete: remove all of a document's chunks from retrieval."""
         with self._write_lock:
-            self._set_is_latest_where({"document_id": document_id}, False)
+            self._set_latest_for_document(document_id, None)
 
     def restore_version(self, document_id: str, version: int):
-        """Rollback: make `version`'s chunks is_latest, all other versions not."""
+        """Rollback / undelete: make `version`'s chunks the only latest ones."""
         with self._write_lock:
-            try:
-                got = self._chroma_collection.get(
-                    where={"document_id": document_id}, include=["metadatas"]
-                )
-                ids = got.get("ids", []) or []
-                mds = got.get("metadatas", []) or []
-                cids, cmds = [], []
-                for cid, md in zip(ids, mds):
-                    want = md.get("version") == version
-                    if bool(md.get("is_latest")) != want:
-                        md = dict(md); md["is_latest"] = want
-                        cids.append(cid); cmds.append(md)
-                if cids:
-                    self._chroma_collection.update(ids=cids, metadatas=cmds)
-            except Exception as e:
-                print(f"[RAG] restore error ({e})")
-
-    def _set_is_latest_where(self, where: dict, value: bool):
-        try:
-            got = self._chroma_collection.get(where=where, include=["metadatas"])
-            ids = got.get("ids", []) or []
-            mds = got.get("metadatas", []) or []
-            cids, cmds = [], []
-            for cid, md in zip(ids, mds):
-                if bool(md.get("is_latest")) != value:
-                    md = dict(md); md["is_latest"] = value
-                    cids.append(cid); cmds.append(md)
-            if cids:
-                self._chroma_collection.update(ids=cids, metadatas=cmds)
-        except Exception as e:
-            print(f"[RAG] is_latest update error ({e})")
+            self._set_latest_for_document(document_id, version)
 
     def purge_document(self, document_id: str):
         """Hard-delete: permanently remove all of a document's vectors."""

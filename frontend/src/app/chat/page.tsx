@@ -23,31 +23,38 @@ import * as api from '@/lib/api';
 
 interface StreamState {
   active: boolean;
-  sessionId: string | null;
   answer: string;
   sources: Source[];
   thinking: boolean;
   error: string | null;
 }
 
-const EMPTY_STREAM: StreamState = {
-  active: false, sessionId: null, answer: '', sources: [], thinking: false, error: null,
-};
+const EMPTY_STREAM: StreamState = { active: false, answer: '', sources: [], thinking: false, error: null };
 
 export default function ChatPage() {
   const [status, setStatus] = useState<Status | null>(null);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [currentId, setCurrentId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
-  const [stream, setStream] = useState<StreamState>(EMPTY_STREAM);
+  // One in-flight generation per conversation → parallel chats across sessions.
+  const [streams, setStreams] = useState<Record<string, StreamState>>({});
   const [confirmId, setConfirmId] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const [toast, setToast] = useState<{ msg: string; sev: 'success' | 'error' } | null>(null);
 
-  const abortRef = useRef<AbortController | null>(null);
+  const controllersRef = useRef<Record<string, AbortController>>({});
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const currentIdRef = useRef<string | null>(null);
+  const sessionsRef = useRef<SessionSummary[]>([]);
   useEffect(() => { currentIdRef.current = currentId; }, [currentId]);
+  useEffect(() => { sessionsRef.current = sessions; }, [sessions]);
+
+  const setStreamFor = useCallback((sid: string, patch: Partial<StreamState>) => {
+    setStreams((prev) => ({ ...prev, [sid]: { ...(prev[sid] || EMPTY_STREAM), ...patch } }));
+  }, []);
+  const clearStreamFor = useCallback((sid: string) => {
+    setStreams((prev) => { const n = { ...prev }; delete n[sid]; return n; });
+  }, []);
 
   const refreshSessions = useCallback(async () => {
     try {
@@ -55,20 +62,14 @@ export default function ChatPage() {
       setSessions(sessions);
     } catch {/* ignore */}
   }, []);
+  const refreshStatus = useCallback(() => { api.getStatus().then(setStatus).catch(() => {}); }, []);
 
-  const refreshStatus = useCallback(() => {
-    api.getStatus().then(setStatus).catch(() => {});
-  }, []);
-
-  useEffect(() => {
-    refreshStatus();
-    refreshSessions();
-  }, [refreshStatus, refreshSessions]);
+  useEffect(() => { refreshStatus(); refreshSessions(); }, [refreshStatus, refreshSessions]);
 
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [messages, stream.answer, stream.active]);
+  }, [messages, streams, currentId]);
 
   const openSession = useCallback(async (id: string) => {
     setCurrentId(id);
@@ -80,10 +81,7 @@ export default function ChatPage() {
     }
   }, []);
 
-  const newConversation = useCallback(() => {
-    setCurrentId(null);
-    setMessages([]);
-  }, []);
+  const newConversation = useCallback(() => { setCurrentId(null); setMessages([]); }, []);
 
   const reloadCurrent = useCallback(async (id: string) => {
     try {
@@ -92,48 +90,52 @@ export default function ChatPage() {
     } catch {/* ignore */}
   }, []);
 
+  // Shared streaming runner, keyed by session so multiple can run at once.
   const runStream = useCallback(
     async (url: string, body: Record<string, unknown> | undefined, sid: string, opts: { firstTurn?: boolean } = {}) => {
       const controller = new AbortController();
-      abortRef.current = controller;
-      setStream({ ...EMPTY_STREAM, active: true, thinking: true, sessionId: sid });
+      controllersRef.current[sid] = controller;
+      setStreamFor(sid, { active: true, thinking: true, answer: '', sources: [], error: null });
       let acc = '';
       let errored = false;
       let errMsg = '';
+      let doneTitle = '';
       try {
         await api.streamNdjson(
           url, body,
           (e: StreamEvent) => {
-            if (e.type === 'token') { acc += e.data; setStream((s) => ({ ...s, thinking: false, answer: acc })); }
-            else if (e.type === 'sources') { setStream((s) => ({ ...s, sources: e.data })); }
-            else if (e.type === 'error') { errored = true; errMsg = e.data; setStream((s) => ({ ...s, error: e.data })); }
+            if (e.type === 'token') { acc += e.data; setStreamFor(sid, { thinking: false, answer: acc }); }
+            else if (e.type === 'sources') { setStreamFor(sid, { sources: e.data }); }
+            else if (e.type === 'error') { errored = true; errMsg = e.data; setStreamFor(sid, { error: e.data }); }
+            else if (e.type === 'done') { doneTitle = e.title; }
           },
           controller.signal
         );
       } catch (err: any) {
-        if (err?.name !== 'AbortError') { errored = true; errMsg = err?.message || 'Erreur'; setStream((s) => ({ ...s, error: errMsg })); }
+        if (err?.name !== 'AbortError') { errored = true; errMsg = err?.message || 'Erreur'; setStreamFor(sid, { error: errMsg }); }
       } finally {
-        abortRef.current = null;
+        delete controllersRef.current[sid];
         const ok = !errored && acc.trim().length > 0;
         if (opts.firstTurn && ok) await api.autotitleSession(sid).catch(() => {});
         await refreshSessions();
-        if (currentIdRef.current === sid) {
-          if (ok) {
-            reloadCurrent(sid);
-          } else {
-            const text = errored ? `⚠️ ${errMsg || 'Erreur'}` : (acc.trim() || '⚠️ Aucune réponse générée.');
-            setMessages((m) => [...m, { id: `tmp-a-${Date.now()}`, parent_id: null, role: 'assistant', content: text, version_index: 1, version_count: 1, sibling_ids: [] }]);
-          }
+        const viewing = currentIdRef.current === sid;
+        if (viewing && ok) {
+          await reloadCurrent(sid);
+        } else if (viewing && !ok) {
+          const text = errored ? `⚠️ ${errMsg || 'Erreur'}` : (acc.trim() || '⚠️ Aucune réponse générée.');
+          setMessages((m) => [...m, { id: `tmp-a-${Date.now()}`, parent_id: null, role: 'assistant', content: text, version_index: 1, version_count: 1, sibling_ids: [] }]);
+        } else if (!viewing && ok) {
+          const title = doneTitle || sessionsRef.current.find((s) => s.id === sid)?.title || 'une conversation';
+          setToast({ msg: `Réponse prête : « ${title} »`, sev: 'success' });
         }
-        setStream(EMPTY_STREAM);
+        clearStreamFor(sid);
       }
     },
-    [refreshSessions, reloadCurrent]
+    [setStreamFor, clearStreamFor, refreshSessions, reloadCurrent]
   );
 
   const handleSend = useCallback(
     async (text: string) => {
-      if (stream.active) return;
       let sid = currentId;
       const firstTurn = !sid || messages.length === 0;
       if (!sid) {
@@ -144,15 +146,16 @@ export default function ChatPage() {
           await refreshSessions();
         } catch { return; }
       }
+      if (streams[sid]?.active) return; // this conversation is already generating
       setMessages((m) => [...m, { id: `tmp-${Date.now()}`, parent_id: null, role: 'user', content: text, version_index: 1, version_count: 1, sibling_ids: [] }]);
-      await runStream(api.chatUrl(sid!), { message: text }, sid!, { firstTurn });
+      void runStream(api.chatUrl(sid), { message: text }, sid, { firstTurn });
     },
-    [currentId, messages.length, stream.active, runStream, refreshSessions]
+    [currentId, messages.length, streams, runStream, refreshSessions]
   );
 
   const handleEdit = useCallback(
     async (id: string, text: string) => {
-      if (!currentId || !text || stream.active) return;
+      if (!currentId || !text || streams[currentId]?.active) return;
       setMessages((prev) => {
         const i = prev.findIndex((m) => m.id === id);
         if (i < 0) return prev;
@@ -160,39 +163,42 @@ export default function ChatPage() {
         copy[i] = { ...copy[i], content: text };
         return copy;
       });
-      await runStream(api.editUrl(currentId, id), { message: text }, currentId, {});
+      void runStream(api.editUrl(currentId, id), { message: text }, currentId, {});
     },
-    [currentId, stream.active, runStream]
+    [currentId, streams, runStream]
   );
 
   const handleRegenerate = useCallback(
     async (userMessageId: string) => {
-      if (!currentId || stream.active) return;
+      if (!currentId || streams[currentId]?.active) return;
       setMessages((prev) => {
         const i = prev.findIndex((m) => m.id === userMessageId);
         return i < 0 ? prev : prev.slice(0, i + 1);
       });
-      await runStream(api.regenerateUrl(currentId, userMessageId), {}, currentId, {});
+      void runStream(api.regenerateUrl(currentId, userMessageId), {}, currentId, {});
     },
-    [currentId, stream.active, runStream]
+    [currentId, streams, runStream]
   );
 
   const handleSwitchVersion = useCallback(
     async (messageId: string) => {
-      if (!currentId || stream.active) return;
+      if (!currentId || streams[currentId]?.active) return;
       try {
         await api.selectVersion(currentId, messageId);
         await reloadCurrent(currentId);
       } catch {/* ignore */}
     },
-    [currentId, stream.active, reloadCurrent]
+    [currentId, streams, reloadCurrent]
   );
 
-  const handleStop = useCallback(() => abortRef.current?.abort(), []);
+  const handleStop = useCallback(() => {
+    if (currentId) controllersRef.current[currentId]?.abort();
+  }, [currentId]);
 
   const handleDelete = useCallback(
     async (id: string) => {
       try {
+        controllersRef.current[id]?.abort();
         await api.deleteSession(id);
         if (currentId === id) newConversation();
         await refreshSessions();
@@ -214,14 +220,17 @@ export default function ChatPage() {
     refreshStatus();
   }, [refreshStatus]);
 
+  const cur = currentId ? streams[currentId] : undefined;
   const liveLastUser = messages.length > 0 && messages[messages.length - 1].role === 'user';
   const showGroundingFlag = (status?.total_documents || 0) > 0;
+  const busySessions = Object.entries(streams).filter(([, s]) => s.active).map(([id]) => id);
 
   return (
     <Box sx={{ display: 'flex', height: '100%' }}>
       <ConversationsRail
         sessions={sessions}
         currentId={currentId}
+        busyIds={busySessions}
         onNew={newConversation}
         onSelect={openSession}
         onDelete={(id) => setConfirmId(id)}
@@ -236,7 +245,7 @@ export default function ChatPage() {
 
         <Box ref={scrollRef} sx={{ flexGrow: 1, overflowY: 'auto', px: { xs: 2, md: 6 }, py: 3 }}>
           <Box sx={{ maxWidth: 860, mx: 'auto', display: 'flex', flexDirection: 'column', gap: 2.5 }}>
-            {messages.length === 0 && !stream.active && (
+            {messages.length === 0 && !cur?.active && (
               <Box sx={{ textAlign: 'center', py: 8, color: 'text.secondary' }}>
                 <Box sx={{ width: 64, height: 64, mx: 'auto', mb: 2, borderRadius: 2.5, bgcolor: 'rgba(0,167,111,0.12)', color: 'primary.main', display: 'grid', placeItems: 'center' }}>
                   <AutoAwesomeRoundedIcon fontSize="large" />
@@ -262,17 +271,17 @@ export default function ChatPage() {
               />
             ))}
 
-            {stream.active && stream.sessionId === currentId && (
+            {cur?.active && (
               <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 0.5 }}>
                 <Typography variant="caption" sx={{ color: 'warning.dark', fontWeight: 700 }}>ASSISTANT</Typography>
                 <Paper sx={{ px: 2, py: 1.5, width: '100%', border: '1px solid rgba(145,158,171,0.2)', boxShadow: 'none', borderRadius: 2 }}>
-                  {stream.thinking && !stream.answer ? (
+                  {cur.thinking && !cur.answer ? (
                     <Typography variant="body2" sx={{ color: 'text.secondary', fontStyle: 'italic' }}>Recherche dans la base…</Typography>
-                  ) : stream.error ? (
-                    <Typography variant="body2" color="error">⚠️ {stream.error}</Typography>
+                  ) : cur.error ? (
+                    <Typography variant="body2" color="error">⚠️ {cur.error}</Typography>
                   ) : (
                     <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap', lineHeight: 1.7 }}>
-                      {stream.answer}
+                      {cur.answer}
                       <Box component="span" sx={{ animation: 'blink 1s steps(2) infinite', '@keyframes blink': { '50%': { opacity: 0 } } }}>▋</Box>
                     </Typography>
                   )}
@@ -280,7 +289,7 @@ export default function ChatPage() {
               </Box>
             )}
 
-            {liveLastUser && !stream.active && (
+            {liveLastUser && !cur?.active && (
               <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, color: 'text.secondary' }}>
                 <Typography variant="body2">La réponse a été interrompue.</Typography>
                 <Button size="small" variant="outlined" color="inherit" startIcon={<RefreshRoundedIcon />}
@@ -292,7 +301,7 @@ export default function ChatPage() {
           </Box>
         </Box>
 
-        <Composer streaming={stream.active} uploading={uploading} onSend={handleSend} onStop={handleStop} onAttach={handleAttach} />
+        <Composer streaming={!!cur?.active} uploading={uploading} onSend={handleSend} onStop={handleStop} onAttach={handleAttach} />
       </Box>
 
       <Dialog open={!!confirmId} onClose={() => setConfirmId(null)} PaperProps={{ sx: { borderRadius: 2 } }}>

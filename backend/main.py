@@ -25,6 +25,7 @@ The chat endpoint streams newline-delimited JSON (NDJSON). Each line is one of:
 """
 
 import os
+import re
 import json
 import shutil
 import tempfile
@@ -56,6 +57,16 @@ rag = RAGEngine()
 # Single-worker pool: document indexing runs in the background, serialized so it
 # never thrashes the GPU or races on the vector store.
 _indexer = ThreadPoolExecutor(max_workers=1)
+
+# Safety net: strip a trailing "Sources: …" / "Références : …" block the model may
+# still append despite the system prompt (the UI shows sources separately).
+_INLINE_SOURCES_RE = re.compile(
+    r"\n\s*(?:\*\*|__|#+\s*)?\s*(?:sources?|r[ée]f[ée]rences?|citations?)\s*(?:\*\*|__)?\s*[:：][\s\S]*$",
+    re.IGNORECASE,
+)
+
+def _strip_inline_sources(text: str) -> str:
+    return _INLINE_SOURCES_RE.sub("", text).rstrip()
 
 
 # ─── Models ──────────────────────────────────────────────────────────────────
@@ -170,7 +181,7 @@ def _reply_generator(session_id: str, fallback_title: str, parent_user_id: str,
         def persist():
             if saved["done"]:
                 return
-            ans = "".join(answer_parts).strip()
+            ans = _strip_inline_sources("".join(answer_parts).strip())
             if ans:
                 db.add_message(session_id, "assistant", ans, parent_id=parent_user_id,
                                sources=json.dumps(sources))
