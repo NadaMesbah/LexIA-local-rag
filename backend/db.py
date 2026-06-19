@@ -176,6 +176,8 @@ def init_db() -> None:
                 id            TEXT PRIMARY KEY,
                 username      TEXT NOT NULL UNIQUE,
                 password_hash TEXT NOT NULL,
+                first_name    TEXT NOT NULL DEFAULT '',
+                last_name     TEXT NOT NULL DEFAULT '',
                 role          TEXT NOT NULL DEFAULT 'user',   -- admin | user
                 created_at    REAL NOT NULL
             );
@@ -198,19 +200,31 @@ def init_db() -> None:
             conn.execute("ALTER TABLE documents ADD COLUMN owner_id TEXT")
         if "scope" not in dcols:
             conn.execute("ALTER TABLE documents ADD COLUMN scope TEXT NOT NULL DEFAULT 'org'")
+        # Names on users (migrate older auth schema that only had username).
+        ucols = _columns(conn, "users")
+        if "first_name" not in ucols:
+            conn.execute("ALTER TABLE users ADD COLUMN first_name TEXT NOT NULL DEFAULT ''")
+        if "last_name" not in ucols:
+            conn.execute("ALTER TABLE users ADD COLUMN last_name TEXT NOT NULL DEFAULT ''")
+        # Persisted original file path (so versions can be downloaded later).
+        if "stored_path" not in _columns(conn, "document_versions"):
+            conn.execute("ALTER TABLE document_versions ADD COLUMN stored_path TEXT")
 
 
 # ─── Users & auth ────────────────────────────────────────────────────────────
 
-def create_user(username: str, password_hash: str, role: str = "user") -> dict:
+def create_user(username: str, password_hash: str, role: str = "user",
+                first_name: str = "", last_name: str = "") -> dict:
     uid = _new_id()
     ts = _now()
     with _connect() as conn:
         conn.execute(
-            "INSERT INTO users (id, username, password_hash, role, created_at) VALUES (?,?,?,?,?)",
-            (uid, username, password_hash, role, ts),
+            "INSERT INTO users (id, username, password_hash, first_name, last_name, role, created_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (uid, username, password_hash, first_name, last_name, role, ts),
         )
-    return {"id": uid, "username": username, "role": role, "created_at": ts}
+    return {"id": uid, "username": username, "first_name": first_name,
+            "last_name": last_name, "role": role, "created_at": ts}
 
 
 def get_user(user_id: str) -> Optional[dict]:
@@ -228,7 +242,7 @@ def get_user_by_username(username: str) -> Optional[dict]:
 def list_users() -> list[dict]:
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT id, username, role, created_at FROM users ORDER BY created_at"
+            "SELECT id, username, first_name, last_name, role, created_at FROM users ORDER BY created_at"
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -487,7 +501,7 @@ def get_or_create_document(name: str, scope: str = "org", owner_id: Optional[str
                 "current_version": 0, "status": "active", "created_at": ts, "updated_at": ts}
 
 
-def add_version(document_id: str, filename: str) -> dict:
+def add_version(document_id: str, filename: str, stored_path: Optional[str] = None) -> dict:
     """Create a new pending version for a document. Returns {id, version}."""
     ts = _now()
     with _connect() as conn:
@@ -499,11 +513,28 @@ def add_version(document_id: str, filename: str) -> dict:
         vid = _new_id()
         conn.execute(
             "INSERT INTO document_versions (id,document_id,version,filename,indexing_status,"
-            "is_latest,chunks,error,uploaded_at) VALUES (?,?,?,?,?,?,?,?,?)",
-            (vid, document_id, version, filename, "pending", 0, 0, None, ts),
+            "is_latest,chunks,error,uploaded_at,stored_path) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (vid, document_id, version, filename, "pending", 0, 0, None, ts, stored_path),
         )
         conn.execute("UPDATE documents SET updated_at=?, status='active' WHERE id=?", (ts, document_id))
     return {"id": vid, "document_id": document_id, "version": version}
+
+
+def set_version_file(version_id: str, stored_path: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE document_versions SET stored_path=? WHERE id=?", (stored_path, version_id)
+        )
+
+
+def document_stored_paths(document_id: str) -> list[str]:
+    """All on-disk file paths for a document's versions (for cleanup on purge)."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT stored_path FROM document_versions WHERE document_id=? AND stored_path IS NOT NULL",
+            (document_id,),
+        ).fetchall()
+    return [r["stored_path"] for r in rows]
 
 
 def set_version_status(version_id: str, status: str, chunks: Optional[int] = None,
@@ -544,6 +575,25 @@ def get_document(document_id: str) -> Optional[dict]:
 def get_version(version_id: str) -> Optional[dict]:
     with _connect() as conn:
         row = conn.execute("SELECT * FROM document_versions WHERE id=?", (version_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_version_by_number(document_id: str, version: int) -> Optional[dict]:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM document_versions WHERE document_id=? AND version=?",
+            (document_id, version),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def latest_version(document_id: str) -> Optional[dict]:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM document_versions WHERE document_id=? "
+            "ORDER BY is_latest DESC, version DESC LIMIT 1",
+            (document_id,),
+        ).fetchone()
     return dict(row) if row else None
 
 

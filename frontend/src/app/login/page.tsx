@@ -1,126 +1,338 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import Box from '@mui/material/Box';
+import Stack from '@mui/material/Stack';
 import Paper from '@mui/material/Paper';
 import Typography from '@mui/material/Typography';
 import TextField from '@mui/material/TextField';
 import Button from '@mui/material/Button';
-import Tabs from '@mui/material/Tabs';
-import Tab from '@mui/material/Tab';
+import Link from '@mui/material/Link';
 import Alert from '@mui/material/Alert';
+import Divider from '@mui/material/Divider';
+import IconButton from '@mui/material/IconButton';
+import InputAdornment from '@mui/material/InputAdornment';
+import CircularProgress from '@mui/material/CircularProgress';
 import AutoAwesomeRoundedIcon from '@mui/icons-material/AutoAwesomeRounded';
+import VisibilityRoundedIcon from '@mui/icons-material/VisibilityRounded';
+import VisibilityOffRoundedIcon from '@mui/icons-material/VisibilityOffRounded';
+import VerifiedUserRoundedIcon from '@mui/icons-material/VerifiedUserRounded';
+import FolderSpecialRoundedIcon from '@mui/icons-material/FolderSpecialRounded';
+import ChatRoundedIcon from '@mui/icons-material/ChatRounded';
 import { useAuth } from '@/lib/auth';
+
+type Mode = 'login' | 'register';
+
+const EMPTY = { firstName: '', lastName: '', username: '', password: '', confirm: '' };
 
 export default function LoginPage() {
   const { user, loading, login, register } = useAuth();
   const router = useRouter();
-  const [mode, setMode] = useState<'login' | 'register'>('login');
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
+
+  const [mode, setMode] = useState<Mode>('login');
+  const [form, setForm] = useState({ ...EMPTY });
+  const [showPwd, setShowPwd] = useState(false);
+  const [showConfirm, setShowConfirm] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  // Already authenticated → leave the login screen.
+  // Already authenticated → leave the auth screen.
   useEffect(() => {
     if (!loading && user) router.replace('/chat');
   }, [loading, user, router]);
 
+  const set = (k: keyof typeof EMPTY) => (e: React.ChangeEvent<HTMLInputElement>) =>
+    setForm((f) => ({ ...f, [k]: e.target.value }));
+
+  const switchMode = (m: Mode) => {
+    setMode(m);
+    setError(null);
+    setShowPwd(false);
+    setShowConfirm(false);
+    if (m === 'register') setSuccess(null);
+  };
+
+  const canSubmit = useMemo(() => {
+    if (mode === 'login') return form.username.trim().length > 0 && form.password.length > 0;
+    return (
+      form.firstName.trim() &&
+      form.lastName.trim() &&
+      form.username.trim().length >= 3 &&
+      form.password.length >= 8 &&
+      form.confirm.length > 0
+    );
+  }, [mode, form]);
+
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    setSuccess(null);
+
+    if (mode === 'register' && form.password !== form.confirm) {
+      setError('Les mots de passe ne correspondent pas.');
+      return;
+    }
+
     setBusy(true);
     try {
-      if (mode === 'login') await login(username.trim(), password);
-      else await register(username.trim(), password);
-      router.replace('/chat');
+      if (mode === 'login') {
+        await login(form.username.trim(), form.password);
+        router.replace('/chat');
+      } else {
+        await register({
+          first_name: form.firstName.trim(),
+          last_name: form.lastName.trim(),
+          username: form.username.trim(),
+          password: form.password,
+        });
+        // Account created — send the user to the sign-in screen.
+        setForm({ ...EMPTY });
+        switchMode('login');
+        setSuccess('Compte créé avec succès. Connectez-vous pour continuer.');
+      }
     } catch (err: any) {
-      setError(err?.message || 'Échec de l’authentification.');
+      setError(err?.message || 'Une erreur est survenue.');
     } finally {
       setBusy(false);
     }
   };
 
+  const pwdAdornment = (visible: boolean, toggle: () => void) => ({
+    endAdornment: (
+      <InputAdornment position="end">
+        <IconButton onClick={toggle} edge="end" size="small">
+          {visible ? <VisibilityRoundedIcon fontSize="small" /> : <VisibilityOffRoundedIcon fontSize="small" />}
+        </IconButton>
+      </InputAdornment>
+    ),
+  });
+
   return (
-    <Box
-      sx={{
-        minHeight: '100vh',
-        display: 'grid',
-        placeItems: 'center',
-        bgcolor: 'background.default',
-        p: 2,
-      }}
-    >
-      <Paper sx={{ p: 4, width: '100%', maxWidth: 400, borderRadius: 3 }} elevation={0}>
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.25, mb: 0.5 }}>
+    <Box sx={{ minHeight: '100vh', display: 'flex', bgcolor: 'background.default' }}>
+      {/* Left brand / marketing panel */}
+      <Box
+        sx={{
+          display: { xs: 'none', md: 'flex' },
+          flexDirection: 'column',
+          justifyContent: 'center',
+          width: '46%',
+          p: 8,
+          color: 'common.white',
+          background: 'linear-gradient(135deg, #007867 0%, #00A76F 55%, #5BE49B 100%)',
+        }}
+      >
+        <Stack direction="row" spacing={1.5} alignItems="center" sx={{ mb: 5 }}>
           <Box
             sx={{
-              width: 36,
-              height: 36,
-              borderRadius: 1.5,
-              bgcolor: 'primary.main',
-              color: 'primary.contrastText',
+              width: 44,
+              height: 44,
+              borderRadius: 2,
+              bgcolor: 'rgba(255,255,255,0.16)',
               display: 'grid',
               placeItems: 'center',
             }}
           >
-            <AutoAwesomeRoundedIcon fontSize="small" />
+            <AutoAwesomeRoundedIcon />
           </Box>
-          <Typography variant="h6" sx={{ fontWeight: 800 }}>
-            RAG&nbsp;<Box component="span" sx={{ color: 'primary.main' }}>Local</Box>
+          <Typography variant="h5" sx={{ fontWeight: 800 }}>
+            RAG Local
           </Typography>
-        </Box>
-        <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-          Connectez-vous pour accéder à votre base de connaissance privée.
+        </Stack>
+
+        <Typography variant="h3" sx={{ fontWeight: 800, lineHeight: 1.2, mb: 2 }}>
+          Votre base de connaissance,
+          <br />
+          privée et locale.
+        </Typography>
+        <Typography variant="body1" sx={{ opacity: 0.9, mb: 5, maxWidth: 440 }}>
+          Interrogez vos documents en langage naturel. Tout reste sur votre infrastructure —
+          aucun envoi vers le cloud.
         </Typography>
 
-        <Tabs
-          value={mode}
-          onChange={(_, v) => {
-            setMode(v);
-            setError(null);
-          }}
-          sx={{ mb: 2 }}
-        >
-          <Tab value="login" label="Connexion" />
-          <Tab value="register" label="Créer un compte" />
-        </Tabs>
+        <Stack spacing={2.5} sx={{ maxWidth: 440 }}>
+          {[
+            { icon: <ChatRoundedIcon />, t: 'Chat intelligent', d: 'Réponses sourcées sur vos documents.' },
+            { icon: <FolderSpecialRoundedIcon />, t: 'Documents versionnés', d: 'Historique, restauration et corbeille.' },
+            { icon: <VerifiedUserRoundedIcon />, t: 'Accès contrôlé', d: 'Espace partagé + collections personnelles.' },
+          ].map((f) => (
+            <Stack key={f.t} direction="row" spacing={2} alignItems="flex-start">
+              <Box
+                sx={{
+                  width: 38,
+                  height: 38,
+                  flexShrink: 0,
+                  borderRadius: 1.5,
+                  bgcolor: 'rgba(255,255,255,0.16)',
+                  display: 'grid',
+                  placeItems: 'center',
+                }}
+              >
+                {f.icon}
+              </Box>
+              <Box>
+                <Typography sx={{ fontWeight: 700 }}>{f.t}</Typography>
+                <Typography variant="body2" sx={{ opacity: 0.85 }}>
+                  {f.d}
+                </Typography>
+              </Box>
+            </Stack>
+          ))}
+        </Stack>
+      </Box>
 
-        <form onSubmit={submit}>
-          <TextField
-            fullWidth
-            label="Nom d’utilisateur"
-            value={username}
-            onChange={(e) => setUsername(e.target.value)}
-            autoComplete="username"
-            sx={{ mb: 2 }}
-          />
-          <TextField
-            fullWidth
-            type="password"
-            label="Mot de passe"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
-            sx={{ mb: 2 }}
-          />
+      {/* Right form panel */}
+      <Box
+        sx={{
+          flexGrow: 1,
+          display: 'grid',
+          placeItems: 'center',
+          p: { xs: 2, sm: 4 },
+        }}
+      >
+        <Paper elevation={0} sx={{ p: { xs: 3, sm: 5 }, width: '100%', maxWidth: 440, borderRadius: 3 }}>
+          {/* Mobile brand */}
+          <Stack
+            direction="row"
+            spacing={1.25}
+            alignItems="center"
+            sx={{ mb: 3, display: { xs: 'flex', md: 'none' } }}
+          >
+            <Box
+              sx={{
+                width: 36,
+                height: 36,
+                borderRadius: 1.5,
+                bgcolor: 'primary.main',
+                color: 'primary.contrastText',
+                display: 'grid',
+                placeItems: 'center',
+              }}
+            >
+              <AutoAwesomeRoundedIcon fontSize="small" />
+            </Box>
+            <Typography variant="h6" sx={{ fontWeight: 800 }}>
+              RAG&nbsp;<Box component="span" sx={{ color: 'primary.main' }}>Local</Box>
+            </Typography>
+          </Stack>
+
+          <Typography variant="h4" sx={{ fontWeight: 800, mb: 0.5 }}>
+            {mode === 'login' ? 'Bon retour' : 'Créer un compte'}
+          </Typography>
+          <Stack direction="row" spacing={0.5} sx={{ mb: 4 }}>
+            <Typography variant="body2" color="text.secondary">
+              {mode === 'login' ? 'Pas encore de compte ?' : 'Vous avez déjà un compte ?'}
+            </Typography>
+            <Link
+              component="button"
+              type="button"
+              variant="subtitle2"
+              onClick={() => switchMode(mode === 'login' ? 'register' : 'login')}
+              sx={{ fontWeight: 700 }}
+            >
+              {mode === 'login' ? 'Inscrivez-vous' : 'Se connecter'}
+            </Link>
+          </Stack>
+
+          {success && (
+            <Alert severity="success" sx={{ mb: 3 }}>
+              {success}
+            </Alert>
+          )}
           {error && (
-            <Alert severity="error" sx={{ mb: 2 }}>
+            <Alert severity="error" sx={{ mb: 3 }}>
               {error}
             </Alert>
           )}
-          <Button
-            fullWidth
-            type="submit"
-            variant="contained"
-            size="large"
-            disabled={busy || !username.trim() || !password}
-          >
-            {mode === 'login' ? 'Se connecter' : 'Créer le compte'}
-          </Button>
-        </form>
-      </Paper>
+
+          <form onSubmit={submit}>
+            <Stack spacing={2.5}>
+              {mode === 'register' && (
+                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
+                  <TextField
+                    fullWidth
+                    label="Prénom"
+                    value={form.firstName}
+                    onChange={set('firstName')}
+                    autoComplete="given-name"
+                  />
+                  <TextField
+                    fullWidth
+                    label="Nom"
+                    value={form.lastName}
+                    onChange={set('lastName')}
+                    autoComplete="family-name"
+                  />
+                </Stack>
+              )}
+
+              <TextField
+                fullWidth
+                label="Nom d'utilisateur"
+                value={form.username}
+                onChange={set('username')}
+                autoComplete="username"
+                helperText={mode === 'register' ? '3 caractères minimum' : undefined}
+              />
+
+              <TextField
+                fullWidth
+                label="Mot de passe"
+                type={showPwd ? 'text' : 'password'}
+                value={form.password}
+                onChange={set('password')}
+                autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
+                helperText={mode === 'register' ? '8 caractères minimum' : undefined}
+                InputProps={pwdAdornment(showPwd, () => setShowPwd((v) => !v))}
+              />
+
+              {mode === 'register' && (
+                <TextField
+                  fullWidth
+                  label="Confirmer le mot de passe"
+                  type={showConfirm ? 'text' : 'password'}
+                  value={form.confirm}
+                  onChange={set('confirm')}
+                  autoComplete="new-password"
+                  error={!!form.confirm && form.confirm !== form.password}
+                  helperText={
+                    !!form.confirm && form.confirm !== form.password
+                      ? 'Les mots de passe ne correspondent pas.'
+                      : undefined
+                  }
+                  InputProps={pwdAdornment(showConfirm, () => setShowConfirm((v) => !v))}
+                />
+              )}
+
+              <Button
+                fullWidth
+                type="submit"
+                variant="contained"
+                size="large"
+                disabled={busy || !canSubmit}
+                startIcon={busy ? <CircularProgress size={18} color="inherit" /> : undefined}
+              >
+                {mode === 'login' ? 'Se connecter' : 'Créer le compte'}
+              </Button>
+            </Stack>
+          </form>
+
+          {mode === 'register' && (
+            <>
+              <Divider sx={{ my: 3, '&::before, &::after': { borderTopStyle: 'dashed' } }}>
+                <Typography variant="caption" color="text.disabled">
+                  INFO
+                </Typography>
+              </Divider>
+              <Typography variant="caption" color="text.secondary">
+                Les nouveaux comptes sont des comptes utilisateurs. La gestion des documents de
+                l'organisation est réservée à l'administrateur.
+              </Typography>
+            </>
+          )}
+        </Paper>
+      </Box>
     </Box>
   );
 }

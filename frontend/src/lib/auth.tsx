@@ -9,7 +9,7 @@ interface AuthContextValue {
   user: User | null;
   loading: boolean;
   login: (username: string, password: string) => Promise<void>;
-  register: (username: string, password: string) => Promise<void>;
+  register: (data: api.RegisterInput) => Promise<void>;
   logout: () => void;
 }
 
@@ -59,10 +59,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setUser(res.user);
   }, []);
 
-  const register = useCallback(async (username: string, password: string) => {
-    const res = await api.register(username, password);
-    api.setToken(res.access_token);
-    setUser(res.user);
+  // Registration creates the account but does NOT log the user in — the sign-up
+  // view then switches to the sign-in screen.
+  const register = useCallback(async (data: api.RegisterInput) => {
+    await api.register(data);
   }, []);
 
   return (

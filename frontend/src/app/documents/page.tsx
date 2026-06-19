@@ -33,6 +33,7 @@ import HistoryRoundedIcon from '@mui/icons-material/HistoryRounded';
 import UploadFileRoundedIcon from '@mui/icons-material/UploadFileRounded';
 import RestoreRoundedIcon from '@mui/icons-material/RestoreRounded';
 import RestoreFromTrashRoundedIcon from '@mui/icons-material/RestoreFromTrashRounded';
+import DownloadRoundedIcon from '@mui/icons-material/DownloadRounded';
 import SearchRoundedIcon from '@mui/icons-material/SearchRounded';
 import ToggleButton from '@mui/material/ToggleButton';
 import ToggleButtonGroup from '@mui/material/ToggleButtonGroup';
@@ -120,6 +121,22 @@ export default function DocumentsPage() {
     },
     [refresh, refreshTrash]
   );
+
+  const handleDownload = useCallback(async (doc: DocumentItem) => {
+    try {
+      await api.downloadDocument(doc.id, doc.name);
+    } catch (e: any) {
+      setToast({ msg: `Téléchargement impossible : ${e?.message}`, sev: 'error' });
+    }
+  }, []);
+
+  const handleDownloadVersion = useCallback(async (doc: DocumentItem, v: DocumentVersion) => {
+    try {
+      await api.downloadVersion(doc.id, v.version, v.filename);
+    } catch (e: any) {
+      setToast({ msg: `Téléchargement impossible : ${e?.message}`, sev: 'error' });
+    }
+  }, []);
 
   // Poll while any document is still indexing.
   const anyPending = useMemo(
@@ -279,30 +296,43 @@ export default function DocumentsPage() {
       valueFormatter: (value) => (value ? new Date(value as Date).toLocaleString() : '—'),
     },
     {
-      field: 'actions', headerName: '', width: 130, sortable: false, filterable: false, align: 'right',
+      field: 'actions', headerName: '', width: 180, sortable: false, filterable: false, align: 'right',
       renderCell: (p) => {
         const manageable = isAdmin || p.row.scope === 'personal';
+        const downloadBtn = (
+          <Tooltip title="Télécharger">
+            <IconButton size="small" onClick={() => handleDownload(p.row.doc)}
+              sx={{ '&:hover': { color: 'primary.main' } }}><DownloadRoundedIcon fontSize="small" /></IconButton>
+          </Tooltip>
+        );
+        if (tab === 'trash') {
+          return manageable ? (
+            <Box>
+              <Tooltip title="Restaurer">
+                <IconButton size="small" onClick={() => undelete(p.row.doc)}
+                  sx={{ '&:hover': { color: 'success.main' } }}><RestoreFromTrashRoundedIcon fontSize="small" /></IconButton>
+              </Tooltip>
+              <Tooltip title="Supprimer définitivement">
+                <IconButton size="small" onClick={() => setConfirm({ doc: p.row.doc, mode: 'purge' })}
+                  sx={{ '&:hover': { color: 'error.main' } }}><DeleteForeverRoundedIcon fontSize="small" /></IconButton>
+              </Tooltip>
+            </Box>
+          ) : <Box>{downloadBtn}</Box>;
+        }
         if (!manageable) {
+          // Org document for a non-admin: read-only, but still downloadable.
           return (
-            <Tooltip title="Document de l'organisation — géré par un administrateur">
-              <Chip label="Lecture seule" size="small" variant="outlined" sx={{ height: 22 }} />
-            </Tooltip>
+            <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 0.5 }}>
+              {downloadBtn}
+              <Tooltip title="Document de l'organisation — géré par un administrateur">
+                <Chip label="Lecture seule" size="small" variant="outlined" sx={{ height: 22 }} />
+              </Tooltip>
+            </Box>
           );
         }
         return (
-        tab === 'trash' ? (
           <Box>
-            <Tooltip title="Restaurer">
-              <IconButton size="small" onClick={() => undelete(p.row.doc)}
-                sx={{ '&:hover': { color: 'success.main' } }}><RestoreFromTrashRoundedIcon fontSize="small" /></IconButton>
-            </Tooltip>
-            <Tooltip title="Supprimer définitivement">
-              <IconButton size="small" onClick={() => setConfirm({ doc: p.row.doc, mode: 'purge' })}
-                sx={{ '&:hover': { color: 'error.main' } }}><DeleteForeverRoundedIcon fontSize="small" /></IconButton>
-            </Tooltip>
-          </Box>
-        ) : (
-          <Box>
+            {downloadBtn}
             <Tooltip title="Versions / restaurer">
               <IconButton size="small" onClick={() => openHistory(p.row.doc)}><HistoryRoundedIcon fontSize="small" /></IconButton>
             </Tooltip>
@@ -315,7 +345,6 @@ export default function DocumentsPage() {
                 sx={{ '&:hover': { color: 'error.main' } }}><DeleteForeverRoundedIcon fontSize="small" /></IconButton>
             </Tooltip>
           </Box>
-        )
         );
       },
     },
@@ -403,15 +432,23 @@ export default function DocumentsPage() {
           <List dense>
             {versions.map((v) => (
               <ListItem key={v.id} secondaryAction={
-                v.is_latest ? (
-                  <Chip label="Actuelle" color="primary" size="small" sx={{ fontWeight: 700 }} />
-                ) : v.indexing_status === 'indexed' ? (
-                  <Tooltip title="Restaurer cette version">
-                    <IconButton edge="end" onClick={() => historyDoc && doRestore(historyDoc, v.version)}>
-                      <RestoreRoundedIcon />
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                  <Tooltip title="Télécharger cette version">
+                    <IconButton edge="end" size="small"
+                      onClick={() => historyDoc && handleDownloadVersion(historyDoc, v)}>
+                      <DownloadRoundedIcon fontSize="small" />
                     </IconButton>
                   </Tooltip>
-                ) : null
+                  {v.is_latest ? (
+                    <Chip label="Actuelle" color="primary" size="small" sx={{ fontWeight: 700 }} />
+                  ) : v.indexing_status === 'indexed' ? (
+                    <Tooltip title="Restaurer cette version">
+                      <IconButton edge="end" onClick={() => historyDoc && doRestore(historyDoc, v.version)}>
+                        <RestoreRoundedIcon />
+                      </IconButton>
+                    </Tooltip>
+                  ) : null}
+                </Box>
               }>
                 <ListItemText
                   primary={<Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>

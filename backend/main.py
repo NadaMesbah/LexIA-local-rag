@@ -52,7 +52,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 
 import db
@@ -72,6 +72,10 @@ app.add_middleware(
 
 # Upload size cap (bytes). 0 / unset disables the check.
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "25")) * 1024 * 1024
+
+# Original uploaded files are kept here so any version can be downloaded later.
+FILES_DIR = os.getenv("FILES_DIR", "/app/data/files")
+os.makedirs(FILES_DIR, exist_ok=True)
 
 # Initialise persistence, seed the admin + adopt legacy data, THEN build the
 # engine (so its backfill sees the owners assigned by ensure_default_admin).
@@ -102,6 +106,8 @@ class LoginRequest(BaseModel):
 
 
 class RegisterRequest(BaseModel):
+    first_name: str
+    last_name: str
     username: str
     password: str
 
@@ -169,21 +175,36 @@ async def login(req: LoginRequest):
     user = db.get_user_by_username(req.username.strip())
     if not user or not auth.verify_password(req.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid username or password.")
-    pub = {"id": user["id"], "username": user["username"], "role": user["role"]}
+    pub = {
+        "id": user["id"],
+        "username": user["username"],
+        "first_name": user.get("first_name", ""),
+        "last_name": user.get("last_name", ""),
+        "role": user["role"],
+    }
     return {"access_token": auth.create_access_token(pub), "token_type": "bearer", "user": pub}
 
 
-@app.post("/auth/register")
+@app.post("/auth/register", status_code=201)
 async def register(req: RegisterRequest):
+    """Create a regular user account. Does NOT log in — the client redirects to
+    the sign-in screen afterwards. There is exactly one admin (seeded from env);
+    self-registration always creates the `user` role."""
+    first_name = req.first_name.strip()
+    last_name = req.last_name.strip()
     username = req.username.strip()
     password = req.password
-    if len(username) < 3 or len(password) < 4:
-        raise HTTPException(status_code=400, detail="Username (≥3) and password (≥4) too short.")
+    if not first_name or not last_name:
+        raise HTTPException(status_code=400, detail="First and last name are required.")
+    if len(username) < 3:
+        raise HTTPException(status_code=400, detail="Username must be at least 3 characters.")
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
     if db.get_user_by_username(username):
         raise HTTPException(status_code=409, detail="Username already taken.")
-    user = db.create_user(username, auth.hash_password(password), role="user")
-    pub = {"id": user["id"], "username": user["username"], "role": user["role"]}
-    return {"access_token": auth.create_access_token(pub), "token_type": "bearer", "user": pub}
+    db.create_user(username, auth.hash_password(password), role="user",
+                   first_name=first_name, last_name=last_name)
+    return {"ok": True, "username": username}
 
 
 @app.get("/auth/me")
@@ -424,7 +445,10 @@ def _save_temp(file: UploadFile, suffix: str) -> str:
 
 def _index_job(version_id: str, document_id: str, version: int, file_path: str,
                filename: str, owner_id: Optional[str], scope: str):
-    """Background: chunk → embed → index a version, then flip it to latest."""
+    """Background: chunk → embed → index a version, then flip it to latest.
+
+    `file_path` is the PERSISTENT stored copy (kept so the version can be
+    downloaded later), so it is NOT deleted here."""
     db.set_version_status(version_id, "processing")
     try:
         n = rag.index_version(file_path, filename, document_id, version,
@@ -434,11 +458,13 @@ def _index_job(version_id: str, document_id: str, version: int, file_path: str,
     except Exception as e:
         db.set_version_status(version_id, "failed", error=str(e))
         print(f"[API] indexing failed for {filename} v{version}: {e}")
-    finally:
-        try:
-            os.unlink(file_path)
-        except Exception:
-            pass
+
+
+def _store_file(tmp_path: str, version_id: str, suffix: str) -> str:
+    """Move a freshly-uploaded temp file to its permanent per-version location."""
+    dest = os.path.join(FILES_DIR, f"{version_id}{suffix}")
+    shutil.move(tmp_path, dest)
+    return dest
 
 
 def _check_ext(filename: str) -> str:
@@ -468,10 +494,14 @@ async def create_document(file: UploadFile = File(...), scope: Optional[str] = F
     suffix = _check_ext(file.filename)
     doc_scope = _resolve_scope(user, scope)
     owner_id = None if doc_scope == "org" else user["id"]
+    # Stream to a temp file first so the size cap is enforced before any DB rows
+    # or vectors are created.
+    tmp = _save_temp(file, suffix)
     doc = db.get_or_create_document(file.filename, scope=doc_scope, owner_id=owner_id)
     ver = db.add_version(doc["id"], file.filename)
-    path = _save_temp(file, suffix)
-    _indexer.submit(_index_job, ver["id"], doc["id"], ver["version"], path,
+    stored = _store_file(tmp, ver["id"], suffix)
+    db.set_version_file(ver["id"], stored)
+    _indexer.submit(_index_job, ver["id"], doc["id"], ver["version"], stored,
                     file.filename, doc.get("owner_id"), doc.get("scope", doc_scope))
     db.log_audit(user["id"], user["username"], "upload", doc["id"], ver["version"],
                  detail=f"{file.filename} ({doc_scope})")
@@ -493,9 +523,11 @@ async def add_document_version(document_id: str, file: UploadFile = File(...),
     if doc["status"] == "deleted":
         raise HTTPException(status_code=404, detail="Document not found.")
     suffix = _check_ext(file.filename)
+    tmp = _save_temp(file, suffix)
     ver = db.add_version(document_id, file.filename)
-    path = _save_temp(file, suffix)
-    _indexer.submit(_index_job, ver["id"], document_id, ver["version"], path,
+    stored = _store_file(tmp, ver["id"], suffix)
+    db.set_version_file(ver["id"], stored)
+    _indexer.submit(_index_job, ver["id"], document_id, ver["version"], stored,
                     file.filename, doc.get("owner_id"), doc.get("scope", "org"))
     db.log_audit(user["id"], user["username"], "new_version", document_id, ver["version"],
                  detail=file.filename)
@@ -536,6 +568,33 @@ async def document_versions(document_id: str, user: dict = Depends(auth.current_
     return {"versions": db.list_versions(document_id)}
 
 
+def _file_response(ver: Optional[dict]):
+    """Return the stored original file for a version, or a helpful 404."""
+    if not ver or not ver.get("stored_path") or not os.path.exists(ver["stored_path"]):
+        raise HTTPException(
+            status_code=404,
+            detail="Original file unavailable (this version predates file storage — "
+                   "re-upload it to enable download).",
+        )
+    return FileResponse(ver["stored_path"], filename=ver["filename"],
+                        media_type="application/octet-stream")
+
+
+@app.get("/documents/{document_id}/download")
+async def download_document(document_id: str, user: dict = Depends(auth.current_user)):
+    """Download the latest version's original file (any visible document)."""
+    _visible_document(document_id, user)
+    return _file_response(db.latest_version(document_id))
+
+
+@app.get("/documents/{document_id}/versions/{version}/download")
+async def download_version(document_id: str, version: int,
+                           user: dict = Depends(auth.current_user)):
+    """Download a specific version's original file."""
+    _visible_document(document_id, user)
+    return _file_response(db.get_version_by_number(document_id, version))
+
+
 @app.post("/documents/{document_id}/versions/{version}/restore")
 async def restore_version(document_id: str, version: int,
                           user: dict = Depends(auth.current_user)):
@@ -561,10 +620,16 @@ async def soft_delete_document(document_id: str, user: dict = Depends(auth.curre
 
 @app.delete("/documents/{document_id}/purge")
 async def purge_document(document_id: str, user: dict = Depends(auth.current_user)):
-    """Hard-delete: permanently remove vectors + records."""
+    """Hard-delete: permanently remove vectors + records + stored files."""
     doc = _manageable_document(document_id, user)
+    stored = db.document_stored_paths(document_id)
     rag.purge_document(document_id)
     db.hard_delete_document(document_id)
+    for p in stored:
+        try:
+            os.unlink(p)
+        except Exception:
+            pass
     db.log_audit(user["id"], user["username"], "purge", document_id, doc["current_version"])
     return {"ok": True}
 
@@ -573,5 +638,11 @@ async def purge_document(document_id: str, user: dict = Depends(auth.current_use
 async def reset_knowledge_base(user: dict = Depends(auth.admin_user)):
     rag.reset()
     db.clear_documents()
+    # Remove all stored original files.
+    for name in os.listdir(FILES_DIR):
+        try:
+            os.unlink(os.path.join(FILES_DIR, name))
+        except Exception:
+            pass
     db.log_audit(user["id"], user["username"], "reset_kb")
     return {"message": "Knowledge base has been reset."}

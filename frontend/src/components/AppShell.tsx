@@ -136,11 +136,11 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             }}
           >
             <Avatar sx={{ width: 34, height: 34, bgcolor: 'primary.main', fontSize: 15, fontWeight: 700 }}>
-              {user.username.slice(0, 1).toUpperCase()}
+              {(user.first_name || user.username).slice(0, 1).toUpperCase()}
             </Avatar>
             <Box sx={{ minWidth: 0, flexGrow: 1 }}>
               <Typography variant="body2" noWrap sx={{ fontWeight: 700 }}>
-                {user.username}
+                {[user.first_name, user.last_name].filter(Boolean).join(' ') || user.username}
               </Typography>
               <Chip
                 label={user.role === 'admin' ? 'Administrateur' : 'Utilisateur'}

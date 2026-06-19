@@ -64,7 +64,8 @@ def ensure_default_admin() -> None:
     if existing:
         admin_id = existing["id"]
     else:
-        admin = db.create_user(username, hash_password(password), role="admin")
+        admin = db.create_user(username, hash_password(password), role="admin",
+                               first_name="Admin", last_name="")
         admin_id = admin["id"]
         print(f"[AUTH] Seeded admin user '{username}'.")
         if os.getenv("ADMIN_PASSWORD") is None:
@@ -74,7 +75,13 @@ def ensure_default_admin() -> None:
 
 
 def _public(user: dict) -> dict:
-    return {"id": user["id"], "username": user["username"], "role": user["role"]}
+    return {
+        "id": user["id"],
+        "username": user["username"],
+        "first_name": user.get("first_name", ""),
+        "last_name": user.get("last_name", ""),
+        "role": user["role"],
+    }
 
 
 def current_user(creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer)) -> dict:

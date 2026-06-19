@@ -85,12 +85,32 @@ export const login = (username: string, password: string) =>
     body: JSON.stringify({ username, password }),
   }).then(asAuth);
 
-export const register = (username: string, password: string) =>
-  fetch(`${API_BASE}/auth/register`, {
+export interface RegisterInput {
+  first_name: string;
+  last_name: string;
+  username: string;
+  password: string;
+}
+
+// Registration creates the account but does NOT log in — the UI sends the user
+// to the sign-in screen afterwards.
+export const register = async (data: RegisterInput): Promise<{ ok: boolean; username: string }> => {
+  const res = await fetch(`${API_BASE}/auth/register`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username, password }),
-  }).then(asAuth);
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      detail = (await res.json())?.detail || detail;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(detail);
+  }
+  return res.json();
+};
 
 export const me = () =>
   fetch(`${API_BASE}/auth/me`, { headers: authHeaders() }).then((r) => asJson<User>(r));
@@ -210,6 +230,40 @@ export const uploadNewVersion = (documentId: string, file: File) => {
     body: form,
   }).then((r) => asJson<{ version: number; indexing_status: string }>(r));
 };
+
+// Fetch a protected file as a blob and trigger a browser download. Used for
+// both the latest version and a specific historical version.
+async function downloadBlob(url: string, filename: string): Promise<void> {
+  const res = await fetch(url, { headers: authHeaders() });
+  if (res.status === 401) {
+    handleUnauthorized();
+    throw new Error('Session expirée — veuillez vous reconnecter.');
+  }
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      detail = (await res.json())?.detail || detail;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(detail);
+  }
+  const blob = await res.blob();
+  const objectUrl = window.URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = objectUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.URL.revokeObjectURL(objectUrl);
+}
+
+export const downloadDocument = (documentId: string, filename: string) =>
+  downloadBlob(`${API_BASE}/documents/${documentId}/download`, filename);
+
+export const downloadVersion = (documentId: string, version: number, filename: string) =>
+  downloadBlob(`${API_BASE}/documents/${documentId}/versions/${version}/download`, filename);
 
 // ─── Streaming (NDJSON) ──────────────────────────────────────────────────────
 // Consumes the chat/edit/regenerate stream and invokes `onEvent` per line.
