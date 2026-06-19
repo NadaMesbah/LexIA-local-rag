@@ -35,6 +35,14 @@ services:
       - RERANK_MODEL=${RERANK_MODEL:-BAAI/bge-reranker-v2-m3}
       - RERANK_DEVICE=${RERANK_DEVICE:-cpu}
       - MEMORY_TOKEN_LIMIT=${MEMORY_TOKEN_LIMIT:-3000}
+      # Auth / RBAC
+      - JWT_SECRET=${JWT_SECRET:-change-me-to-a-long-random-secret}
+      - JWT_TTL_HOURS=${JWT_TTL_HOURS:-12}
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin}
+      - ADMIN_EMAIL=${ADMIN_EMAIL:-admin@local.host}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000}
+      - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-25}
       # Cache HuggingFace reranker weights inside the volume (download once).
       - HF_HOME=/app/data/hf_cache
     volumes:
@@ -51,12 +59,16 @@ services:
       start_period: 60s
 
   frontend:
-    image: nginx:alpine
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # The URL the browser uses to reach the backend (baked at build time).
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
     ports:
-      - "3000:80"
-    volumes:
-      - ./frontend/index.html:/usr/share/nginx/html/index.html:ro
-      - ./frontend/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
     restart: unless-stopped
     depends_on:
       backend:
