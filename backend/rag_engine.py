@@ -1,27 +1,23 @@
 """
-RAG Engine — core logic.
+RAG Engine — core logic (Phase 2: document versioning + freshness).
 
-Stack:
-  - LlamaIndex            orchestration
-  - Ollama                local LLM (Qwen 2.5 7B) + embeddings (bge-m3)
-  - ChromaDB (embedded)   persistent vector store (survives restarts)
-  - bge-reranker-v2-m3    CPU cross-encoder reranker (optional, big quality gain)
+Stack: LlamaIndex · Ollama (Qwen 2.5 + bge-m3) · ChromaDB (embedded) · optional
+bge-reranker.
 
-Design notes:
-  - The vector store is a Chroma PersistentClient on disk, so the knowledge
-    base is never lost on restart. We never overwrite it on startup.
-  - Embeddings use bge-m3 (1024-dim, strongly multilingual).
-  - Chat is SESSION-AWARE: each request rebuilds a CondensePlusContext chat
-    engine seeded with the conversation history (multi-turn memory). The
-    history itself is persisted in SQLite by the caller (see db.py / main.py).
-  - Retrieval is two-stage: fetch a wide set of candidates by vector
-    similarity, then rerank with a cross-encoder and keep the best few before
-    handing them to the LLM. This is the main quality lever.
+Versioning / freshness
+----------------------
+Every chunk in Chroma carries metadata: document_id, version, is_latest.
+Retrieval always filters on is_latest == true, so the chat answers only from the
+newest indexed version of each document. Uploading a new version inserts fresh
+is_latest chunks and flips the previous version's chunks to is_latest=false
+(kept for rollback). Soft-delete flips all of a document's chunks to false;
+hard-delete purges them.
 """
 
 import os
 import re
 import asyncio
+import threading
 from typing import Optional
 
 import chromadb
@@ -35,16 +31,19 @@ from llama_index.core import (
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.llms import ChatMessage, MessageRole
 from llama_index.core.memory import ChatMemoryBuffer
-from llama_index.core.chat_engine import SimpleChatEngine
+from llama_index.core.chat_engine import SimpleChatEngine, ContextChatEngine
 from llama_index.core.postprocessor import SimilarityPostprocessor
+from llama_index.core.vector_stores import MetadataFilters, MetadataFilter, FilterOperator
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.llms.ollama import Ollama
 from llama_index.embeddings.ollama import OllamaEmbedding
 
+import db
+
 # ── Compatibility shim ───────────────────────────────────────────────────────
-# Some llama-index-llms-ollama versions set additional_kwargs["tool_calls"]=None.
-# llama-index-core's is_function() then calls len(None) and crashes during
-# streaming ("object of type 'NoneType' has no len()"). Make it None-safe.
+# Some llama-index-llms-ollama versions set additional_kwargs["tool_calls"]=None,
+# which makes llama-index-core's is_function() call len(None) and crash during
+# streaming. Make it None-safe.
 import llama_index.core.chat_engine.types as _chat_types  # noqa: E402
 
 def _safe_is_function(message) -> bool:
@@ -62,46 +61,34 @@ EMBED_MODEL     = os.getenv("EMBED_MODEL", "bge-m3")
 CHROMA_PATH     = os.getenv("CHROMA_PATH", "/app/data/chroma")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "rag_knowledge_base")
 
-# Context / generation
 CONTEXT_WINDOW  = int(os.getenv("CONTEXT_WINDOW", "8192"))
 NUM_OUTPUT      = int(os.getenv("NUM_OUTPUT", "1024"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "600"))
-TEMPERATURE     = float(os.getenv("TEMPERATURE", "0.2"))   # low = focused, less language drift
+TEMPERATURE     = float(os.getenv("TEMPERATURE", "0.2"))
 
-# Chunking — paragraph/sentence-aware splitting
 CHUNK_SIZE      = int(os.getenv("CHUNK_SIZE", "512"))
 CHUNK_OVERLAP   = int(os.getenv("CHUNK_OVERLAP", "64"))
 
-# Retrieval + reranking
-RETRIEVE_TOP_K  = int(os.getenv("RETRIEVE_TOP_K", "5"))    # candidate set
-RERANK_TOP_N    = int(os.getenv("RERANK_TOP_N", "4"))      # kept after rerank
-# Reranker OFF by default: it runs on CPU and adds noticeable latency to EVERY
-# message (incl. greetings) + a one-time ~2.2 GB download. Turn it on only if
-# you want maximum retrieval quality and can accept slower replies.
+RETRIEVE_TOP_K  = int(os.getenv("RETRIEVE_TOP_K", "5"))
+RERANK_TOP_N    = int(os.getenv("RERANK_TOP_N", "4"))
 RERANK_ENABLED  = os.getenv("RERANK_ENABLED", "false").lower() in ("1", "true", "yes")
-# Minimum similarity for a chunk to count as "relevant". Below this, the question
-# is treated as general → answered without documents and WITHOUT sources.
 RELEVANCE_CUTOFF = float(os.getenv("RELEVANCE_CUTOFF", "0.6"))
 RERANK_MODEL    = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
-RERANK_DEVICE   = os.getenv("RERANK_DEVICE", "cpu")        # keep VRAM free for the LLM
+RERANK_DEVICE   = os.getenv("RERANK_DEVICE", "cpu")
 
-# Memory
 MEMORY_TOKEN_LIMIT = int(os.getenv("MEMORY_TOKEN_LIMIT", "3000"))
 
 SUPPORTED_EXTS = {".pdf", ".txt", ".docx", ".md", ".csv", ".xlsx"}
 
 SYSTEM_PROMPT = (
     "You are a precise, helpful assistant for a private knowledge base. "
-    "Answer the user's question using the context provided below, and mention the "
-    "document name(s) you relied on. If the context does NOT contain the answer, say "
+    "Answer using the context below. If the context does NOT contain the answer, say "
     "clearly that you couldn't find it in the documents — do NOT invent or guess. "
-    "CRITICAL: reply ENTIRELY in the SAME LANGUAGE the user used, and never switch to "
-    "another language in the middle of your answer. Be clear, concise and structured."
+    "Do NOT add a 'Sources', 'Source' or citations list to your answer, and do NOT "
+    "mention file names or version numbers — the application displays the sources "
+    "separately. Be clear, concise and well structured."
 )
 
-# Context block injected into the system message on each turn (may be empty
-# when the knowledge base has no relevant content — that's fine, the assistant
-# then just chats normally).
 CONTEXT_TEMPLATE = (
     "Voici des extraits potentiellement pertinents de la base de connaissance "
     "(ils peuvent être vides ou hors-sujet — utilise-les seulement s'ils aident) :\n"
@@ -110,110 +97,97 @@ CONTEXT_TEMPLATE = (
     "---------------------"
 )
 
-# Prompt for plain conversation (no document retrieval).
 CONV_SYSTEM_PROMPT = (
-    "You are a friendly, helpful AI assistant. Chat naturally and answer clearly. "
-    "CRITICAL: reply ENTIRELY in the SAME LANGUAGE the user used, and never switch to "
-    "another language in the middle of your answer. Be concise."
+    "You are a friendly, helpful AI assistant. Chat naturally and answer clearly. Be concise."
 )
 
-# Router prompt: decides if a message needs the private documents.
-# Biased toward YES so real questions are never answered without the documents.
 ROUTER_PROMPT = (
     "Decide whether a user message should trigger a search in the user's private "
     "uploaded documents.\n"
-    "Reply NO ONLY for pure greetings, thanks or social small talk "
-    "(e.g. 'bonjour', 'merci', 'how are you', 'ok').\n"
-    "Reply YES for ANY real question, request or task — especially anything that "
-    "mentions a project, file, topic, or asks to explain / summarize / list / analyze / "
-    "describe something. When unsure, reply YES.\n"
+    "Reply NO ONLY for pure greetings, thanks or social small talk.\n"
+    "Reply YES for ANY real question, request or task. When unsure, reply YES.\n"
     "Reply with exactly one word: YES or NO.\n\n"
     "{conversation}"
     "Message: {message}\n"
     "Answer:"
 )
 
-# Prompt to generate a short conversation title.
 TITLE_PROMPT = (
-    "Generate a very short, descriptive title for a conversation that starts with "
-    "the user message below. Rules: 3 to 6 words, no surrounding quotes, no trailing "
-    "punctuation, and write it in the SAME LANGUAGE as the message.\n\n"
-    "Message: {message}\n\n"
-    "Title:"
+    "Generate a very short, descriptive title (3 to 6 words, no quotes, no trailing "
+    "punctuation, same language as the message) for a conversation that starts with:\n\n"
+    "Message: {message}\n\nTitle:"
 )
 
 
-# ─── Language lock (prevents Qwen from drifting into Chinese) ─────────────────
+# ─── Language lock (prevents Qwen drifting into Chinese) ──────────────────────
 _CJK = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
-_JP = re.compile(r"[\u3040-\u30ff]")
-_KR = re.compile(r"[\uac00-\ud7af]")
 _AR = re.compile(r"[\u0600-\u06ff]")
 _CYR = re.compile(r"[\u0400-\u04ff]")
 _FR_ACC = re.compile(r"[àâçéèêëîïôûùüœ]")
-_ES_ACC = re.compile(r"[ñ¿¡]")
 
 
 def _detect_language(text: str) -> Optional[str]:
-    """Best-effort language guess from a short message (script + stopwords)."""
     t = (text or "").strip()
     if not t:
         return None
     if _CJK.search(t):
         return "Chinese"
-    if _JP.search(t):
-        return "Japanese"
-    if _KR.search(t):
-        return "Korean"
     if _AR.search(t):
         return "Arabic"
     if _CYR.search(t):
         return "Russian"
     low = " " + t.lower() + " "
     fr = sum(m in low for m in (
-        " le ", " la ", " les ", " un ", " une ", " des ", " du ", " et ", " est ",
-        " que ", " qui ", " pour ", " avec ", " vous ", " je ", " tu ", " ne ", " pas ",
-        " bonjour ", " salut ", " merci ", " quoi ", " pourquoi ", " comment ", " quel ",
-        " quelle ", " ça ", " c'est ", " explique ", " résume ",
+        " le ", " la ", " les ", " un ", " une ", " des ", " du ", " et ", " est ", " que ",
+        " qui ", " pour ", " avec ", " vous ", " je ", " ne ", " pas ", " bonjour ", " salut ",
+        " merci ", " quoi ", " pourquoi ", " comment ", " quel ", " ça ", " c'est ",
+        " explique ", " résume ",
     )) + len(_FR_ACC.findall(low)) * 2
-    es = sum(m in low for m in (
-        " el ", " los ", " las ", " una ", " uno ", " que ", " por ", " para ", " con ",
-        " como ", " qué ", " hola ", " gracias ", " usted ", " es ", " está ", " pero ",
-        " muy ", " explica ",
-    )) + len(_ES_ACC.findall(low)) * 2
     en = sum(m in low for m in (
-        " the ", " is ", " are ", " you ", " what ", " why ", " how ", " please ",
-        " hello ", " hi ", " thanks ", " and ", " to ", " of ", " in ", " for ", " with ",
-        " this ", " that ", " do ", " does ", " explain ", " summarize ",
+        " the ", " is ", " are ", " you ", " what ", " why ", " how ", " please ", " hello ",
+        " hi ", " thanks ", " and ", " to ", " of ", " in ", " for ", " with ", " this ",
+        " explain ", " summarize ",
     ))
-    best = max((fr, "French"), (es, "Spanish"), (en, "English"), key=lambda x: x[0])
-    return best[1] if best[0] > 0 else None
+    if fr == 0 and en == 0:
+        return None
+    return "French" if fr >= en else "English"
 
 
 def _language_directive(text: str) -> str:
-    """A hard instruction appended to the system prompt to lock the output language."""
     lang = _detect_language(text)
     if lang == "Chinese":
-        return ""  # the user genuinely wrote Chinese
+        return ""
     if lang:
         return (
-            f"\n\nABSOLUTE RULE — LANGUAGE: The user is writing in {lang}. Write your "
-            f"ENTIRE answer in {lang} only. Do NOT output any Chinese characters and do "
-            f"NOT switch to another language. This rule overrides everything else."
+            f"\n\nABSOLUTE RULE — LANGUAGE: The user is writing in {lang}. Write your ENTIRE "
+            f"answer in {lang} only. Never output Chinese characters or switch languages. "
+            f"This overrides everything else."
         )
     return (
-        "\n\nABSOLUTE RULE — LANGUAGE: Reply only in the exact same language as the "
-        "user's message. Do NOT output any Chinese characters and do NOT switch languages."
+        "\n\nABSOLUTE RULE — LANGUAGE: Reply only in the exact same language as the user's "
+        "message. Never output Chinese characters or switch languages."
     )
 
 
+def _scope_filters(scope: Optional[dict]) -> MetadataFilters:
+    """Always restrict to is_latest=true; optionally to one document (scope)."""
+    filters = [MetadataFilter(key="is_latest", value=True, operator=FilterOperator.EQ)]
+    if scope and scope.get("type") == "document" and scope.get("id"):
+        filters.append(
+            MetadataFilter(key="document_id", value=scope["id"], operator=FilterOperator.EQ)
+        )
+    return MetadataFilters(filters=filters)
+
+
 class RAGEngine:
-    """Persistent, session-aware RAG engine."""
+    """Persistent, session-aware, version-aware RAG engine."""
 
     def __init__(self):
         self._index: Optional[VectorStoreIndex] = None
         self._vector_store: Optional[ChromaVectorStore] = None
         self._chroma_collection = None
         self._reranker = None
+        self._write_lock = threading.Lock()
         self._setup()
 
     # ─── Setup ────────────────────────────────────────────────────────────────
@@ -227,39 +201,30 @@ class RAGEngine:
             request_timeout=REQUEST_TIMEOUT,
             context_window=CONTEXT_WINDOW,
             temperature=TEMPERATURE,
-            keep_alive="30m",   # keep the model warm between turns
-            # Tight sampling + repeat penalty curb rambling and Qwen's tendency
-            # to code-switch into Chinese on short prompts.
+            keep_alive="30m",
             additional_kwargs={"top_p": 0.85, "top_k": 40, "repeat_penalty": 1.15},
         )
-        Settings.embed_model = OllamaEmbedding(
-            model_name=EMBED_MODEL,
-            base_url=OLLAMA_BASE_URL,
-        )
+        Settings.embed_model = OllamaEmbedding(model_name=EMBED_MODEL, base_url=OLLAMA_BASE_URL)
         Settings.node_parser = SentenceSplitter(
-            chunk_size=CHUNK_SIZE,
-            chunk_overlap=CHUNK_OVERLAP,
-            paragraph_separator="\n\n\n",
+            chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP, paragraph_separator="\n\n\n"
         )
         Settings.num_output = NUM_OUTPUT
         Settings.context_window = CONTEXT_WINDOW
 
         print(f"[RAG] Opening ChromaDB at {CHROMA_PATH} (collection='{COLLECTION_NAME}')")
         client = chromadb.PersistentClient(path=CHROMA_PATH)
-        # get_or_create => never wipes existing vectors on startup
         self._chroma_collection = client.get_or_create_collection(
-            name=COLLECTION_NAME,
-            metadata={"hnsw:space": "cosine"},
+            name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
         )
         self._vector_store = ChromaVectorStore(chroma_collection=self._chroma_collection)
-
         storage_context = StorageContext.from_defaults(vector_store=self._vector_store)
         self._index = VectorStoreIndex.from_vector_store(
-            vector_store=self._vector_store,
-            storage_context=storage_context,
+            vector_store=self._vector_store, storage_context=storage_context
         )
 
         self._reranker = self._build_reranker()
+        self._backfill_legacy()
+        self._reconcile_latest()
         print("[RAG] Engine ready.")
 
     def _build_reranker(self):
@@ -268,19 +233,65 @@ class RAGEngine:
             return None
         try:
             from llama_index.postprocessor.sbert_rerank import SentenceTransformerRerank
-            reranker = SentenceTransformerRerank(
-                model=RERANK_MODEL,
-                top_n=RERANK_TOP_N,
-                device=RERANK_DEVICE,
-            )
-            print(f"[RAG] Reranker '{RERANK_MODEL}' on {RERANK_DEVICE} (top_n={RERANK_TOP_N})")
-            return reranker
+            r = SentenceTransformerRerank(model=RERANK_MODEL, top_n=RERANK_TOP_N, device=RERANK_DEVICE)
+            print(f"[RAG] Reranker '{RERANK_MODEL}' on {RERANK_DEVICE}")
+            return r
         except Exception as e:
-            # Never let a reranker problem take down the whole engine.
-            print(f"[RAG] WARNING: reranker unavailable ({e}). Falling back to vector-only.")
+            print(f"[RAG] WARNING: reranker unavailable ({e}). Vector-only.")
             return None
 
-    # ─── Chat (session-aware, streaming) ───────────────────────────────────────
+    def _backfill_legacy(self):
+        """Give pre-Phase-2 chunks the version metadata so they stay retrievable."""
+        try:
+            got = self._chroma_collection.get(include=["metadatas"])
+            ids = got.get("ids", []) or []
+            mds = got.get("metadatas", []) or []
+            up_ids, up_mds = [], []
+            for cid, md in zip(ids, mds):
+                md = dict(md or {})
+                if "is_latest" not in md or "document_id" not in md:
+                    name = md.get("file_name") or md.get("source") or "Unknown"
+                    info = db.ensure_legacy_document(name, 0)
+                    md["file_name"] = name
+                    md["document_id"] = info["document_id"]
+                    md["version"] = info["version"]
+                    md["is_latest"] = True
+                    up_ids.append(cid)
+                    up_mds.append(md)
+            if up_ids:
+                self._chroma_collection.update(ids=up_ids, metadatas=up_mds)
+                print(f"[RAG] Backfilled {len(up_ids)} legacy chunks with version metadata.")
+        except Exception as e:
+            print(f"[RAG] backfill skipped ({e})")
+
+    def _reconcile_latest(self):
+        """
+        Repair is_latest across all chunks using the DB as source of truth:
+        only the active document's current_version stays is_latest=true. Fixes
+        stale/duplicate-version chunks left by older code or failed flips.
+        """
+        try:
+            latest = {}  # document_id -> current_version (None if deleted/inactive)
+            for d in db.list_documents(include_deleted=True):
+                latest[d["id"]] = d["current_version"] if d["status"] == "active" else None
+            got = self._chroma_collection.get(include=["metadatas"])
+            ids = got.get("ids", []) or []
+            mds = got.get("metadatas", []) or []
+            cids, cmds = [], []
+            for cid, md in zip(ids, mds):
+                md = dict(md or {})
+                did = md.get("document_id")
+                want = did in latest and latest[did] is not None and md.get("version") == latest[did]
+                if bool(md.get("is_latest")) != want:
+                    md["is_latest"] = want
+                    cids.append(cid); cmds.append(md)
+            if cids:
+                self._chroma_collection.update(ids=cids, metadatas=cmds)
+                print(f"[RAG] Reconciled is_latest on {len(cids)} chunks.")
+        except Exception as e:
+            print(f"[RAG] reconcile skipped ({e})")
+
+    # ─── Chat ──────────────────────────────────────────────────────────────────
 
     def _memory(self, history: list[dict]):
         chat_history = [
@@ -290,47 +301,57 @@ class RAGEngine:
             )
             for m in history if m.get("content")
         ]
-        return ChatMemoryBuffer.from_defaults(
-            chat_history=chat_history, token_limit=MEMORY_TOKEN_LIMIT
-        )
+        return ChatMemoryBuffer.from_defaults(chat_history=chat_history, token_limit=MEMORY_TOKEN_LIMIT)
 
-    def _build_doc_engine(self, memory, lang_directive: str = ""):
-        """Conversational RAG: retrieves doc chunks and answers grounded in them."""
-        postprocessors = [SimilarityPostprocessor(similarity_cutoff=RELEVANCE_CUTOFF)]
-        if self._reranker:
-            postprocessors.append(self._reranker)
-        return self._index.as_chat_engine(
-            chat_mode="context",
-            memory=memory,
-            similarity_top_k=RETRIEVE_TOP_K,
-            node_postprocessors=postprocessors,
-            system_prompt=SYSTEM_PROMPT + lang_directive,
-            context_template=CONTEXT_TEMPLATE,
-            streaming=True,
-        )
+    def _rerank(self, nodes, query: str):
+        if self._reranker and nodes:
+            try:
+                from llama_index.core.schema import QueryBundle
+                return self._reranker.postprocess_nodes(nodes, query_bundle=QueryBundle(query))
+            except Exception as e:
+                print(f"[RAG] rerank error ({e})")
+        return nodes
 
-    def _relevant_nodes(self, message: str):
-        """Retrieve and keep only chunks above the relevance cutoff (may be empty)."""
+    def _relevant_nodes(self, message: str, scope: Optional[dict]):
+        """
+        Retrieve candidates, then keep only LATEST-version chunks (optionally
+        scoped to one document) above the relevance cutoff. Pure-Python filtering
+        so correctness never depends on vector-store filter translation.
+        """
         try:
-            retriever = self._index.as_retriever(similarity_top_k=RETRIEVE_TOP_K)
+            retriever = self._index.as_retriever(similarity_top_k=max(RETRIEVE_TOP_K * 3, 12))
             nodes = retriever.retrieve(message)
-            nodes = SimilarityPostprocessor(
-                similarity_cutoff=RELEVANCE_CUTOFF
-            ).postprocess_nodes(nodes)
-            return nodes
         except Exception as e:
-            print(f"[RAG] retrieval check error ({e})")
+            print(f"[RAG] retrieval error ({e})")
             return []
+        scoped_id = scope.get("id") if (scope and scope.get("type") == "document") else None
+        kept = []
+        for n in nodes:
+            md = n.node.metadata or {}
+            if md.get("is_latest") is False:   # missing -> treat as latest (legacy safety)
+                continue
+            if scoped_id and md.get("document_id") != scoped_id:
+                continue
+            kept.append(n)
+        kept = [n for n in kept if (n.score or 0) >= RELEVANCE_CUTOFF]
+        kept = self._rerank(kept, message)
+        return kept[:RETRIEVE_TOP_K]
 
-    def _build_chat_only_engine(self, memory, lang_directive: str = ""):
-        """Plain conversation: NO retrieval (greetings, small talk, general questions)."""
-        return SimpleChatEngine.from_defaults(
-            memory=memory,
-            system_prompt=CONV_SYSTEM_PROMPT + lang_directive,
-        )
+    @staticmethod
+    def _context_block(nodes) -> str:
+        parts = []
+        for n in nodes:
+            md = n.node.metadata or {}
+            head = md.get("file_name", "document")
+            if md.get("version"):
+                head += f" v{md['version']}"
+            page = md.get("page_label")
+            if page and page != "?":
+                head += f" p.{page}"
+            parts.append(f"[{head}]\n{n.node.get_content()}")
+        return "\n\n".join(parts)
 
     def generate_title(self, message: str) -> str:
-        """Make a short, human-friendly conversation title from the first message."""
         fallback = " ".join((message or "").split())[:48] or "Conversation"
         try:
             prompt = _language_directive(message) + "\n\n" + TITLE_PROMPT.format(
@@ -338,120 +359,158 @@ class RAGEngine:
             )
             resp = Settings.llm.complete(prompt.strip())
             title = (resp.text or "").strip().strip('"').strip()
-            title = title.splitlines()[0][:60] if title else ""
-            return title or fallback
+            return (title.splitlines()[0][:60] if title else "") or fallback
         except Exception as e:
             print(f"[RAG] title generation error ({e})")
             return fallback
 
     def _should_use_docs(self, message: str, history: list[dict]) -> bool:
-        """Fast YES/NO: does this message actually need the private documents?"""
         try:
             convo = ""
             for m in history[-4:]:
                 who = "User" if m["role"] == "user" else "Assistant"
                 convo += f"{who}: {m['content'][:300]}\n"
-            prompt = ROUTER_PROMPT.format(conversation=convo, message=message)
-            resp = Settings.llm.complete(prompt)
+            resp = Settings.llm.complete(ROUTER_PROMPT.format(conversation=convo, message=message))
             ans = (resp.text or "").strip().lower()
             return ans.startswith("y") or "yes" in ans[:8]
         except Exception as e:
             print(f"[RAG] router error ({e}); defaulting to document search")
             return True
 
-    async def stream_chat(self, message: str, history: list[dict]):
+    async def stream_chat(self, message: str, history: list[dict], scope: Optional[dict] = None):
         """
-        Async generator yielding ("token", str) events, then a final
-        ("sources", list[dict]) event.
+        Yields ("token", str)… then ("sources", list).
 
-        Routing:
-          1. Greetings / small talk -> plain chat, no retrieval, no sources.
-          2. Otherwise, retrieve and check relevance:
-             - relevant chunks found -> grounded answer + sources
-             - nothing relevant (e.g. general knowledge not in the docs) ->
-               plain chat answer, NO sources.
+        Retrieves over latest-version chunks (optionally scoped to one document)
+        and streams the answer directly from the LLM with the retrieved context
+        injected — no chat-engine wrapper, so the stream can't silently come back
+        empty. Grounds + cites when relevant chunks exist; otherwise answers
+        generally with no sources.
         """
         loop = asyncio.get_event_loop()
+        directive = _language_directive(message)
+        scoped = bool(scope and scope.get("type") == "document")
 
-        relevant = []
+        nodes = []
         if self.doc_count() > 0:
-            wants_docs = await loop.run_in_executor(
+            wants = scoped or await loop.run_in_executor(
                 None, self._should_use_docs, message, history
             )
-            if wants_docs:
-                relevant = await loop.run_in_executor(
-                    None, self._relevant_nodes, message
-                )
+            if wants:
+                nodes = await loop.run_in_executor(None, self._relevant_nodes, message, scope)
 
-        use_docs = len(relevant) > 0
-        memory = self._memory(history)
-        lang_directive = _language_directive(message)
-        engine = (
-            self._build_doc_engine(memory, lang_directive)
-            if use_docs
-            else self._build_chat_only_engine(memory, lang_directive)
-        )
+        use_docs = len(nodes) > 0
+        if use_docs:
+            system_text = (
+                SYSTEM_PROMPT + directive + "\n\n"
+                + CONTEXT_TEMPLATE.format(context_str=self._context_block(nodes))
+            )
+        else:
+            system_text = CONV_SYSTEM_PROMPT + directive
 
-        streaming_response = await loop.run_in_executor(
-            None, lambda: engine.stream_chat(message)
-        )
+        msgs = [ChatMessage(role=MessageRole.SYSTEM, content=system_text)]
+        for m in history[-12:]:
+            if not m.get("content"):
+                continue
+            msgs.append(ChatMessage(
+                role=MessageRole.USER if m["role"] == "user" else MessageRole.ASSISTANT,
+                content=m["content"],
+            ))
+        msgs.append(ChatMessage(role=MessageRole.USER, content=message))
 
-        gen = streaming_response.response_gen
+        gen = await loop.run_in_executor(None, lambda: Settings.llm.stream_chat(msgs))
         sentinel = object()
         while True:
-            token = await loop.run_in_executor(None, next, gen, sentinel)
-            if token is sentinel:
+            resp = await loop.run_in_executor(None, next, gen, sentinel)
+            if resp is sentinel:
                 break
-            yield ("token", token)
+            delta = getattr(resp, "delta", None)
+            if delta:
+                yield ("token", delta)
 
-        sources = (
-            self._format_sources(getattr(streaming_response, "source_nodes", []))
-            if use_docs else []
-        )
-        yield ("sources", sources)
+        yield ("sources", self._format_sources(nodes) if use_docs else [])
 
     @staticmethod
     def _format_sources(source_nodes) -> list[dict]:
         sources = []
+        seen = set()  # one source per document (best-scoring chunk)
         for node in source_nodes or []:
+            md = node.node.metadata or {}
+            key = md.get("document_id") or md.get("file_name")
+            if key in seen:
+                continue
+            seen.add(key)
             content = node.node.get_content() or ""
-            sources.append(
-                {
-                    "text": content[:320] + ("…" if len(content) > 320 else ""),
-                    "score": round(float(node.score or 0), 4),
-                    "filename": node.node.metadata.get("file_name", "Unknown"),
-                    "page": node.node.metadata.get("page_label", "?"),
-                }
-            )
+            sources.append({
+                "text": content[:320] + ("…" if len(content) > 320 else ""),
+                "score": round(float(node.score or 0), 4),
+                "filename": md.get("file_name", "Unknown"),
+                "page": md.get("page_label", "?"),
+                "document_id": md.get("document_id"),
+                "version": md.get("version"),
+            })
         return sources
 
-    # ─── Ingestion ────────────────────────────────────────────────────────────
+    # ─── Ingestion & version management ────────────────────────────────────────
 
-    async def ingest_document(self, file_path: str, original_name: str) -> dict:
-        """Parse, chunk, embed and persist a single document. Returns chunk count."""
-        loop = asyncio.get_event_loop()
-
-        def _run():
+    def index_version(self, file_path: str, filename: str, document_id: str, version: int) -> int:
+        """Chunk/embed a file as a new version, mark it is_latest, demote older ones."""
+        with self._write_lock:
             documents = SimpleDirectoryReader(input_files=[file_path]).load_data()
-            for doc in documents:
-                doc.metadata["file_name"] = original_name
-                doc.metadata["source"] = original_name
-
-            # Split into chunks explicitly so we can report an accurate count.
             nodes = Settings.node_parser.get_nodes_from_documents(documents)
             for node in nodes:
-                node.metadata["file_name"] = original_name
-                node.metadata["source"] = original_name
-
+                node.metadata.update({
+                    "file_name": filename,
+                    "source": filename,
+                    "document_id": document_id,
+                    "version": version,
+                    "is_latest": True,
+                })
             self._index.insert_nodes(nodes)
-            return {"chunks": len(nodes), "filename": original_name}
+            self._demote_other_versions(document_id, keep_version=version)
+            return len(nodes)
 
-        return await loop.run_in_executor(None, _run)
+    def _set_latest_for_document(self, document_id: str, latest_version):
+        """Set is_latest=true only for chunks of `latest_version` (None => none)."""
+        try:
+            got = self._chroma_collection.get(where={"document_id": document_id}, include=["metadatas"])
+            ids = got.get("ids", []) or []
+            mds = got.get("metadatas", []) or []
+            cids, cmds = [], []
+            for cid, md in zip(ids, mds):
+                want = latest_version is not None and md.get("version") == latest_version
+                if bool(md.get("is_latest")) != want:
+                    md = dict(md); md["is_latest"] = want
+                    cids.append(cid); cmds.append(md)
+            if cids:
+                self._chroma_collection.update(ids=cids, metadatas=cmds)
+        except Exception as e:
+            print(f"[RAG] set-latest error ({e})")
 
-    # ─── Management ──────────────────────────────────────────────────────────
+    def _demote_other_versions(self, document_id: str, keep_version: int):
+        self._set_latest_for_document(document_id, keep_version)
+
+    def set_document_hidden(self, document_id: str):
+        """Soft-delete: remove all of a document's chunks from retrieval."""
+        with self._write_lock:
+            self._set_latest_for_document(document_id, None)
+
+    def restore_version(self, document_id: str, version: int):
+        """Rollback / undelete: make `version`'s chunks the only latest ones."""
+        with self._write_lock:
+            self._set_latest_for_document(document_id, version)
+
+    def purge_document(self, document_id: str):
+        """Hard-delete: permanently remove all of a document's vectors."""
+        with self._write_lock:
+            try:
+                self._chroma_collection.delete(where={"document_id": document_id})
+            except Exception as e:
+                print(f"[RAG] purge error ({e})")
+
+    # ─── Status ────────────────────────────────────────────────────────────────
 
     def doc_count(self) -> int:
-        """Total number of vector chunks currently stored."""
         try:
             return int(self._chroma_collection.count())
         except Exception:
@@ -470,17 +529,7 @@ class RAGEngine:
             "reranker": RERANK_MODEL if self._reranker else None,
         }
 
-    def delete_document(self, doc_name: str) -> bool:
-        """Remove all chunks belonging to a document from Chroma (by metadata)."""
-        try:
-            self._chroma_collection.delete(where={"file_name": doc_name})
-            return True
-        except Exception as e:
-            print(f"[RAG] Delete error for '{doc_name}': {e}")
-            return False
-
     def reset(self):
-        """Drop and recreate the collection (wipes all vectors)."""
         client = chromadb.PersistentClient(path=CHROMA_PATH)
         try:
             client.delete_collection(COLLECTION_NAME)

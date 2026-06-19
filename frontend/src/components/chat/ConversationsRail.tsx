@@ -6,6 +6,7 @@ import IconButton from '@mui/material/IconButton';
 import List from '@mui/material/List';
 import ListItemButton from '@mui/material/ListItemButton';
 import Typography from '@mui/material/Typography';
+import CircularProgress from '@mui/material/CircularProgress';
 import AddRoundedIcon from '@mui/icons-material/AddRounded';
 import ChatBubbleOutlineRoundedIcon from '@mui/icons-material/ChatBubbleOutlineRounded';
 import DeleteOutlineRoundedIcon from '@mui/icons-material/DeleteOutlineRounded';
@@ -14,12 +15,14 @@ import type { SessionSummary } from '@/lib/types';
 export default function ConversationsRail({
   sessions,
   currentId,
+  busyIds = [],
   onNew,
   onSelect,
   onDelete,
 }: {
   sessions: SessionSummary[];
   currentId: string | null;
+  busyIds?: string[];
   onNew: () => void;
   onSelect: (id: string) => void;
   onDelete: (id: string) => void;
@@ -87,6 +90,9 @@ export default function ConversationsRail({
               >
                 {s.title}
               </Typography>
+              {busyIds.includes(s.id) && (
+                <CircularProgress size={14} thickness={6} sx={{ mr: 0.5, color: 'primary.main' }} />
+              )}
               <IconButton
                 className="del"
                 size="small"

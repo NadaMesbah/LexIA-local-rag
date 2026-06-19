@@ -67,8 +67,26 @@ export default function Markdown({ children }: { children: string }) {
           pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
         }}
       >
-        {children}
+        {normalizeMath(children)}
       </ReactMarkdown>
     </Box>
   );
+}
+
+// Qwen emits LaTeX with \( \) and \[ \] delimiters, but remark-math only knows
+// $…$ / $$…$$ (and markdown would otherwise strip the backslashes). Convert them
+// so equations render. Code blocks are left untouched.
+function normalizeMath(src: string): string {
+  if (!src) return src;
+  const blocks: string[] = [];
+  // protect fenced + inline code from the delimiter swap
+  let s = src.replace(/```[\s\S]*?```/g, (m) => `\u0000C${blocks.push(m) - 1}\u0000`);
+  s = s.replace(/`[^`\n]*`/g, (m) => `\u0000C${blocks.push(m) - 1}\u0000`);
+  s = s
+    .replace(/\\\[/g, () => '$$')
+    .replace(/\\\]/g, () => '$$')
+    .replace(/\\\(/g, () => '$')
+    .replace(/\\\)/g, () => '$');
+  s = s.replace(/\u0000C(\d+)\u0000/g, (_, i) => blocks[Number(i)]);
+  return s;
 }
