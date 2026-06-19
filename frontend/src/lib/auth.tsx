@@ -8,7 +8,7 @@ import type { User } from './types';
 interface AuthContextValue {
   user: User | null;
   loading: boolean;
-  login: (username: string, password: string) => Promise<void>;
+  login: (email: string, password: string) => Promise<void>;
   register: (data: api.RegisterInput) => Promise<void>;
   logout: () => void;
 }
@@ -53,8 +53,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return () => api.setUnauthorizedHandler(null);
   }, [router]);
 
-  const login = useCallback(async (username: string, password: string) => {
-    const res = await api.login(username, password);
+  const login = useCallback(async (email: string, password: string) => {
+    const res = await api.login(email, password);
     api.setToken(res.access_token);
     setUser(res.user);
   }, []);

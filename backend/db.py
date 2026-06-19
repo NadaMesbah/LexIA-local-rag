@@ -175,6 +175,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS users (
                 id            TEXT PRIMARY KEY,
                 username      TEXT NOT NULL UNIQUE,
+                email         TEXT NOT NULL DEFAULT '',       -- login identifier
                 password_hash TEXT NOT NULL,
                 first_name    TEXT NOT NULL DEFAULT '',
                 last_name     TEXT NOT NULL DEFAULT '',
@@ -206,6 +207,15 @@ def init_db() -> None:
             conn.execute("ALTER TABLE users ADD COLUMN first_name TEXT NOT NULL DEFAULT ''")
         if "last_name" not in ucols:
             conn.execute("ALTER TABLE users ADD COLUMN last_name TEXT NOT NULL DEFAULT ''")
+        # Email login identifier (migrate older auth schema that only had username).
+        if "email" not in ucols:
+            conn.execute("ALTER TABLE users ADD COLUMN email TEXT NOT NULL DEFAULT ''")
+        # Case-insensitive uniqueness for non-empty emails (partial unique index
+        # so legacy rows with an empty email don't collide).
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email "
+            "ON users(email COLLATE NOCASE) WHERE email <> ''"
+        )
         # Persisted original file path (so versions can be downloaded later).
         if "stored_path" not in _columns(conn, "document_versions"):
             conn.execute("ALTER TABLE document_versions ADD COLUMN stored_path TEXT")
@@ -214,16 +224,16 @@ def init_db() -> None:
 # ─── Users & auth ────────────────────────────────────────────────────────────
 
 def create_user(username: str, password_hash: str, role: str = "user",
-                first_name: str = "", last_name: str = "") -> dict:
+                first_name: str = "", last_name: str = "", email: str = "") -> dict:
     uid = _new_id()
     ts = _now()
     with _connect() as conn:
         conn.execute(
-            "INSERT INTO users (id, username, password_hash, first_name, last_name, role, created_at) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (uid, username, password_hash, first_name, last_name, role, ts),
+            "INSERT INTO users (id, username, email, password_hash, first_name, last_name, role, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (uid, username, email, password_hash, first_name, last_name, role, ts),
         )
-    return {"id": uid, "username": username, "first_name": first_name,
+    return {"id": uid, "username": username, "email": email, "first_name": first_name,
             "last_name": last_name, "role": role, "created_at": ts}
 
 
@@ -239,10 +249,28 @@ def get_user_by_username(username: str) -> Optional[dict]:
     return dict(row) if row else None
 
 
+def get_user_by_email(email: str) -> Optional[dict]:
+    """Look up a user by email, case-insensitively (empty email never matches)."""
+    email = (email or "").strip()
+    if not email:
+        return None
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE email <> '' AND email = ? COLLATE NOCASE", (email,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def set_user_email(user_id: str, email: str) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE users SET email=? WHERE id=?", (email, user_id))
+
+
 def list_users() -> list[dict]:
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT id, username, first_name, last_name, role, created_at FROM users ORDER BY created_at"
+            "SELECT id, username, email, first_name, last_name, role, created_at "
+            "FROM users ORDER BY created_at"
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -603,7 +631,20 @@ def list_versions(document_id: str) -> list[dict]:
             "SELECT * FROM document_versions WHERE document_id=? ORDER BY version DESC",
             (document_id,),
         ).fetchall()
-    return [dict(r) for r in rows]
+    return [_public_version(dict(r)) for r in rows]
+
+
+def _public_version(v: Optional[dict]) -> Optional[dict]:
+    """Annotate a version row with a `downloadable` flag and drop the internal
+    server file path so it is never exposed to clients. A version is downloadable
+    only when its original file was stored (versions that predate file storage
+    have a NULL `stored_path`)."""
+    if v is None:
+        return None
+    v = dict(v)
+    v["downloadable"] = bool(v.get("stored_path"))
+    v.pop("stored_path", None)
+    return v
 
 
 def list_documents(include_deleted: bool = False, owner_id: Optional[str] = None,
@@ -632,7 +673,7 @@ def list_documents(include_deleted: bool = False, owner_id: Optional[str] = None
             c = conn.execute(
                 "SELECT COUNT(*) AS c FROM document_versions WHERE document_id=?", (d["id"],)
             ).fetchone()["c"]
-            d["latest"] = dict(v) if v else None
+            d["latest"] = _public_version(dict(v)) if v else None
             d["version_count"] = int(c)
     return docs
 

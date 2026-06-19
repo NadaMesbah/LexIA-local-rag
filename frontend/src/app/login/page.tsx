@@ -24,7 +24,9 @@ import { useAuth } from '@/lib/auth';
 
 type Mode = 'login' | 'register';
 
-const EMPTY = { firstName: '', lastName: '', username: '', password: '', confirm: '' };
+const EMPTY = { firstName: '', lastName: '', username: '', email: '', password: '', confirm: '' };
+
+const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 
 export default function LoginPage() {
   const { user, loading, login, register } = useAuth();
@@ -55,11 +57,12 @@ export default function LoginPage() {
   };
 
   const canSubmit = useMemo(() => {
-    if (mode === 'login') return form.username.trim().length > 0 && form.password.length > 0;
+    if (mode === 'login') return EMAIL_RE.test(form.email.trim()) && form.password.length > 0;
     return (
       form.firstName.trim() &&
       form.lastName.trim() &&
       form.username.trim().length >= 3 &&
+      EMAIL_RE.test(form.email.trim()) &&
       form.password.length >= 8 &&
       form.confirm.length > 0
     );
@@ -78,13 +81,14 @@ export default function LoginPage() {
     setBusy(true);
     try {
       if (mode === 'login') {
-        await login(form.username.trim(), form.password);
+        await login(form.email.trim(), form.password);
         router.replace('/chat');
       } else {
         await register({
           first_name: form.firstName.trim(),
           last_name: form.lastName.trim(),
           username: form.username.trim(),
+          email: form.email.trim(),
           password: form.password,
         });
         // Account created — send the user to the sign-in screen.
@@ -267,13 +271,32 @@ export default function LoginPage() {
                 </Stack>
               )}
 
+              {mode === 'register' && (
+                <TextField
+                  fullWidth
+                  label="Nom d'utilisateur"
+                  value={form.username}
+                  onChange={set('username')}
+                  autoComplete="username"
+                  helperText="3 caractères minimum"
+                />
+              )}
+
               <TextField
                 fullWidth
-                label="Nom d'utilisateur"
-                value={form.username}
-                onChange={set('username')}
-                autoComplete="username"
-                helperText={mode === 'register' ? '3 caractères minimum' : undefined}
+                type="email"
+                label="Adresse e-mail"
+                value={form.email}
+                onChange={set('email')}
+                autoComplete="email"
+                error={!!form.email && !EMAIL_RE.test(form.email.trim())}
+                helperText={
+                  !!form.email && !EMAIL_RE.test(form.email.trim())
+                    ? 'Adresse e-mail invalide.'
+                    : mode === 'login'
+                      ? 'Connectez-vous avec votre e-mail.'
+                      : undefined
+                }
               />
 
               <TextField
