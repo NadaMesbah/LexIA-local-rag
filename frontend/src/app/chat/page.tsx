@@ -1,26 +1,24 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import Box from '@mui/material/Box';
 import Paper from '@mui/material/Paper';
 import Typography from '@mui/material/Typography';
-import IconButton from '@mui/material/IconButton';
 import Button from '@mui/material/Button';
-import Tooltip from '@mui/material/Tooltip';
 import Dialog from '@mui/material/Dialog';
 import DialogTitle from '@mui/material/DialogTitle';
 import DialogContent from '@mui/material/DialogContent';
 import DialogContentText from '@mui/material/DialogContentText';
 import DialogActions from '@mui/material/DialogActions';
-import ViewSidebarRoundedIcon from '@mui/icons-material/ViewSidebarRounded';
+import Snackbar from '@mui/material/Snackbar';
+import Alert from '@mui/material/Alert';
 import RefreshRoundedIcon from '@mui/icons-material/RefreshRounded';
 import AutoAwesomeRoundedIcon from '@mui/icons-material/AutoAwesomeRounded';
 
 import ConversationsRail from '@/components/chat/ConversationsRail';
 import MessageItem from '@/components/chat/MessageItem';
-import SourcesPanel from '@/components/chat/SourcesPanel';
 import Composer from '@/components/chat/Composer';
-import type { DocumentItem, Message, Scope, SessionSummary, Source, Status, StreamEvent } from '@/lib/types';
+import type { Message, SessionSummary, Status, StreamEvent, Source } from '@/lib/types';
 import * as api from '@/lib/api';
 
 interface StreamState {
@@ -33,24 +31,18 @@ interface StreamState {
 }
 
 const EMPTY_STREAM: StreamState = {
-  active: false,
-  sessionId: null,
-  answer: '',
-  sources: [],
-  thinking: false,
-  error: null,
+  active: false, sessionId: null, answer: '', sources: [], thinking: false, error: null,
 };
 
 export default function ChatPage() {
   const [status, setStatus] = useState<Status | null>(null);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
-  const [documents, setDocuments] = useState<DocumentItem[]>([]);
   const [currentId, setCurrentId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [stream, setStream] = useState<StreamState>(EMPTY_STREAM);
-  const [sourcesOpen, setSourcesOpen] = useState(true);
-  const [scope, setScope] = useState<Scope>({ type: 'all' });
   const [confirmId, setConfirmId] = useState<string | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [toast, setToast] = useState<{ msg: string; sev: 'success' | 'error' } | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -64,20 +56,15 @@ export default function ChatPage() {
     } catch {/* ignore */}
   }, []);
 
-  const refreshDocuments = useCallback(async () => {
-    try {
-      const { documents } = await api.listDocuments();
-      setDocuments(documents);
-    } catch {/* ignore */}
+  const refreshStatus = useCallback(() => {
+    api.getStatus().then(setStatus).catch(() => {});
   }, []);
 
   useEffect(() => {
-    api.getStatus().then(setStatus).catch(() => {});
+    refreshStatus();
     refreshSessions();
-    refreshDocuments();
-  }, [refreshSessions, refreshDocuments]);
+  }, [refreshStatus, refreshSessions]);
 
-  // Autoscroll on new content.
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
@@ -105,46 +92,26 @@ export default function ChatPage() {
     } catch {/* ignore */}
   }, []);
 
-  // Core streaming runner shared by send / edit / regenerate.
   const runStream = useCallback(
-    async (
-      url: string,
-      body: Record<string, unknown> | undefined,
-      sid: string,
-      opts: { firstTurn?: boolean } = {}
-    ) => {
+    async (url: string, body: Record<string, unknown> | undefined, sid: string, opts: { firstTurn?: boolean } = {}) => {
       const controller = new AbortController();
       abortRef.current = controller;
       setStream({ ...EMPTY_STREAM, active: true, thinking: true, sessionId: sid });
       let acc = '';
-      let srcs: Source[] = [];
       let errored = false;
       let errMsg = '';
       try {
         await api.streamNdjson(
-          url,
-          body,
+          url, body,
           (e: StreamEvent) => {
-            if (e.type === 'token') {
-              acc += e.data;
-              setStream((s) => ({ ...s, thinking: false, answer: acc }));
-            } else if (e.type === 'sources') {
-              srcs = e.data;
-              setStream((s) => ({ ...s, sources: srcs }));
-            } else if (e.type === 'error') {
-              errored = true;
-              errMsg = e.data;
-              setStream((s) => ({ ...s, error: e.data }));
-            }
+            if (e.type === 'token') { acc += e.data; setStream((s) => ({ ...s, thinking: false, answer: acc })); }
+            else if (e.type === 'sources') { setStream((s) => ({ ...s, sources: e.data })); }
+            else if (e.type === 'error') { errored = true; errMsg = e.data; setStream((s) => ({ ...s, error: e.data })); }
           },
           controller.signal
         );
       } catch (err: any) {
-        if (err?.name !== 'AbortError') {
-          errored = true;
-          errMsg = err?.message || 'Erreur';
-          setStream((s) => ({ ...s, error: errMsg }));
-        }
+        if (err?.name !== 'AbortError') { errored = true; errMsg = err?.message || 'Erreur'; setStream((s) => ({ ...s, error: errMsg })); }
       } finally {
         abortRef.current = null;
         const ok = !errored && acc.trim().length > 0;
@@ -152,15 +119,10 @@ export default function ChatPage() {
         await refreshSessions();
         if (currentIdRef.current === sid) {
           if (ok) {
-            // success: reload canonical tree (ids, version arrows)
             reloadCurrent(sid);
           } else {
-            // failure/empty: surface it instead of a silent "interrupted" state
             const text = errored ? `⚠️ ${errMsg || 'Erreur'}` : (acc.trim() || '⚠️ Aucune réponse générée.');
-            setMessages((m) => [
-              ...m,
-              { id: `tmp-a-${Date.now()}`, parent_id: null, role: 'assistant', content: text, version_index: 1, version_count: 1, sibling_ids: [] },
-            ]);
+            setMessages((m) => [...m, { id: `tmp-a-${Date.now()}`, parent_id: null, role: 'assistant', content: text, version_index: 1, version_count: 1, sibling_ids: [] }]);
           }
         }
         setStream(EMPTY_STREAM);
@@ -180,18 +142,12 @@ export default function ChatPage() {
           sid = s.id;
           setCurrentId(sid);
           await refreshSessions();
-        } catch {
-          return;
-        }
+        } catch { return; }
       }
-      // optimistic user bubble
-      setMessages((m) => [
-        ...m,
-        { id: `tmp-${Date.now()}`, parent_id: null, role: 'user', content: text, version_index: 1, version_count: 1, sibling_ids: [] },
-      ]);
-      await runStream(api.chatUrl(sid!), { message: text, scope }, sid!, { firstTurn });
+      setMessages((m) => [...m, { id: `tmp-${Date.now()}`, parent_id: null, role: 'user', content: text, version_index: 1, version_count: 1, sibling_ids: [] }]);
+      await runStream(api.chatUrl(sid!), { message: text }, sid!, { firstTurn });
     },
-    [currentId, messages.length, stream.active, runStream, refreshSessions, scope]
+    [currentId, messages.length, stream.active, runStream, refreshSessions]
   );
 
   const handleEdit = useCallback(
@@ -204,9 +160,9 @@ export default function ChatPage() {
         copy[i] = { ...copy[i], content: text };
         return copy;
       });
-      await runStream(api.editUrl(currentId, id), { message: text, scope }, currentId, {});
+      await runStream(api.editUrl(currentId, id), { message: text }, currentId, {});
     },
-    [currentId, stream.active, runStream, scope]
+    [currentId, stream.active, runStream]
   );
 
   const handleRegenerate = useCallback(
@@ -246,12 +202,17 @@ export default function ChatPage() {
     [currentId, newConversation, refreshSessions]
   );
 
-  const lastSources = useMemo(() => {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === 'assistant') return messages[i].sources || [];
+  const handleAttach = useCallback(async (files: FileList) => {
+    setUploading(true);
+    let n = 0;
+    for (const f of Array.from(files)) {
+      try { await api.uploadDocument(f); n += 1; }
+      catch (e: any) { setToast({ msg: `Échec : ${e?.message || f.name}`, sev: 'error' }); }
     }
-    return [];
-  }, [messages]);
+    setUploading(false);
+    if (n) setToast({ msg: `${n} document(s) envoyé(s) — indexation en cours.`, sev: 'success' });
+    refreshStatus();
+  }, [refreshStatus]);
 
   const liveLastUser = messages.length > 0 && messages[messages.length - 1].role === 'user';
   const showGroundingFlag = (status?.total_documents || 0) > 0;
@@ -266,56 +227,26 @@ export default function ChatPage() {
         onDelete={(id) => setConfirmId(id)}
       />
 
-      {/* Center column */}
       <Box sx={{ flexGrow: 1, minWidth: 0, display: 'flex', flexDirection: 'column', height: '100%' }}>
-        {/* Header */}
-        <Box
-          sx={{
-            px: 3,
-            py: 1.5,
-            borderBottom: '1px dashed rgba(145,158,171,0.2)',
-            display: 'flex',
-            alignItems: 'center',
-            gap: 1,
-            bgcolor: 'background.paper',
-          }}
-        >
-          <Typography variant="subtitle1" sx={{ fontWeight: 700, flexGrow: 1 }} noWrap>
+        <Box sx={{ px: 3, py: 1.75, borderBottom: '1px dashed rgba(145,158,171,0.2)', bgcolor: 'background.paper' }}>
+          <Typography variant="subtitle1" sx={{ fontWeight: 700 }} noWrap>
             {sessions.find((s) => s.id === currentId)?.title || 'Nouvelle conversation'}
           </Typography>
-          <Tooltip title={sourcesOpen ? 'Masquer les sources' : 'Afficher les sources'}>
-            <IconButton onClick={() => setSourcesOpen((o) => !o)} color={sourcesOpen ? 'primary' : 'default'}>
-              <ViewSidebarRoundedIcon />
-            </IconButton>
-          </Tooltip>
         </Box>
 
-        {/* Messages */}
         <Box ref={scrollRef} sx={{ flexGrow: 1, overflowY: 'auto', px: { xs: 2, md: 6 }, py: 3 }}>
           <Box sx={{ maxWidth: 860, mx: 'auto', display: 'flex', flexDirection: 'column', gap: 2.5 }}>
             {messages.length === 0 && !stream.active && (
               <Box sx={{ textAlign: 'center', py: 8, color: 'text.secondary' }}>
-                <Box
-                  sx={{
-                    width: 64,
-                    height: 64,
-                    mx: 'auto',
-                    mb: 2,
-                    borderRadius: 2.5,
-                    bgcolor: 'rgba(0,167,111,0.12)',
-                    color: 'primary.main',
-                    display: 'grid',
-                    placeItems: 'center',
-                  }}
-                >
+                <Box sx={{ width: 64, height: 64, mx: 'auto', mb: 2, borderRadius: 2.5, bgcolor: 'rgba(0,167,111,0.12)', color: 'primary.main', display: 'grid', placeItems: 'center' }}>
                   <AutoAwesomeRoundedIcon fontSize="large" />
                 </Box>
                 <Typography variant="h5" sx={{ fontWeight: 800, color: 'text.primary' }}>
                   Interrogez votre base de connaissance
                 </Typography>
                 <Typography variant="body2" sx={{ mt: 1, maxWidth: 460, mx: 'auto' }}>
-                  Posez une question générale, ou ajoutez des documents et l&apos;assistant répondra
-                  en s&apos;appuyant dessus — avec citations.
+                  Posez une question, ou joignez un document avec 📎 et l&apos;assistant répondra
+                  en s&apos;appuyant dessus — avec sources.
                 </Typography>
               </Box>
             )}
@@ -331,17 +262,12 @@ export default function ChatPage() {
               />
             ))}
 
-            {/* Live streaming bubble */}
             {stream.active && stream.sessionId === currentId && (
               <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 0.5 }}>
-                <Typography variant="caption" sx={{ color: 'warning.dark', fontWeight: 700 }}>
-                  ASSISTANT
-                </Typography>
+                <Typography variant="caption" sx={{ color: 'warning.dark', fontWeight: 700 }}>ASSISTANT</Typography>
                 <Paper sx={{ px: 2, py: 1.5, width: '100%', border: '1px solid rgba(145,158,171,0.2)', boxShadow: 'none', borderRadius: 2 }}>
                   {stream.thinking && !stream.answer ? (
-                    <Typography variant="body2" sx={{ color: 'text.secondary', fontStyle: 'italic' }}>
-                      Recherche dans la base…
-                    </Typography>
+                    <Typography variant="body2" sx={{ color: 'text.secondary', fontStyle: 'italic' }}>Recherche dans la base…</Typography>
                   ) : stream.error ? (
                     <Typography variant="body2" color="error">⚠️ {stream.error}</Typography>
                   ) : (
@@ -354,17 +280,11 @@ export default function ChatPage() {
               </Box>
             )}
 
-            {/* Interrupted-answer recovery */}
             {liveLastUser && !stream.active && (
               <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, color: 'text.secondary' }}>
                 <Typography variant="body2">La réponse a été interrompue.</Typography>
-                <Button
-                  size="small"
-                  variant="outlined"
-                  color="inherit"
-                  startIcon={<RefreshRoundedIcon />}
-                  onClick={() => handleRegenerate(messages[messages.length - 1].id)}
-                >
+                <Button size="small" variant="outlined" color="inherit" startIcon={<RefreshRoundedIcon />}
+                  onClick={() => handleRegenerate(messages[messages.length - 1].id)}>
                   Régénérer
                 </Button>
               </Box>
@@ -372,35 +292,21 @@ export default function ChatPage() {
           </Box>
         </Box>
 
-        <Composer streaming={stream.active} onSend={handleSend} onStop={handleStop} />
+        <Composer streaming={stream.active} uploading={uploading} onSend={handleSend} onStop={handleStop} onAttach={handleAttach} />
       </Box>
-
-      {sourcesOpen && (
-        <SourcesPanel
-          documents={documents}
-          lastSources={lastSources}
-          scope={scope}
-          onScopeChange={setScope}
-          uploadFn={api.uploadDocument}
-          onUploaded={() => {
-            refreshDocuments();
-            api.getStatus().then(setStatus).catch(() => {});
-          }}
-        />
-      )}
 
       <Dialog open={!!confirmId} onClose={() => setConfirmId(null)} PaperProps={{ sx: { borderRadius: 2 } }}>
         <DialogTitle>Supprimer la conversation ?</DialogTitle>
-        <DialogContent>
-          <DialogContentText>Cette action est irréversible.</DialogContentText>
-        </DialogContent>
+        <DialogContent><DialogContentText>Cette action est irréversible.</DialogContentText></DialogContent>
         <DialogActions>
           <Button color="inherit" onClick={() => setConfirmId(null)}>Annuler</Button>
-          <Button color="error" variant="contained" onClick={() => confirmId && handleDelete(confirmId)}>
-            Supprimer
-          </Button>
+          <Button color="error" variant="contained" onClick={() => confirmId && handleDelete(confirmId)}>Supprimer</Button>
         </DialogActions>
       </Dialog>
+
+      <Snackbar open={!!toast} autoHideDuration={4000} onClose={() => setToast(null)} anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}>
+        {toast ? <Alert severity={toast.sev} variant="filled" onClose={() => setToast(null)}>{toast.msg}</Alert> : undefined}
+      </Snackbar>
     </Box>
   );
 }

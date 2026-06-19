@@ -82,9 +82,11 @@ SUPPORTED_EXTS = {".pdf", ".txt", ".docx", ".md", ".csv", ".xlsx"}
 
 SYSTEM_PROMPT = (
     "You are a precise, helpful assistant for a private knowledge base. "
-    "Answer using the context below, and mention the document name(s) you relied on. "
-    "If the context does NOT contain the answer, say clearly that you couldn't find it "
-    "in the documents — do NOT invent or guess. Be clear, concise and structured."
+    "Answer using the context below. If the context does NOT contain the answer, say "
+    "clearly that you couldn't find it in the documents — do NOT invent or guess. "
+    "Do NOT add a 'Sources', 'Source' or citations list to your answer, and do NOT "
+    "mention file names or version numbers — the application displays the sources "
+    "separately. Be clear, concise and well structured."
 )
 
 CONTEXT_TEMPLATE = (
