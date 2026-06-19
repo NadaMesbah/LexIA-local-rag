@@ -92,25 +92,6 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             );
           })}
         </List>
-
-        <Box sx={{ flexGrow: 1 }} />
-        <Box sx={{ p: 2.5 }}>
-          <Box
-            sx={{
-              p: 2,
-              borderRadius: 2,
-              bgcolor: 'rgba(0,167,111,0.08)',
-              textAlign: 'center',
-            }}
-          >
-            <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block' }}>
-              100% local & privé
-            </Typography>
-            <Typography variant="caption" sx={{ color: 'text.disabled' }}>
-              Vos documents ne quittent pas la machine
-            </Typography>
-          </Box>
-        </Box>
       </Drawer>
 
       <Box component="main" sx={{ flexGrow: 1, minWidth: 0, height: '100%', overflow: 'hidden' }}>

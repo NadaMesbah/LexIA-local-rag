@@ -7,6 +7,7 @@ import Typography from '@mui/material/Typography';
 import IconButton from '@mui/material/IconButton';
 import Tooltip from '@mui/material/Tooltip';
 import Chip from '@mui/material/Chip';
+import Collapse from '@mui/material/Collapse';
 import TextField from '@mui/material/TextField';
 import Button from '@mui/material/Button';
 import ContentCopyRoundedIcon from '@mui/icons-material/ContentCopyRounded';
@@ -16,8 +17,32 @@ import RefreshRoundedIcon from '@mui/icons-material/RefreshRounded';
 import ChevronLeftRoundedIcon from '@mui/icons-material/ChevronLeftRounded';
 import ChevronRightRoundedIcon from '@mui/icons-material/ChevronRightRounded';
 import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
+import DescriptionOutlinedIcon from '@mui/icons-material/DescriptionOutlined';
 import Markdown from '@/components/Markdown';
-import type { Message } from '@/lib/types';
+import type { Message, Source } from '@/lib/types';
+
+function SourceRow({ s }: { s: Source }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <Box onClick={() => setOpen((o) => !o)} sx={{
+      p: 1.25, borderRadius: 1.5, border: '1px solid rgba(145,158,171,0.2)', cursor: 'pointer',
+      width: '100%', '&:hover': { borderColor: 'primary.light' },
+    }}>
+      <Box sx={{ display: 'flex', gap: 1, alignItems: 'center', mb: 0.5 }}>
+        <DescriptionOutlinedIcon fontSize="small" sx={{ color: 'primary.main' }} />
+        <Typography variant="caption" sx={{ fontWeight: 700, flexGrow: 1, wordBreak: 'break-all' }}>
+          {s.filename}{s.version ? ` · v${s.version}` : ''}
+        </Typography>
+        {s.page && s.page !== '?' && <Chip label={`p.${s.page}`} size="small" sx={{ height: 18, fontSize: 10 }} />}
+      </Box>
+      <Typography variant="caption" color="text.secondary" sx={{
+        display: '-webkit-box', WebkitLineClamp: open ? 'unset' : 2, WebkitBoxOrient: 'vertical', overflow: 'hidden',
+      }}>
+        {s.text}
+      </Typography>
+    </Box>
+  );
+}
 
 function CopyButton({ text }: { text: string }) {
   const [done, setDone] = useState(false);
@@ -81,6 +106,7 @@ export default function MessageItem({
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(m.content);
+  const [showSources, setShowSources] = useState(false);
   const isUser = m.role === 'user';
 
   if (isUser) {
@@ -181,7 +207,21 @@ export default function MessageItem({
             </IconButton>
           </Tooltip>
         )}
+        {m.sources && m.sources.length > 0 && (
+          <Button size="small" variant="text" startIcon={<DescriptionOutlinedIcon fontSize="small" />}
+            onClick={() => setShowSources((v) => !v)}
+            sx={{ color: 'text.secondary', textTransform: 'none', minWidth: 0 }}>
+            {showSources ? 'Masquer les sources' : `Sources (${m.sources.length})`}
+          </Button>
+        )}
       </Box>
+      {m.sources && m.sources.length > 0 && (
+        <Collapse in={showSources} sx={{ width: '100%' }}>
+          <Box sx={{ mt: 0.5, display: 'flex', flexDirection: 'column', gap: 0.75 }}>
+            {m.sources.map((s, i) => <SourceRow key={i} s={s} />)}
+          </Box>
+        </Collapse>
+      )}
     </Box>
   );
 }
