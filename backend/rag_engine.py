@@ -402,8 +402,14 @@ class RAGEngine:
             return items
 
     def _relevant_nodes(self, message: str, scope: Optional[dict], user: Optional[dict]) -> list[dict]:
-        """Vector search with the visibility filter pushed into Chroma, then cutoff + rerank."""
+        """Vector search with the visibility filter pushed into Chroma, then cutoff + rerank.
+
+        When the query is explicitly scoped to attached documents, the relevance
+        cutoff is bypassed: the user has already chosen those documents, so we
+        return their best-matching chunks unconditionally (capped at top-k) rather
+        than risk filtering them all out and forcing an un-grounded answer."""
         where = self._visibility_where(user, scope)
+        scoped = bool(self._scoped_ids(scope))
         try:
             emb = Settings.embed_model.get_query_embedding(message)
             n = max(RETRIEVE_TOP_K * 3, 12) if self._reranker else RETRIEVE_TOP_K
@@ -423,7 +429,8 @@ class RAGEngine:
         ]
         raw = len(items)
         top_raw = round(max((it["score"] for it in items), default=0.0), 4)
-        kept = [it for it in items if it["score"] >= RELEVANCE_CUTOFF]
+        # Scoped queries skip the cutoff (the document choice is the relevance signal).
+        kept = items if scoped else [it for it in items if it["score"] >= RELEVANCE_CUTOFF]
         after_cutoff = len(kept)
         kept = self._rerank(kept, message)
         result = kept[:RETRIEVE_TOP_K]
@@ -431,7 +438,7 @@ class RAGEngine:
         # `raw == 0` => the visibility `where` matched no chunk (check is_latest/
         # scope/owner_id metadata); `raw > 0 but after_cutoff == 0` => the best
         # match scored below RELEVANCE_CUTOFF (compare with top_raw and lower it).
-        print(f"[RAG] retrieve: where={where} raw={raw} top_score={top_raw} "
+        print(f"[RAG] retrieve: where={where} scoped={scoped} raw={raw} top_score={top_raw} "
               f"after_cutoff={after_cutoff} returned={len(result)} cutoff={RELEVANCE_CUTOFF}")
         return result
 
