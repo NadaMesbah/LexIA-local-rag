@@ -71,7 +71,12 @@ CHUNK_OVERLAP   = int(os.getenv("CHUNK_OVERLAP", "64"))
 RETRIEVE_TOP_K  = int(os.getenv("RETRIEVE_TOP_K", "5"))
 RERANK_TOP_N    = int(os.getenv("RERANK_TOP_N", "4"))
 RERANK_ENABLED  = os.getenv("RERANK_ENABLED", "false").lower() in ("1", "true", "yes")
-RELEVANCE_CUTOFF = float(os.getenv("RELEVANCE_CUTOFF", "0.6"))
+# Minimum cosine similarity (score = 1 - cosine_distance) for a chunk to count as
+# relevant. With bge-m3 and the reranker OFF, genuinely relevant passages often
+# score ~0.4-0.6, so a high cutoff silently discards them and the answer falls
+# back to "general" with no sources. 0.35 favours recall; raise it (e.g. 0.5)
+# only if the reranker is enabled or answers pull in off-topic chunks.
+RELEVANCE_CUTOFF = float(os.getenv("RELEVANCE_CUTOFF", "0.35"))
 RERANK_MODEL    = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
 RERANK_DEVICE   = os.getenv("RERANK_DEVICE", "cpu")
 
@@ -389,16 +394,17 @@ class RAGEngine:
             for t, m, d in zip(docs, metas, dists)
         ]
         raw = len(items)
+        top_raw = round(max((it["score"] for it in items), default=0.0), 4)
         kept = [it for it in items if it["score"] >= RELEVANCE_CUTOFF]
         after_cutoff = len(kept)
         kept = self._rerank(kept, message)
         result = kept[:RETRIEVE_TOP_K]
         # Diagnostics: pinpoint where retrieval drops to zero (filter vs. cutoff).
         # `raw == 0` => the visibility `where` matched no chunk (check is_latest/
-        # scope/owner_id metadata); `raw > 0 but after_cutoff == 0` => everything
-        # was below RELEVANCE_CUTOFF (try lowering it).
-        print(f"[RAG] retrieve: where={where} raw={raw} after_cutoff={after_cutoff} "
-              f"returned={len(result)} cutoff={RELEVANCE_CUTOFF}")
+        # scope/owner_id metadata); `raw > 0 but after_cutoff == 0` => the best
+        # match scored below RELEVANCE_CUTOFF (compare with top_raw and lower it).
+        print(f"[RAG] retrieve: where={where} raw={raw} top_score={top_raw} "
+              f"after_cutoff={after_cutoff} returned={len(result)} cutoff={RELEVANCE_CUTOFF}")
         return result
 
     @staticmethod
