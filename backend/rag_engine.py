@@ -21,6 +21,7 @@ import threading
 from typing import Optional
 
 import chromadb
+from chromadb.config import Settings as ChromaSettings
 
 from llama_index.core import (
     VectorStoreIndex,
@@ -59,6 +60,11 @@ EMBED_MODEL     = os.getenv("EMBED_MODEL", "bge-m3")
 
 CHROMA_PATH     = os.getenv("CHROMA_PATH", "/app/data/chroma")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "rag_knowledge_base")
+
+# Fully local & private: disable ChromaDB's anonymized product telemetry so the
+# system makes ZERO outbound network calls at runtime (everything stays on the
+# host — demonstrable by pulling the network and watching it still answer).
+CHROMA_SETTINGS = ChromaSettings(anonymized_telemetry=False)
 
 CONTEXT_WINDOW  = int(os.getenv("CONTEXT_WINDOW", "8192"))
 NUM_OUTPUT      = int(os.getenv("NUM_OUTPUT", "1024"))
@@ -239,7 +245,7 @@ class RAGEngine:
             )
 
         print(f"[RAG] Opening ChromaDB at {CHROMA_PATH} (collection='{COLLECTION_NAME}')")
-        client = chromadb.PersistentClient(path=CHROMA_PATH)
+        client = chromadb.PersistentClient(path=CHROMA_PATH, settings=CHROMA_SETTINGS)
         self._chroma_collection = client.get_or_create_collection(
             name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
         )
@@ -663,7 +669,7 @@ class RAGEngine:
         }
 
     def reset(self):
-        client = chromadb.PersistentClient(path=CHROMA_PATH)
+        client = chromadb.PersistentClient(path=CHROMA_PATH, settings=CHROMA_SETTINGS)
         try:
             client.delete_collection(COLLECTION_NAME)
         except Exception:
