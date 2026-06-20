@@ -127,7 +127,8 @@ class RenameSessionRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
-    scope: Optional[dict] = None   # {"type": "all"} | {"type": "document", "id": "..."}
+    scope: Optional[dict] = None   # {"type": "all"} | {"type": "document", "id"/"ids": ...}
+    attachments: Optional[list] = None  # [{"id": "...", "filename": "..."}] shown on the user message
 
 
 # ─── Ownership helpers ───────────────────────────────────────────────────────
@@ -270,6 +271,11 @@ async def get_session(session_id: str, user: dict = Depends(auth.current_user)):
                 m["sources"] = json.loads(m["sources"])
             except Exception:
                 m["sources"] = []
+        if m.get("attachments"):
+            try:
+                m["attachments"] = json.loads(m["attachments"])
+            except Exception:
+                m["attachments"] = []
     session["messages"] = messages
     return session
 
@@ -382,7 +388,8 @@ async def chat(session_id: str, req: ChatRequest, user: dict = Depends(auth.curr
     path = db.get_active_path(session_id)
     history = [{"role": m["role"], "content": m["content"]} for m in path]
     parent_id = path[-1]["id"] if path else None
-    uid = db.add_message(session_id, "user", message, parent_id=parent_id)["id"]
+    att = json.dumps(req.attachments) if req.attachments else None
+    uid = db.add_message(session_id, "user", message, parent_id=parent_id, attachments=att)["id"]
 
     gen = _reply_generator(session_id, session["title"], uid, message, history, req.scope, user)
     return StreamingResponse(gen(), media_type="application/x-ndjson")
@@ -404,7 +411,8 @@ async def edit_message(session_id: str, message_id: str, req: ChatRequest,
         raise HTTPException(status_code=400, detail="Empty message.")
 
     history = _history_before(session_id, message_id)
-    uid = db.add_message(session_id, "user", content, parent_id=target["parent_id"])["id"]
+    att = json.dumps(req.attachments) if req.attachments else None
+    uid = db.add_message(session_id, "user", content, parent_id=target["parent_id"], attachments=att)["id"]
     gen = _reply_generator(session_id, session["title"], uid, content, history, req.scope, user)
     return StreamingResponse(gen(), media_type="application/x-ndjson")
 

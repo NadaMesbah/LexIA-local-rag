@@ -18,6 +18,7 @@ import ChevronLeftRoundedIcon from '@mui/icons-material/ChevronLeftRounded';
 import ChevronRightRoundedIcon from '@mui/icons-material/ChevronRightRounded';
 import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
 import DescriptionOutlinedIcon from '@mui/icons-material/DescriptionOutlined';
+import AttachFileRoundedIcon from '@mui/icons-material/AttachFileRounded';
 import Markdown from '@/components/Markdown';
 import type { Message, Source } from '@/lib/types';
 
@@ -112,6 +113,24 @@ export default function MessageItem({
   if (isUser) {
     return (
       <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 0.5 }}>
+        {!editing && m.attachments && m.attachments.length > 0 && (
+          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.75, justifyContent: 'flex-end', maxWidth: '78%' }}>
+            {m.attachments.map((a) => (
+              <Chip
+                key={a.id}
+                icon={<AttachFileRoundedIcon />}
+                label={a.filename}
+                size="small"
+                sx={{
+                  maxWidth: 240,
+                  bgcolor: 'rgba(0,167,111,0.08)',
+                  border: '1px solid rgba(0,167,111,0.24)',
+                  '& .MuiChip-label': { fontWeight: 600 },
+                }}
+              />
+            ))}
+          </Box>
+        )}
         {editing ? (
           <Box sx={{ width: '100%', maxWidth: 720 }}>
             <TextField

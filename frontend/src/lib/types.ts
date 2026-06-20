@@ -32,12 +32,18 @@ export interface Source {
   version?: number | null;
 }
 
+export interface MessageAttachment {
+  id: string; // document_id
+  filename: string;
+}
+
 export interface Message {
   id: string;
   parent_id: string | null;
   role: 'user' | 'assistant';
   content: string;
   sources?: Source[];
+  attachments?: MessageAttachment[];
   version_index: number;
   version_count: number;
   sibling_ids: string[];
@@ -77,7 +83,9 @@ export interface DocumentItem {
   latest: DocumentVersion | null;
 }
 
-export type Scope = { type: 'all' } | { type: 'document'; id: string; name: string };
+export type Scope =
+  | { type: 'all' }
+  | { type: 'document'; id?: string; ids?: string[]; name?: string };
 
 export interface Status {
   status: string;

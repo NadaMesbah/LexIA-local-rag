@@ -52,6 +52,9 @@ _chat_types.is_function = _safe_is_function
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
 LLM_MODEL       = os.getenv("LLM_MODEL", "qwen2.5:7b")
+# Optional lighter model used ONLY for short auto-titles. Defaults to the main
+# model; set TITLE_MODEL (e.g. "qwen2.5:1.5b") to make titling faster/cheaper.
+TITLE_MODEL     = os.getenv("TITLE_MODEL", "").strip() or LLM_MODEL
 EMBED_MODEL     = os.getenv("EMBED_MODEL", "bge-m3")
 
 CHROMA_PATH     = os.getenv("CHROMA_PATH", "/app/data/chroma")
@@ -190,6 +193,7 @@ class RAGEngine:
         self._vector_store: Optional[ChromaVectorStore] = None
         self._chroma_collection = None
         self._reranker = None
+        self._title_llm = None
         self._write_lock = threading.Lock()
         self._setup()
 
@@ -213,6 +217,21 @@ class RAGEngine:
         )
         Settings.num_output = NUM_OUTPUT
         Settings.context_window = CONTEXT_WINDOW
+
+        # Dedicated (optionally lighter) LLM for short auto-titles. Reusing a small
+        # model here keeps titling from competing with / waiting behind the main
+        # generation model. Falls back to the main model when TITLE_MODEL is unset.
+        if TITLE_MODEL == LLM_MODEL:
+            self._title_llm = Settings.llm
+        else:
+            print(f"[RAG] Title model={TITLE_MODEL}")
+            self._title_llm = Ollama(
+                model=TITLE_MODEL,
+                base_url=OLLAMA_BASE_URL,
+                request_timeout=REQUEST_TIMEOUT,
+                temperature=0.2,
+                keep_alive="30m",
+            )
 
         print(f"[RAG] Opening ChromaDB at {CHROMA_PATH} (collection='{COLLECTION_NAME}')")
         client = chromadb.PersistentClient(path=CHROMA_PATH)
@@ -285,7 +304,13 @@ class RAGEngine:
         """
         try:
             latest = {}  # document_id -> current_version (None if deleted/inactive)
-            for d in db.list_documents(include_deleted=True):
+            # role="admin" is REQUIRED here: without it, list_documents applies the
+            # per-user visibility filter "(scope='org' OR owner_id=?)" with owner_id
+            # = None, which silently drops every PERSONAL document. Those documents
+            # would then be absent from `latest`, so the loop below would flip their
+            # chunks to is_latest=False on every startup and make a user's own
+            # documents permanently unretrievable. We need the full, unfiltered set.
+            for d in db.list_documents(include_deleted=True, role="admin"):
                 latest[d["id"]] = d["current_version"] if d["status"] == "active" else None
             got = self._chroma_collection.get(include=["metadatas"])
             ids = got.get("ids", []) or []
@@ -311,12 +336,20 @@ class RAGEngine:
         """
         Chroma `where` clause: only latest chunks, restricted to the documents the
         user may see (admins see all; others see org docs + their own), optionally
-        narrowed to one document. Pushed down into the vector store so a user's
-        nearest-neighbour set is never polluted by chunks they can't access.
+        narrowed to one or several documents. Pushed down into the vector store so
+        a user's nearest-neighbour set is never polluted by chunks they can't access.
+
+        `scope` narrows the search to specific documents (e.g. files attached in the
+        composer): {"type": "document", "id": "..."} or {"type": "document",
+        "ids": ["...", "..."]}.
         """
         conds: list[dict] = [{"is_latest": True}]
-        if scope and scope.get("type") == "document" and scope.get("id"):
-            conds.append({"document_id": scope["id"]})
+        if scope and scope.get("type") == "document":
+            ids = [i for i in (scope.get("ids") or ([scope.get("id")] if scope.get("id") else [])) if i]
+            if len(ids) == 1:
+                conds.append({"document_id": ids[0]})
+            elif len(ids) > 1:
+                conds.append({"document_id": {"$in": ids}})
         if user and user.get("role") != "admin":
             conds.append({"$or": [{"scope": "org"}, {"owner_id": user["id"]}]})
         return {"$and": conds} if len(conds) > 1 else conds[0]
@@ -346,7 +379,7 @@ class RAGEngine:
                 include=["documents", "metadatas", "distances"],
             )
         except Exception as e:
-            print(f"[RAG] retrieval error ({e})")
+            print(f"[RAG] retrieval error ({e}); where={where}")
             return []
         docs = (res.get("documents") or [[]])[0]
         metas = (res.get("metadatas") or [[]])[0]
@@ -355,9 +388,18 @@ class RAGEngine:
             {"text": t or "", "metadata": m or {}, "score": 1.0 - float(d)}
             for t, m, d in zip(docs, metas, dists)
         ]
-        items = [it for it in items if it["score"] >= RELEVANCE_CUTOFF]
-        items = self._rerank(items, message)
-        return items[:RETRIEVE_TOP_K]
+        raw = len(items)
+        kept = [it for it in items if it["score"] >= RELEVANCE_CUTOFF]
+        after_cutoff = len(kept)
+        kept = self._rerank(kept, message)
+        result = kept[:RETRIEVE_TOP_K]
+        # Diagnostics: pinpoint where retrieval drops to zero (filter vs. cutoff).
+        # `raw == 0` => the visibility `where` matched no chunk (check is_latest/
+        # scope/owner_id metadata); `raw > 0 but after_cutoff == 0` => everything
+        # was below RELEVANCE_CUTOFF (try lowering it).
+        print(f"[RAG] retrieve: where={where} raw={raw} after_cutoff={after_cutoff} "
+              f"returned={len(result)} cutoff={RELEVANCE_CUTOFF}")
+        return result
 
     @staticmethod
     def _context_block(items: list[dict]) -> str:
@@ -379,7 +421,7 @@ class RAGEngine:
             prompt = _language_directive(message) + "\n\n" + TITLE_PROMPT.format(
                 message=(message or "")[:500]
             )
-            resp = Settings.llm.complete(prompt.strip())
+            resp = (self._title_llm or Settings.llm).complete(prompt.strip())
             title = (resp.text or "").strip().strip('"').strip()
             return (title.splitlines()[0][:60] if title else "") or fallback
         except Exception as e:
@@ -417,8 +459,12 @@ class RAGEngine:
             wants = scoped or await loop.run_in_executor(
                 None, self._should_use_docs, message, history
             )
+            print(f"[RAG] chat: doc_count={self.doc_count()} scoped={scoped} "
+                  f"use_docs_router={wants} role={(user or {}).get('role')}")
             if wants:
                 items = await loop.run_in_executor(None, self._relevant_nodes, message, scope, user)
+        else:
+            print("[RAG] chat: knowledge base is empty (doc_count=0) — answering conversationally")
 
         use_docs = len(items) > 0
         if use_docs:
