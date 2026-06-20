@@ -17,10 +17,11 @@ import AutoAwesomeRoundedIcon from '@mui/icons-material/AutoAwesomeRounded';
 
 import ConversationsRail from '@/components/chat/ConversationsRail';
 import MessageItem from '@/components/chat/MessageItem';
-import Composer, { type PendingAttachment } from '@/components/chat/Composer';
-import type { Message, SessionSummary, Status, IndexingStatus } from '@/lib/types';
+import Composer from '@/components/chat/Composer';
+import type { Message, SessionSummary, Status, IndexingStatus, PendingAttachment } from '@/lib/types';
 import * as api from '@/lib/api';
 import { useChatStream } from '@/lib/chatStream';
+import { useAttachments } from '@/lib/attachments';
 
 export default function ChatPage() {
   const [status, setStatus] = useState<Status | null>(null);
@@ -29,13 +30,16 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [confirmId, setConfirmId] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
-  const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const [toast, setToast] = useState<{ msg: string; sev: 'success' | 'error' | 'info' } | null>(null);
 
   // Streaming lives ABOVE this page (in a layout-level provider), so a running
   // generation survives navigating to /documents and back — no false "réponse
   // interrompue", while parallel generations per conversation still work.
   const { streams, busyIds, isActive, startStream, abort, completion } = useChatStream();
+  // Attachment indexing state ALSO lives above the page (same pattern): draft
+  // attachments and their real (backend-polled) status survive navigation.
+  const { pending: pendingAttachments, addAttachments, removeAttachment, clearPending, watch, statusOf } =
+    useAttachments();
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const currentIdRef = useRef<string | null>(null);
@@ -59,22 +63,35 @@ export default function ChatPage() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages, streams, currentId]);
 
+  // After (re)loading a conversation, keep following any attachment that is still
+  // indexing so its chip updates to "done" live, and survives navigation.
+  const watchMsgAttachments = useCallback((msgs: Message[]) => {
+    const ids = msgs.flatMap((m) =>
+      (m.attachments || [])
+        .filter((a) => a.indexing_status === 'pending' || a.indexing_status === 'processing')
+        .map((a) => a.id)
+    );
+    if (ids.length) watch(ids);
+  }, [watch]);
+
   const reloadCurrent = useCallback(async (id: string) => {
     try {
       const detail = await api.getSession(id);
       setMessages(detail.messages || []);
+      watchMsgAttachments(detail.messages || []);
     } catch {/* ignore */}
-  }, []);
+  }, [watchMsgAttachments]);
 
   const openSession = useCallback(async (id: string) => {
     setCurrentId(id);
     try {
       const detail = await api.getSession(id);
       setMessages(detail.messages || []);
+      watchMsgAttachments(detail.messages || []);
     } catch {
       setMessages([]);
     }
-  }, []);
+  }, [watchMsgAttachments]);
 
   const newConversation = useCallback(() => { setCurrentId(null); setMessages([]); }, []);
 
@@ -133,7 +150,7 @@ export default function ChatPage() {
           version_index: 1, version_count: 1, sibling_ids: [],
         },
       ]);
-      setPendingAttachments([]); // consumed by this turn
+      clearPending(); // consumed by this turn (status keeps updating via the provider)
 
       if (notReady) {
         setToast({ msg: 'Indexation du document en cours — la réponse démarrera dès qu\'il sera prêt.', sev: 'info' });
@@ -146,7 +163,7 @@ export default function ChatPage() {
         firstTurn,
       });
     },
-    [currentId, messages.length, pendingAttachments, isActive, startStream, refreshSessions]
+    [currentId, messages.length, pendingAttachments, isActive, startStream, refreshSessions, clearPending]
   );
 
   const handleEdit = useCallback(
@@ -202,32 +219,6 @@ export default function ChatPage() {
     [abort, currentId, newConversation, refreshSessions]
   );
 
-  // Poll the indexing status of just-attached documents until they are ready.
-  const pollAttachmentStatus = useCallback((ids: string[]) => {
-    let tries = 0;
-    const tick = async () => {
-      tries += 1;
-      try {
-        const { documents } = await api.listDocuments();
-        const byId = new Map(documents.map((d) => [d.id, d]));
-        let pendingLeft = false;
-        setPendingAttachments((prev) =>
-          prev.map((a) => {
-            if (!ids.includes(a.id)) return a;
-            const st = (byId.get(a.id)?.latest?.indexing_status as IndexingStatus) || a.status;
-            if (st === 'pending' || st === 'processing') pendingLeft = true;
-            return { ...a, status: st };
-          })
-        );
-        if (pendingLeft && tries < 40) setTimeout(tick, 1500);
-        else refreshStatus();
-      } catch {
-        if (tries < 40) setTimeout(tick, 2000);
-      }
-    };
-    setTimeout(tick, 1200);
-  }, [refreshStatus]);
-
   const handleAttach = useCallback(async (files: FileList) => {
     setUploading(true);
     const added: PendingAttachment[] = [];
@@ -241,16 +232,13 @@ export default function ChatPage() {
     }
     setUploading(false);
     if (added.length) {
-      setPendingAttachments((prev) => [...prev, ...added]);
+      // The provider tracks these and polls the backend for their real status
+      // (survives navigation); no page-local timer that dies on unmount.
+      addAttachments(added);
       setToast({ msg: `${added.length} document(s) joint(s) — ils seront prioritaires pour votre prochaine question.`, sev: 'success' });
-      pollAttachmentStatus(added.map((a) => a.id));
     }
     refreshStatus();
-  }, [pollAttachmentStatus, refreshStatus]);
-
-  const removeAttachment = useCallback((id: string) => {
-    setPendingAttachments((prev) => prev.filter((a) => a.id !== id));
-  }, []);
+  }, [addAttachments, refreshStatus]);
 
   const cur = currentId ? streams[currentId] : undefined;
   const liveLastUser = messages.length > 0 && messages[messages.length - 1].role === 'user';
@@ -297,6 +285,7 @@ export default function ChatPage() {
                 m={m}
                 showGroundingFlag={showGroundingFlag}
                 streaming={!!cur?.active}
+                statusOf={statusOf}
                 onSwitchVersion={handleSwitchVersion}
                 onEdit={handleEdit}
                 onRegenerate={handleRegenerate}

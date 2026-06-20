@@ -13,15 +13,11 @@ import StopRoundedIcon from '@mui/icons-material/StopRounded';
 import AttachFileRoundedIcon from '@mui/icons-material/AttachFileRounded';
 import CheckCircleRoundedIcon from '@mui/icons-material/CheckCircleRounded';
 import ErrorOutlineRoundedIcon from '@mui/icons-material/ErrorOutlineRounded';
-import type { IndexingStatus } from '@/lib/types';
+import type { IndexingStatus, PendingAttachment } from '@/lib/types';
 
 const ACCEPT = '.pdf,.txt,.docx,.md,.csv,.xlsx';
 
-export interface PendingAttachment {
-  id: string;
-  filename: string;
-  status: IndexingStatus;
-}
+export type { PendingAttachment };
 
 export default function Composer({
   streaming,

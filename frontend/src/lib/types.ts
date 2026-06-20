@@ -35,6 +35,17 @@ export interface Source {
 export interface MessageAttachment {
   id: string; // document_id
   filename: string;
+  // Current backend indexing status, enriched when a conversation is loaded so a
+  // re-opened chat shows the real state of the attached document (not a guess).
+  indexing_status?: IndexingStatus | null;
+}
+
+// A file attached in the composer for the next message (draft). Its status is
+// kept in sync with the backend by the AttachmentsProvider.
+export interface PendingAttachment {
+  id: string;
+  filename: string;
+  status: IndexingStatus;
 }
 
 export interface Message {

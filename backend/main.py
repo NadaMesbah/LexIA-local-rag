@@ -273,9 +273,17 @@ async def get_session(session_id: str, user: dict = Depends(auth.current_user)):
                 m["sources"] = []
         if m.get("attachments"):
             try:
-                m["attachments"] = json.loads(m["attachments"])
+                atts = json.loads(m["attachments"])
             except Exception:
-                m["attachments"] = []
+                atts = []
+            # Enrich each attachment with the attached document's CURRENT indexing
+            # status (source of truth), so a re-opened conversation shows the real
+            # state instead of whatever was guessed when it was first sent.
+            for a in atts:
+                if isinstance(a, dict) and a.get("id"):
+                    lv = db.latest_version(a["id"])
+                    a["indexing_status"] = lv.get("indexing_status") if lv else None
+            m["attachments"] = atts
     session["messages"] = messages
     return session
 
