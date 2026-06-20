@@ -95,12 +95,14 @@ function VersionNav({ m, onSwitch }: { m: Message; onSwitch: (id: string) => voi
 export default function MessageItem({
   m,
   showGroundingFlag,
+  streaming = false,
   onSwitchVersion,
   onEdit,
   onRegenerate,
 }: {
   m: Message;
   showGroundingFlag: boolean;
+  streaming?: boolean;
   onSwitchVersion: (id: string) => void;
   onEdit: (id: string, text: string) => void;
   onRegenerate: (userMessageId: string) => void;
@@ -177,11 +179,15 @@ export default function MessageItem({
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.25 }}>
             <VersionNav m={m} onSwitch={onSwitchVersion} />
             <CopyButton text={m.content} />
-            <Tooltip title="Modifier">
-              <IconButton size="small" onClick={() => { setDraft(m.content); setEditing(true); }} sx={{ color: 'text.disabled' }}>
-                <EditRoundedIcon fontSize="small" />
-              </IconButton>
-            </Tooltip>
+            {/* Editing is hidden while a reply is generating: editing then would
+                race the in-flight answer and target an id that isn't persisted yet. */}
+            {!streaming && (
+              <Tooltip title="Modifier">
+                <IconButton size="small" onClick={() => { setDraft(m.content); setEditing(true); }} sx={{ color: 'text.disabled' }}>
+                  <EditRoundedIcon fontSize="small" />
+                </IconButton>
+              </Tooltip>
+            )}
           </Box>
         )}
       </Box>
@@ -219,7 +225,7 @@ export default function MessageItem({
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.25 }}>
         <VersionNav m={m} onSwitch={onSwitchVersion} />
         <CopyButton text={m.content} />
-        {m.parent_id && (
+        {m.parent_id && !streaming && (
           <Tooltip title="Régénérer">
             <IconButton size="small" onClick={() => onRegenerate(m.parent_id as string)} sx={{ color: 'text.disabled' }}>
               <RefreshRoundedIcon fontSize="small" />

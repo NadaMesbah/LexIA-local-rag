@@ -83,7 +83,7 @@ export default function ChatPage() {
   useEffect(() => {
     if (!completion || completion.seq === lastCompletionSeq.current) return;
     lastCompletionSeq.current = completion.seq;
-    const { sid, ok, errored, errMsg, answer, title } = completion;
+    const { sid, ok, errored, errMsg, title } = completion;
 
     if (title) {
       setSessions((prev) => prev.map((s) => (s.id === sid ? { ...s, title } : s)));
@@ -91,15 +91,17 @@ export default function ChatPage() {
     void refreshSessions();
 
     const viewing = currentIdRef.current === sid;
-    if (viewing && ok) {
+    if (viewing) {
+      // Always re-sync from the server, even on stop/error. The optimistic user
+      // message uses a temporary id; without reloading it would keep that id and
+      // a subsequent edit/regenerate would fail ("Editable user message not
+      // found"). The backend persists the user message (and any partial answer)
+      // regardless of how the stream ended.
       void reloadCurrent(sid);
-    } else if (viewing && !ok) {
-      const text = errored ? `⚠️ ${errMsg || 'Erreur'}` : (answer.trim() || '⚠️ Aucune réponse générée.');
-      setMessages((m) => [
-        ...m,
-        { id: `tmp-a-${Date.now()}`, parent_id: null, role: 'assistant', content: text, version_index: 1, version_count: 1, sibling_ids: [] },
-      ]);
-    } else if (!viewing && ok) {
+      if (!ok && errored) {
+        setToast({ msg: `⚠️ ${errMsg || 'Erreur'}`, sev: 'error' });
+      }
+    } else if (ok) {
       const t = title || sessionsRef.current.find((s) => s.id === sid)?.title || 'une conversation';
       setToast({ msg: `Réponse prête : « ${t} »`, sev: 'success' });
     }
@@ -294,6 +296,7 @@ export default function ChatPage() {
                 key={m.id}
                 m={m}
                 showGroundingFlag={showGroundingFlag}
+                streaming={!!cur?.active}
                 onSwitchVersion={handleSwitchVersion}
                 onEdit={handleEdit}
                 onRegenerate={handleRegenerate}
