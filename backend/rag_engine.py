@@ -337,6 +337,35 @@ class RAGEngine:
     # ─── Chat ──────────────────────────────────────────────────────────────────
 
     @staticmethod
+    def _scoped_ids(scope: Optional[dict]) -> list[str]:
+        """Document ids a query is explicitly restricted to (composer attachments)."""
+        if not (scope and scope.get("type") == "document"):
+            return []
+        ids = scope.get("ids") or ([scope.get("id")] if scope.get("id") else [])
+        return [i for i in ids if i]
+
+    async def _await_attachments_indexed(self, doc_ids: list[str], timeout: float = 120.0):
+        """
+        Block until the explicitly-attached documents finish indexing (status
+        leaves pending/processing). A question asked immediately after attaching
+        a file would otherwise race ahead of indexing, retrieve nothing, and the
+        model would hallucinate. Bounded by `timeout` so a stuck job can't hang
+        the request forever.
+        """
+        if not doc_ids:
+            return
+        deadline = asyncio.get_event_loop().time() + timeout
+        while True:
+            pending = [d for d in doc_ids
+                       if (db.latest_version(d) or {}).get("indexing_status") in ("pending", "processing")]
+            if not pending:
+                return
+            if asyncio.get_event_loop().time() >= deadline:
+                print(f"[RAG] attachments still indexing after {timeout:.0f}s, proceeding: {pending}")
+                return
+            await asyncio.sleep(0.7)
+
+    @staticmethod
     def _visibility_where(user: Optional[dict], scope: Optional[dict]) -> dict:
         """
         Chroma `where` clause: only latest chunks, restricted to the documents the
@@ -349,12 +378,11 @@ class RAGEngine:
         "ids": ["...", "..."]}.
         """
         conds: list[dict] = [{"is_latest": True}]
-        if scope and scope.get("type") == "document":
-            ids = [i for i in (scope.get("ids") or ([scope.get("id")] if scope.get("id") else [])) if i]
-            if len(ids) == 1:
-                conds.append({"document_id": ids[0]})
-            elif len(ids) > 1:
-                conds.append({"document_id": {"$in": ids}})
+        ids = RAGEngine._scoped_ids(scope)
+        if len(ids) == 1:
+            conds.append({"document_id": ids[0]})
+        elif len(ids) > 1:
+            conds.append({"document_id": {"$in": ids}})
         if user and user.get("role") != "admin":
             conds.append({"$or": [{"scope": "org"}, {"owner_id": user["id"]}]})
         return {"$and": conds} if len(conds) > 1 else conds[0]
@@ -453,20 +481,31 @@ class RAGEngine:
         Yields ("token", str)… then ("sources", list).
 
         Retrieves over latest-version chunks the user is allowed to see (visibility
-        pushed into Chroma), optionally scoped to one document, and streams the
-        answer directly from the LLM with the retrieved context injected.
+        pushed into Chroma), optionally scoped to one or more attached documents,
+        and streams the answer with the retrieved context injected.
+
+        When the query is explicitly scoped to attached documents we (a) wait for
+        their indexing to finish so a question asked right after attaching isn't
+        answered from an empty index, and (b) ALWAYS use the grounded prompt — so
+        if no extract is found the model says it couldn't find it instead of
+        hallucinating an unrelated answer.
         """
         loop = asyncio.get_event_loop()
         directive = _language_directive(message)
-        scoped = bool(scope and scope.get("type") == "document")
+        scoped_ids = self._scoped_ids(scope)
+        scoped = bool(scoped_ids)
 
         items = []
-        if self.doc_count() > 0:
-            wants = scoped or await loop.run_in_executor(
-                None, self._should_use_docs, message, history
-            )
-            print(f"[RAG] chat: doc_count={self.doc_count()} scoped={scoped} "
-                  f"use_docs_router={wants} role={(user or {}).get('role')}")
+        if scoped:
+            # Explicit attachment(s): block until they are indexed, then ground on them.
+            await self._await_attachments_indexed(scoped_ids)
+            items = await loop.run_in_executor(None, self._relevant_nodes, message, scope, user)
+            print(f"[RAG] chat: scoped_docs={scoped_ids} items={len(items)} "
+                  f"role={(user or {}).get('role')}")
+        elif self.doc_count() > 0:
+            wants = await loop.run_in_executor(None, self._should_use_docs, message, history)
+            print(f"[RAG] chat: doc_count={self.doc_count()} use_docs_router={wants} "
+                  f"role={(user or {}).get('role')}")
             if wants:
                 items = await loop.run_in_executor(None, self._relevant_nodes, message, scope, user)
         else:
@@ -477,6 +516,19 @@ class RAGEngine:
             system_text = (
                 SYSTEM_PROMPT + directive + "\n\n"
                 + CONTEXT_TEMPLATE.format(context_str=self._context_block(items))
+            )
+        elif scoped:
+            # Attached document(s) but nothing retrievable (indexing failed, or the
+            # documents don't answer the question). Stay grounded: instruct the
+            # model to say so rather than inventing a generic answer.
+            no_ctx = (
+                "(Aucun extrait des documents joints n'a pu être récupéré : soit leur "
+                "indexation vient d'échouer, soit ils ne contiennent pas d'information "
+                "pertinente pour cette question.)"
+            )
+            system_text = (
+                SYSTEM_PROMPT + directive + "\n\n"
+                + CONTEXT_TEMPLATE.format(context_str=no_ctx)
             )
         else:
             system_text = CONV_SYSTEM_PROMPT + directive

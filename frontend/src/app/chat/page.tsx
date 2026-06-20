@@ -136,7 +136,7 @@ export default function ChatPage() {
       setPendingAttachments([]); // consumed by this turn
 
       if (notReady) {
-        setToast({ msg: 'Indexation en cours — la réponse pourrait ne pas couvrir tout le document joint.', sev: 'info' });
+        setToast({ msg: 'Indexation du document en cours — la réponse démarrera dès qu\'il sera prêt.', sev: 'info' });
       }
 
       startStream({
