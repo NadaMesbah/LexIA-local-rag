@@ -52,14 +52,15 @@ function CodeBlock({ children }: { children: ReactNode }) {
           {copied ? <CheckRoundedIcon fontSize="small" /> : <ContentCopyRoundedIcon fontSize="small" />}
         </IconButton>
       </Tooltip>
-      <pre>{children}</pre>
+      {/* Code is always LTR regardless of surrounding text direction. */}
+      <pre dir="ltr">{children}</pre>
     </Box>
   );
 }
 
 export default function Markdown({ children }: { children: string }) {
   return (
-    <Box className="md" sx={{ fontSize: 14, color: 'text.primary', wordBreak: 'break-word' }}>
+    <Box className="md" dir="auto" sx={{ fontSize: 14, color: 'text.primary', wordBreak: 'break-word' }}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[rehypeKatex, rehypeHighlight]}

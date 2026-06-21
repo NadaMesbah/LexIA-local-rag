@@ -77,6 +77,7 @@ def init_db() -> None:
                 role            TEXT NOT NULL,          -- 'user' | 'assistant'
                 content         TEXT NOT NULL,
                 sources         TEXT,                   -- JSON (assistant only)
+                attachments     TEXT,                   -- JSON list of {id, filename} (user only)
                 created_at      REAL NOT NULL,
                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
             );
@@ -93,6 +94,11 @@ def init_db() -> None:
             conn.execute("ALTER TABLE messages ADD COLUMN parent_id TEXT")
         if "active_child_id" not in mcols:
             conn.execute("ALTER TABLE messages ADD COLUMN active_child_id TEXT")
+        # Files attached to a user message in the composer (JSON list of
+        # {id, filename}); used to display the attachment in the conversation and
+        # to ground that turn's answer on those documents.
+        if "attachments" not in mcols:
+            conn.execute("ALTER TABLE messages ADD COLUMN attachments TEXT")
 
         # Legacy flat conversations: link each session's messages into a single
         # chain (preserve order) so they display correctly under the tree model.
@@ -376,6 +382,7 @@ def add_message(
     content: str,
     parent_id: Optional[str] = None,
     sources: Optional[str] = None,
+    attachments: Optional[str] = None,
 ) -> dict:
     """Insert a message as a child of `parent_id` and make it the active branch."""
     mid = _new_id()
@@ -383,8 +390,8 @@ def add_message(
     with _connect() as conn:
         conn.execute(
             "INSERT INTO messages (id, session_id, parent_id, active_child_id, role, "
-            "content, sources, created_at) VALUES (?,?,?,?,?,?,?,?)",
-            (mid, session_id, parent_id, None, role, content, sources, ts),
+            "content, sources, attachments, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (mid, session_id, parent_id, None, role, content, sources, attachments, ts),
         )
         # Make this new message the selected branch.
         if parent_id:
@@ -470,6 +477,7 @@ def get_active_path(session_id: str) -> list[dict]:
             "role": cur["role"],
             "content": cur["content"],
             "sources": cur["sources"],
+            "attachments": cur["attachments"] if "attachments" in cur.keys() else None,
             "version_index": sib_ids.index(cur["id"]) + 1,
             "version_count": len(sib_ids),
             "sibling_ids": sib_ids,
@@ -598,6 +606,27 @@ def get_document(document_id: str) -> Optional[dict]:
     with _connect() as conn:
         row = conn.execute("SELECT * FROM documents WHERE id=?", (document_id,)).fetchone()
     return dict(row) if row else None
+
+
+def find_document_id(name: str, scope: str, owner_id: Optional[str]) -> Optional[str]:
+    """Resolve a document id from (name, scope, owner) — used to repair Chroma
+    chunks whose document key was lost. Prefers an active, most-recent match."""
+    if not name:
+        return None
+    with _connect() as conn:
+        if scope == "personal":
+            row = conn.execute(
+                "SELECT id FROM documents WHERE name=? AND scope='personal' AND owner_id=? "
+                "ORDER BY (status!='deleted') DESC, updated_at DESC LIMIT 1",
+                (name, owner_id),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT id FROM documents WHERE name=? AND scope='org' "
+                "ORDER BY (status!='deleted') DESC, updated_at DESC LIMIT 1",
+                (name,),
+            ).fetchone()
+    return row["id"] if row else None
 
 
 def get_version(version_id: str) -> Optional[dict]:

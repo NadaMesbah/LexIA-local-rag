@@ -18,43 +18,35 @@ import AutoAwesomeRoundedIcon from '@mui/icons-material/AutoAwesomeRounded';
 import ConversationsRail from '@/components/chat/ConversationsRail';
 import MessageItem from '@/components/chat/MessageItem';
 import Composer from '@/components/chat/Composer';
-import type { Message, SessionSummary, Status, StreamEvent, Source } from '@/lib/types';
+import type { Message, SessionSummary, Status, IndexingStatus, PendingAttachment } from '@/lib/types';
 import * as api from '@/lib/api';
-
-interface StreamState {
-  active: boolean;
-  answer: string;
-  sources: Source[];
-  thinking: boolean;
-  error: string | null;
-}
-
-const EMPTY_STREAM: StreamState = { active: false, answer: '', sources: [], thinking: false, error: null };
+import { useChatStream } from '@/lib/chatStream';
+import { useAttachments } from '@/lib/attachments';
 
 export default function ChatPage() {
   const [status, setStatus] = useState<Status | null>(null);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [currentId, setCurrentId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
-  // One in-flight generation per conversation → parallel chats across sessions.
-  const [streams, setStreams] = useState<Record<string, StreamState>>({});
   const [confirmId, setConfirmId] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
-  const [toast, setToast] = useState<{ msg: string; sev: 'success' | 'error' } | null>(null);
+  const [toast, setToast] = useState<{ msg: string; sev: 'success' | 'error' | 'info' } | null>(null);
 
-  const controllersRef = useRef<Record<string, AbortController>>({});
+  // Streaming lives ABOVE this page (in a layout-level provider), so a running
+  // generation survives navigating to /documents and back — no false "réponse
+  // interrompue", while parallel generations per conversation still work.
+  const { streams, busyIds, isActive, startStream, abort, completion } = useChatStream();
+  // Attachment indexing state ALSO lives above the page (same pattern): draft
+  // attachments and their real (backend-polled) status survive navigation.
+  const { pending: pendingAttachments, addAttachments, removeAttachment, clearPending, watch, statusOf } =
+    useAttachments();
+
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const currentIdRef = useRef<string | null>(null);
   const sessionsRef = useRef<SessionSummary[]>([]);
+  const lastCompletionSeq = useRef(0);
   useEffect(() => { currentIdRef.current = currentId; }, [currentId]);
   useEffect(() => { sessionsRef.current = sessions; }, [sessions]);
-
-  const setStreamFor = useCallback((sid: string, patch: Partial<StreamState>) => {
-    setStreams((prev) => ({ ...prev, [sid]: { ...(prev[sid] || EMPTY_STREAM), ...patch } }));
-  }, []);
-  const clearStreamFor = useCallback((sid: string) => {
-    setStreams((prev) => { const n = { ...prev }; delete n[sid]; return n; });
-  }, []);
 
   const refreshSessions = useCallback(async () => {
     try {
@@ -71,68 +63,66 @@ export default function ChatPage() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages, streams, currentId]);
 
-  const openSession = useCallback(async (id: string) => {
-    setCurrentId(id);
-    try {
-      const detail = await api.getSession(id);
-      setMessages(detail.messages || []);
-    } catch {
-      setMessages([]);
-    }
-  }, []);
-
-  const newConversation = useCallback(() => { setCurrentId(null); setMessages([]); }, []);
+  // After (re)loading a conversation, keep following any attachment that is still
+  // indexing so its chip updates to "done" live, and survives navigation.
+  const watchMsgAttachments = useCallback((msgs: Message[]) => {
+    const ids = msgs.flatMap((m) =>
+      (m.attachments || [])
+        .filter((a) => a.indexing_status === 'pending' || a.indexing_status === 'processing')
+        .map((a) => a.id)
+    );
+    if (ids.length) watch(ids);
+  }, [watch]);
 
   const reloadCurrent = useCallback(async (id: string) => {
     try {
       const detail = await api.getSession(id);
       setMessages(detail.messages || []);
+      watchMsgAttachments(detail.messages || []);
     } catch {/* ignore */}
-  }, []);
+  }, [watchMsgAttachments]);
 
-  // Shared streaming runner, keyed by session so multiple can run at once.
-  const runStream = useCallback(
-    async (url: string, body: Record<string, unknown> | undefined, sid: string, opts: { firstTurn?: boolean } = {}) => {
-      const controller = new AbortController();
-      controllersRef.current[sid] = controller;
-      setStreamFor(sid, { active: true, thinking: true, answer: '', sources: [], error: null });
-      let acc = '';
-      let errored = false;
-      let errMsg = '';
-      let doneTitle = '';
-      try {
-        await api.streamNdjson(
-          url, body,
-          (e: StreamEvent) => {
-            if (e.type === 'token') { acc += e.data; setStreamFor(sid, { thinking: false, answer: acc }); }
-            else if (e.type === 'sources') { setStreamFor(sid, { sources: e.data }); }
-            else if (e.type === 'error') { errored = true; errMsg = e.data; setStreamFor(sid, { error: e.data }); }
-            else if (e.type === 'done') { doneTitle = e.title; }
-          },
-          controller.signal
-        );
-      } catch (err: any) {
-        if (err?.name !== 'AbortError') { errored = true; errMsg = err?.message || 'Erreur'; setStreamFor(sid, { error: errMsg }); }
-      } finally {
-        delete controllersRef.current[sid];
-        const ok = !errored && acc.trim().length > 0;
-        if (opts.firstTurn && ok) await api.autotitleSession(sid).catch(() => {});
-        await refreshSessions();
-        const viewing = currentIdRef.current === sid;
-        if (viewing && ok) {
-          await reloadCurrent(sid);
-        } else if (viewing && !ok) {
-          const text = errored ? `⚠️ ${errMsg || 'Erreur'}` : (acc.trim() || '⚠️ Aucune réponse générée.');
-          setMessages((m) => [...m, { id: `tmp-a-${Date.now()}`, parent_id: null, role: 'assistant', content: text, version_index: 1, version_count: 1, sibling_ids: [] }]);
-        } else if (!viewing && ok) {
-          const title = doneTitle || sessionsRef.current.find((s) => s.id === sid)?.title || 'une conversation';
-          setToast({ msg: `Réponse prête : « ${title} »`, sev: 'success' });
-        }
-        clearStreamFor(sid);
+  const openSession = useCallback(async (id: string) => {
+    setCurrentId(id);
+    try {
+      const detail = await api.getSession(id);
+      setMessages(detail.messages || []);
+      watchMsgAttachments(detail.messages || []);
+    } catch {
+      setMessages([]);
+    }
+  }, [watchMsgAttachments]);
+
+  const newConversation = useCallback(() => { setCurrentId(null); setMessages([]); }, []);
+
+  // React to a generation finishing (it may have completed while this page was
+  // unmounted, e.g. the user was on /documents). Sync the view to the server.
+  useEffect(() => {
+    if (!completion || completion.seq === lastCompletionSeq.current) return;
+    lastCompletionSeq.current = completion.seq;
+    const { sid, ok, errored, errMsg, title } = completion;
+
+    if (title) {
+      setSessions((prev) => prev.map((s) => (s.id === sid ? { ...s, title } : s)));
+    }
+    void refreshSessions();
+
+    const viewing = currentIdRef.current === sid;
+    if (viewing) {
+      // Always re-sync from the server, even on stop/error. The optimistic user
+      // message uses a temporary id; without reloading it would keep that id and
+      // a subsequent edit/regenerate would fail ("Editable user message not
+      // found"). The backend persists the user message (and any partial answer)
+      // regardless of how the stream ended.
+      void reloadCurrent(sid);
+      if (!ok && errored) {
+        setToast({ msg: `⚠️ ${errMsg || 'Erreur'}`, sev: 'error' });
       }
-    },
-    [setStreamFor, clearStreamFor, refreshSessions, reloadCurrent]
-  );
+    } else if (ok) {
+      const t = title || sessionsRef.current.find((s) => s.id === sid)?.title || 'une conversation';
+      setToast({ msg: `Réponse prête : « ${t} »`, sev: 'success' });
+    }
+  }, [completion, refreshSessions, reloadCurrent]);
 
   const handleSend = useCallback(
     async (text: string) => {
@@ -146,16 +136,39 @@ export default function ChatPage() {
           await refreshSessions();
         } catch { return; }
       }
-      if (streams[sid]?.active) return; // this conversation is already generating
-      setMessages((m) => [...m, { id: `tmp-${Date.now()}`, parent_id: null, role: 'user', content: text, version_index: 1, version_count: 1, sibling_ids: [] }]);
-      void runStream(api.chatUrl(sid), { message: text }, sid, { firstTurn });
+      if (isActive(sid)) return; // this conversation is already generating
+
+      const atts = pendingAttachments.map((a) => ({ id: a.id, filename: a.filename }));
+      const scope = atts.length ? { type: 'document', ids: atts.map((a) => a.id) } : undefined;
+      const notReady = pendingAttachments.some((a) => a.status !== 'indexed' && a.status !== 'failed');
+
+      setMessages((m) => [
+        ...m,
+        {
+          id: `tmp-${Date.now()}`, parent_id: null, role: 'user', content: text,
+          attachments: atts.length ? atts : undefined,
+          version_index: 1, version_count: 1, sibling_ids: [],
+        },
+      ]);
+      clearPending(); // consumed by this turn (status keeps updating via the provider)
+
+      if (notReady) {
+        setToast({ msg: 'Indexation du document en cours — la réponse démarrera dès qu\'il sera prêt.', sev: 'info' });
+      }
+
+      startStream({
+        url: api.chatUrl(sid),
+        body: { message: text, scope, attachments: atts.length ? atts : undefined },
+        sid,
+        firstTurn,
+      });
     },
-    [currentId, messages.length, streams, runStream, refreshSessions]
+    [currentId, messages.length, pendingAttachments, isActive, startStream, refreshSessions, clearPending]
   );
 
   const handleEdit = useCallback(
     async (id: string, text: string) => {
-      if (!currentId || !text || streams[currentId]?.active) return;
+      if (!currentId || !text || isActive(currentId)) return;
       setMessages((prev) => {
         const i = prev.findIndex((m) => m.id === id);
         if (i < 0) return prev;
@@ -163,74 +176,80 @@ export default function ChatPage() {
         copy[i] = { ...copy[i], content: text };
         return copy;
       });
-      void runStream(api.editUrl(currentId, id), { message: text }, currentId, {});
+      startStream({ url: api.editUrl(currentId, id), body: { message: text }, sid: currentId });
     },
-    [currentId, streams, runStream]
+    [currentId, isActive, startStream]
   );
 
   const handleRegenerate = useCallback(
     async (userMessageId: string) => {
-      if (!currentId || streams[currentId]?.active) return;
+      if (!currentId || isActive(currentId)) return;
       setMessages((prev) => {
         const i = prev.findIndex((m) => m.id === userMessageId);
         return i < 0 ? prev : prev.slice(0, i + 1);
       });
-      void runStream(api.regenerateUrl(currentId, userMessageId), {}, currentId, {});
+      startStream({ url: api.regenerateUrl(currentId, userMessageId), body: {}, sid: currentId });
     },
-    [currentId, streams, runStream]
+    [currentId, isActive, startStream]
   );
 
   const handleSwitchVersion = useCallback(
     async (messageId: string) => {
-      if (!currentId || streams[currentId]?.active) return;
+      if (!currentId || isActive(currentId)) return;
       try {
         await api.selectVersion(currentId, messageId);
         await reloadCurrent(currentId);
       } catch {/* ignore */}
     },
-    [currentId, streams, reloadCurrent]
+    [currentId, isActive, reloadCurrent]
   );
 
-  const handleStop = useCallback(() => {
-    if (currentId) controllersRef.current[currentId]?.abort();
-  }, [currentId]);
+  const handleStop = useCallback(() => { abort(currentId); }, [abort, currentId]);
 
   const handleDelete = useCallback(
     async (id: string) => {
       try {
-        controllersRef.current[id]?.abort();
+        abort(id);
         await api.deleteSession(id);
         if (currentId === id) newConversation();
         await refreshSessions();
       } catch {/* ignore */}
       setConfirmId(null);
     },
-    [currentId, newConversation, refreshSessions]
+    [abort, currentId, newConversation, refreshSessions]
   );
 
   const handleAttach = useCallback(async (files: FileList) => {
     setUploading(true);
-    let n = 0;
+    const added: PendingAttachment[] = [];
     for (const f of Array.from(files)) {
-      try { await api.uploadDocument(f, 'personal'); n += 1; }
-      catch (e: any) { setToast({ msg: `Échec : ${e?.message || f.name}`, sev: 'error' }); }
+      try {
+        const r = await api.uploadDocument(f, 'personal');
+        added.push({ id: r.document_id, filename: r.filename, status: (r.indexing_status as IndexingStatus) || 'pending' });
+      } catch (e: any) {
+        setToast({ msg: `Échec : ${e?.message || f.name}`, sev: 'error' });
+      }
     }
     setUploading(false);
-    if (n) setToast({ msg: `${n} document(s) envoyé(s) — indexation en cours.`, sev: 'success' });
+    if (added.length) {
+      // The provider tracks these and polls the backend for their real status
+      // (survives navigation); no page-local timer that dies on unmount.
+      addAttachments(added);
+      setToast({ msg: `${added.length} document(s) joint(s) — ils seront prioritaires pour votre prochaine question.`, sev: 'success' });
+    }
     refreshStatus();
-  }, [refreshStatus]);
+  }, [addAttachments, refreshStatus]);
 
   const cur = currentId ? streams[currentId] : undefined;
   const liveLastUser = messages.length > 0 && messages[messages.length - 1].role === 'user';
   const showGroundingFlag = (status?.total_documents || 0) > 0;
-  const busySessions = Object.entries(streams).filter(([, s]) => s.active).map(([id]) => id);
 
   return (
     <Box sx={{ display: 'flex', height: '100%' }}>
       <ConversationsRail
         sessions={sessions}
         currentId={currentId}
-        busyIds={busySessions}
+        busyIds={busyIds}
         onNew={newConversation}
         onSelect={openSession}
         onDelete={(id) => setConfirmId(id)}
@@ -238,7 +257,7 @@ export default function ChatPage() {
 
       <Box sx={{ flexGrow: 1, minWidth: 0, display: 'flex', flexDirection: 'column', height: '100%' }}>
         <Box sx={{ px: 3, py: 1.75, borderBottom: '1px dashed rgba(145,158,171,0.2)', bgcolor: 'background.paper' }}>
-          <Typography variant="subtitle1" sx={{ fontWeight: 700 }} noWrap>
+          <Typography dir="auto" variant="subtitle1" sx={{ fontWeight: 700 }} noWrap>
             {sessions.find((s) => s.id === currentId)?.title || 'Nouvelle conversation'}
           </Typography>
         </Box>
@@ -265,6 +284,8 @@ export default function ChatPage() {
                 key={m.id}
                 m={m}
                 showGroundingFlag={showGroundingFlag}
+                streaming={!!cur?.active}
+                statusOf={statusOf}
                 onSwitchVersion={handleSwitchVersion}
                 onEdit={handleEdit}
                 onRegenerate={handleRegenerate}
@@ -273,14 +294,14 @@ export default function ChatPage() {
 
             {cur?.active && (
               <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 0.5 }}>
-                <Typography variant="caption" sx={{ color: 'warning.dark', fontWeight: 700 }}>ASSISTANT</Typography>
+                <Typography variant="caption" sx={{ color: 'warning.dark', fontWeight: 700 }}>OUANA</Typography>
                 <Paper sx={{ px: 2, py: 1.5, width: '100%', border: '1px solid rgba(145,158,171,0.2)', boxShadow: 'none', borderRadius: 2 }}>
                   {cur.thinking && !cur.answer ? (
                     <Typography variant="body2" sx={{ color: 'text.secondary', fontStyle: 'italic' }}>Recherche dans la base…</Typography>
                   ) : cur.error ? (
                     <Typography variant="body2" color="error">⚠️ {cur.error}</Typography>
                   ) : (
-                    <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap', lineHeight: 1.7 }}>
+                    <Typography dir="auto" variant="body2" sx={{ whiteSpace: 'pre-wrap', lineHeight: 1.7 }}>
                       {cur.answer}
                       <Box component="span" sx={{ animation: 'blink 1s steps(2) infinite', '@keyframes blink': { '50%': { opacity: 0 } } }}>▋</Box>
                     </Typography>
@@ -301,7 +322,15 @@ export default function ChatPage() {
           </Box>
         </Box>
 
-        <Composer streaming={!!cur?.active} uploading={uploading} onSend={handleSend} onStop={handleStop} onAttach={handleAttach} />
+        <Composer
+          streaming={!!cur?.active}
+          uploading={uploading}
+          attachments={pendingAttachments}
+          onSend={handleSend}
+          onStop={handleStop}
+          onAttach={handleAttach}
+          onRemoveAttachment={removeAttachment}
+        />
       </Box>
 
       <Dialog open={!!confirmId} onClose={() => setConfirmId(null)} PaperProps={{ sx: { borderRadius: 2 } }}>

@@ -6,7 +6,10 @@ bge-reranker.
 
 Versioning / freshness
 ----------------------
-Every chunk in Chroma carries metadata: document_id, version, is_latest.
+Every chunk in Chroma carries metadata: rag_doc_id, version, is_latest (plus
+owner_id/scope for access control). NOTE: we deliberately do NOT use the key
+"document_id" — LlamaIndex reserves it and overwrites it with its own ref_doc_id
+on insert, which silently breaks any where-filter on it.
 Retrieval always filters on is_latest == true, so the chat answers only from the
 newest indexed version of each document. Uploading a new version inserts fresh
 is_latest chunks and flips the previous version's chunks to is_latest=false
@@ -21,6 +24,7 @@ import threading
 from typing import Optional
 
 import chromadb
+from chromadb.config import Settings as ChromaSettings
 
 from llama_index.core import (
     VectorStoreIndex,
@@ -52,10 +56,18 @@ _chat_types.is_function = _safe_is_function
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
 LLM_MODEL       = os.getenv("LLM_MODEL", "qwen2.5:7b")
+# Optional lighter model used ONLY for short auto-titles. Defaults to the main
+# model; set TITLE_MODEL (e.g. "qwen2.5:1.5b") to make titling faster/cheaper.
+TITLE_MODEL     = os.getenv("TITLE_MODEL", "").strip() or LLM_MODEL
 EMBED_MODEL     = os.getenv("EMBED_MODEL", "bge-m3")
 
 CHROMA_PATH     = os.getenv("CHROMA_PATH", "/app/data/chroma")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "rag_knowledge_base")
+
+# Fully local & private: disable ChromaDB's anonymized product telemetry so the
+# system makes ZERO outbound network calls at runtime (everything stays on the
+# host — demonstrable by pulling the network and watching it still answer).
+CHROMA_SETTINGS = ChromaSettings(anonymized_telemetry=False)
 
 CONTEXT_WINDOW  = int(os.getenv("CONTEXT_WINDOW", "8192"))
 NUM_OUTPUT      = int(os.getenv("NUM_OUTPUT", "1024"))
@@ -68,7 +80,23 @@ CHUNK_OVERLAP   = int(os.getenv("CHUNK_OVERLAP", "64"))
 RETRIEVE_TOP_K  = int(os.getenv("RETRIEVE_TOP_K", "5"))
 RERANK_TOP_N    = int(os.getenv("RERANK_TOP_N", "4"))
 RERANK_ENABLED  = os.getenv("RERANK_ENABLED", "false").lower() in ("1", "true", "yes")
-RELEVANCE_CUTOFF = float(os.getenv("RELEVANCE_CUTOFF", "0.6"))
+# Minimum cosine similarity (score = 1 - cosine_distance) for a chunk to count as
+# relevant. With bge-m3 and the reranker OFF, genuinely relevant passages often
+# score ~0.4-0.6, so a high cutoff silently discards them and the answer falls
+# back to "general" with no sources. 0.35 favours recall; raise it (e.g. 0.5)
+# only if the reranker is enabled or answers pull in off-topic chunks.
+RELEVANCE_CUTOFF = float(os.getenv("RELEVANCE_CUTOFF", "0.35"))
+
+# Source DISPLAY filtering (independent of retrieval/context). Retrieval keeps a
+# low cutoff for recall, but we only SHOW the user sources that are clearly
+# relevant: close to the best match (relative gap), above a modest floor, and
+# capped in number — so a correct answer isn't accompanied by an unrelated long
+# tail, and pure small talk (no real match) shows no source at all. Tunable via
+# env without touching answer quality. For the sharpest source precision, enable
+# the cross-encoder reranker (RERANK_ENABLED=true).
+SOURCE_MIN_SCORE = float(os.getenv("SOURCE_MIN_SCORE", "0.40"))
+SOURCE_REL_GAP   = float(os.getenv("SOURCE_REL_GAP", "0.10"))
+SOURCE_MAX       = int(os.getenv("SOURCE_MAX", "4"))
 RERANK_MODEL    = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
 RERANK_DEVICE   = os.getenv("RERANK_DEVICE", "cpu")
 
@@ -190,6 +218,7 @@ class RAGEngine:
         self._vector_store: Optional[ChromaVectorStore] = None
         self._chroma_collection = None
         self._reranker = None
+        self._title_llm = None
         self._write_lock = threading.Lock()
         self._setup()
 
@@ -214,8 +243,23 @@ class RAGEngine:
         Settings.num_output = NUM_OUTPUT
         Settings.context_window = CONTEXT_WINDOW
 
+        # Dedicated (optionally lighter) LLM for short auto-titles. Reusing a small
+        # model here keeps titling from competing with / waiting behind the main
+        # generation model. Falls back to the main model when TITLE_MODEL is unset.
+        if TITLE_MODEL == LLM_MODEL:
+            self._title_llm = Settings.llm
+        else:
+            print(f"[RAG] Title model={TITLE_MODEL}")
+            self._title_llm = Ollama(
+                model=TITLE_MODEL,
+                base_url=OLLAMA_BASE_URL,
+                request_timeout=REQUEST_TIMEOUT,
+                temperature=0.2,
+                keep_alive="30m",
+            )
+
         print(f"[RAG] Opening ChromaDB at {CHROMA_PATH} (collection='{COLLECTION_NAME}')")
-        client = chromadb.PersistentClient(path=CHROMA_PATH)
+        client = chromadb.PersistentClient(path=CHROMA_PATH, settings=CHROMA_SETTINGS)
         self._chroma_collection = client.get_or_create_collection(
             name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
         )
@@ -244,8 +288,10 @@ class RAGEngine:
             return None
 
     def _backfill_legacy(self):
-        """Give pre-auth chunks the metadata (version + owner/scope) they need to
-        stay retrievable and correctly visibility-filtered."""
+        """Repair chunk metadata at startup so existing chunks stay retrievable and
+        correctly filtered: give pre-versioning chunks version/owner/scope, and
+        backfill `rag_doc_id` for chunks indexed before that key existed (their
+        reserved "document_id" was clobbered by LlamaIndex with its ref_doc_id)."""
         try:
             got = self._chroma_collection.get(include=["metadatas"])
             ids = got.get("ids", []) or []
@@ -254,26 +300,39 @@ class RAGEngine:
             for cid, md in zip(ids, mds):
                 md = dict(md or {})
                 changed = False
-                if "is_latest" not in md or "document_id" not in md:
+                # Pre-versioning chunks: no version/is_latest at all.
+                if "is_latest" not in md or "version" not in md:
                     name = md.get("file_name") or md.get("source") or "Unknown"
                     info = db.ensure_legacy_document(name, 0)
                     md["file_name"] = name
-                    md["document_id"] = info["document_id"]
+                    md.setdefault("rag_doc_id", info["document_id"])
                     md.setdefault("version", info["version"])
                     md["is_latest"] = True
-                    md["owner_id"] = info["owner_id"] or ""
-                    md["scope"] = info["scope"]
+                    md.setdefault("owner_id", info["owner_id"] or "")
+                    md.setdefault("scope", info["scope"])
                     changed = True
                 if "scope" not in md or "owner_id" not in md:
-                    doc = db.get_document(md.get("document_id")) if md.get("document_id") else None
-                    md["scope"] = (doc or {}).get("scope") or "org"
-                    md["owner_id"] = (doc or {}).get("owner_id") or ""
+                    doc = db.get_document(md.get("rag_doc_id")) if md.get("rag_doc_id") else None
+                    md["scope"] = (doc or {}).get("scope") or md.get("scope") or "org"
+                    md["owner_id"] = (doc or {}).get("owner_id") or md.get("owner_id") or ""
                     changed = True
+                # Backfill our document key for chunks indexed before "rag_doc_id"
+                # existed. We can still resolve it from (file_name, scope, owner_id),
+                # which LlamaIndex does NOT clobber.
+                if not md.get("rag_doc_id"):
+                    did = db.find_document_id(
+                        md.get("file_name") or md.get("source") or "",
+                        md.get("scope") or "org",
+                        md.get("owner_id") or None,
+                    )
+                    if did:
+                        md["rag_doc_id"] = did
+                        changed = True
                 if changed:
                     up_ids.append(cid); up_mds.append(md)
             if up_ids:
                 self._chroma_collection.update(ids=up_ids, metadatas=up_mds)
-                print(f"[RAG] Backfilled {len(up_ids)} chunks with version/owner metadata.")
+                print(f"[RAG] Backfilled {len(up_ids)} chunks (rag_doc_id / version / owner / scope).")
         except Exception as e:
             print(f"[RAG] backfill skipped ({e})")
 
@@ -285,7 +344,13 @@ class RAGEngine:
         """
         try:
             latest = {}  # document_id -> current_version (None if deleted/inactive)
-            for d in db.list_documents(include_deleted=True):
+            # role="admin" is REQUIRED here: without it, list_documents applies the
+            # per-user visibility filter "(scope='org' OR owner_id=?)" with owner_id
+            # = None, which silently drops every PERSONAL document. Those documents
+            # would then be absent from `latest`, so the loop below would flip their
+            # chunks to is_latest=False on every startup and make a user's own
+            # documents permanently unretrievable. We need the full, unfiltered set.
+            for d in db.list_documents(include_deleted=True, role="admin"):
                 latest[d["id"]] = d["current_version"] if d["status"] == "active" else None
             got = self._chroma_collection.get(include=["metadatas"])
             ids = got.get("ids", []) or []
@@ -293,7 +358,7 @@ class RAGEngine:
             cids, cmds = [], []
             for cid, md in zip(ids, mds):
                 md = dict(md or {})
-                did = md.get("document_id")
+                did = md.get("rag_doc_id")
                 want = did in latest and latest[did] is not None and md.get("version") == latest[did]
                 if bool(md.get("is_latest")) != want:
                     md["is_latest"] = want
@@ -307,16 +372,52 @@ class RAGEngine:
     # ─── Chat ──────────────────────────────────────────────────────────────────
 
     @staticmethod
+    def _scoped_ids(scope: Optional[dict]) -> list[str]:
+        """Document ids a query is explicitly restricted to (composer attachments)."""
+        if not (scope and scope.get("type") == "document"):
+            return []
+        ids = scope.get("ids") or ([scope.get("id")] if scope.get("id") else [])
+        return [i for i in ids if i]
+
+    async def _await_attachments_indexed(self, doc_ids: list[str], timeout: float = 120.0):
+        """
+        Block until the explicitly-attached documents finish indexing (status
+        leaves pending/processing). A question asked immediately after attaching
+        a file would otherwise race ahead of indexing, retrieve nothing, and the
+        model would hallucinate. Bounded by `timeout` so a stuck job can't hang
+        the request forever.
+        """
+        if not doc_ids:
+            return
+        deadline = asyncio.get_event_loop().time() + timeout
+        while True:
+            pending = [d for d in doc_ids
+                       if (db.latest_version(d) or {}).get("indexing_status") in ("pending", "processing")]
+            if not pending:
+                return
+            if asyncio.get_event_loop().time() >= deadline:
+                print(f"[RAG] attachments still indexing after {timeout:.0f}s, proceeding: {pending}")
+                return
+            await asyncio.sleep(0.7)
+
+    @staticmethod
     def _visibility_where(user: Optional[dict], scope: Optional[dict]) -> dict:
         """
         Chroma `where` clause: only latest chunks, restricted to the documents the
         user may see (admins see all; others see org docs + their own), optionally
-        narrowed to one document. Pushed down into the vector store so a user's
-        nearest-neighbour set is never polluted by chunks they can't access.
+        narrowed to one or several documents. Pushed down into the vector store so
+        a user's nearest-neighbour set is never polluted by chunks they can't access.
+
+        `scope` narrows the search to specific documents (e.g. files attached in the
+        composer): {"type": "document", "id": "..."} or {"type": "document",
+        "ids": ["...", "..."]}.
         """
         conds: list[dict] = [{"is_latest": True}]
-        if scope and scope.get("type") == "document" and scope.get("id"):
-            conds.append({"document_id": scope["id"]})
+        ids = RAGEngine._scoped_ids(scope)
+        if len(ids) == 1:
+            conds.append({"rag_doc_id": ids[0]})
+        elif len(ids) > 1:
+            conds.append({"rag_doc_id": {"$in": ids}})
         if user and user.get("role") != "admin":
             conds.append({"$or": [{"scope": "org"}, {"owner_id": user["id"]}]})
         return {"$and": conds} if len(conds) > 1 else conds[0]
@@ -336,8 +437,14 @@ class RAGEngine:
             return items
 
     def _relevant_nodes(self, message: str, scope: Optional[dict], user: Optional[dict]) -> list[dict]:
-        """Vector search with the visibility filter pushed into Chroma, then cutoff + rerank."""
+        """Vector search with the visibility filter pushed into Chroma, then cutoff + rerank.
+
+        When the query is explicitly scoped to attached documents, the relevance
+        cutoff is bypassed: the user has already chosen those documents, so we
+        return their best-matching chunks unconditionally (capped at top-k) rather
+        than risk filtering them all out and forcing an un-grounded answer."""
         where = self._visibility_where(user, scope)
+        scoped = bool(self._scoped_ids(scope))
         try:
             emb = Settings.embed_model.get_query_embedding(message)
             n = max(RETRIEVE_TOP_K * 3, 12) if self._reranker else RETRIEVE_TOP_K
@@ -346,7 +453,7 @@ class RAGEngine:
                 include=["documents", "metadatas", "distances"],
             )
         except Exception as e:
-            print(f"[RAG] retrieval error ({e})")
+            print(f"[RAG] retrieval error ({e}); where={where}")
             return []
         docs = (res.get("documents") or [[]])[0]
         metas = (res.get("metadatas") or [[]])[0]
@@ -355,9 +462,20 @@ class RAGEngine:
             {"text": t or "", "metadata": m or {}, "score": 1.0 - float(d)}
             for t, m, d in zip(docs, metas, dists)
         ]
-        items = [it for it in items if it["score"] >= RELEVANCE_CUTOFF]
-        items = self._rerank(items, message)
-        return items[:RETRIEVE_TOP_K]
+        raw = len(items)
+        top_raw = round(max((it["score"] for it in items), default=0.0), 4)
+        # Scoped queries skip the cutoff (the document choice is the relevance signal).
+        kept = items if scoped else [it for it in items if it["score"] >= RELEVANCE_CUTOFF]
+        after_cutoff = len(kept)
+        kept = self._rerank(kept, message)
+        result = kept[:RETRIEVE_TOP_K]
+        # Diagnostics: pinpoint where retrieval drops to zero (filter vs. cutoff).
+        # `raw == 0` => the visibility `where` matched no chunk (check is_latest/
+        # scope/owner_id metadata); `raw > 0 but after_cutoff == 0` => the best
+        # match scored below RELEVANCE_CUTOFF (compare with top_raw and lower it).
+        print(f"[RAG] retrieve: where={where} scoped={scoped} raw={raw} top_score={top_raw} "
+              f"after_cutoff={after_cutoff} returned={len(result)} cutoff={RELEVANCE_CUTOFF}")
+        return result
 
     @staticmethod
     def _context_block(items: list[dict]) -> str:
@@ -379,7 +497,7 @@ class RAGEngine:
             prompt = _language_directive(message) + "\n\n" + TITLE_PROMPT.format(
                 message=(message or "")[:500]
             )
-            resp = Settings.llm.complete(prompt.strip())
+            resp = (self._title_llm or Settings.llm).complete(prompt.strip())
             title = (resp.text or "").strip().strip('"').strip()
             return (title.splitlines()[0][:60] if title else "") or fallback
         except Exception as e:
@@ -387,17 +505,10 @@ class RAGEngine:
             return fallback
 
     def _should_use_docs(self, message: str, history: list[dict]) -> bool:
-        try:
-            convo = ""
-            for m in history[-4:]:
-                who = "User" if m["role"] == "user" else "Assistant"
-                convo += f"{who}: {m['content'][:300]}\n"
-            resp = Settings.llm.complete(ROUTER_PROMPT.format(conversation=convo, message=message))
-            ans = (resp.text or "").strip().lower()
-            return ans.startswith("y") or "yes" in ans[:8]
-        except Exception as e:
-            print(f"[RAG] router error ({e}); defaulting to document search")
-            return True
+        # Deprecated: retrieval is now always attempted when the KB is non-empty
+        # (the relevance cutoff decides grounding). Kept as a no-op for safety; the
+        # old LLM yes/no gate misfired for non-English answers. Always returns True.
+        return True
 
     async def stream_chat(self, message: str, history: list[dict],
                           scope: Optional[dict] = None, user: Optional[dict] = None):
@@ -405,26 +516,58 @@ class RAGEngine:
         Yields ("token", str)… then ("sources", list).
 
         Retrieves over latest-version chunks the user is allowed to see (visibility
-        pushed into Chroma), optionally scoped to one document, and streams the
-        answer directly from the LLM with the retrieved context injected.
+        pushed into Chroma), optionally scoped to one or more attached documents,
+        and streams the answer with the retrieved context injected.
+
+        When the query is explicitly scoped to attached documents we (a) wait for
+        their indexing to finish so a question asked right after attaching isn't
+        answered from an empty index, and (b) ALWAYS use the grounded prompt — so
+        if no extract is found the model says it couldn't find it instead of
+        hallucinating an unrelated answer.
         """
         loop = asyncio.get_event_loop()
         directive = _language_directive(message)
-        scoped = bool(scope and scope.get("type") == "document")
+        scoped_ids = self._scoped_ids(scope)
+        scoped = bool(scoped_ids)
 
         items = []
-        if self.doc_count() > 0:
-            wants = scoped or await loop.run_in_executor(
-                None, self._should_use_docs, message, history
-            )
-            if wants:
-                items = await loop.run_in_executor(None, self._relevant_nodes, message, scope, user)
+        if scoped:
+            # Explicit attachment(s): block until they are indexed, then ground on them.
+            await self._await_attachments_indexed(scoped_ids)
+            items = await loop.run_in_executor(None, self._relevant_nodes, message, scope, user)
+            print(f"[RAG] chat: scoped_docs={scoped_ids} items={len(items)} "
+                  f"role={(user or {}).get('role')}")
+        elif self.doc_count() > 0:
+            # Always retrieve when the KB is non-empty. A previous LLM yes/no
+            # "router" gated this per message, but it misfired badly for non-English
+            # replies — the model answering "Oui"/"نعم" was parsed as "no search" —
+            # so French/Arabic questions were answered WITHOUT the documents. The
+            # relevance cutoff already decides whether the hits are good enough to
+            # ground on, so the gate was both redundant and harmful.
+            items = await loop.run_in_executor(None, self._relevant_nodes, message, scope, user)
+            print(f"[RAG] chat: doc_count={self.doc_count()} items={len(items)} "
+                  f"role={(user or {}).get('role')}")
+        else:
+            print("[RAG] chat: knowledge base is empty (doc_count=0) — answering conversationally")
 
         use_docs = len(items) > 0
         if use_docs:
             system_text = (
                 SYSTEM_PROMPT + directive + "\n\n"
                 + CONTEXT_TEMPLATE.format(context_str=self._context_block(items))
+            )
+        elif scoped:
+            # Attached document(s) but nothing retrievable (indexing failed, or the
+            # documents don't answer the question). Stay grounded: instruct the
+            # model to say so rather than inventing a generic answer.
+            no_ctx = (
+                "(Aucun extrait des documents joints n'a pu être récupéré : soit leur "
+                "indexation vient d'échouer, soit ils ne contiennent pas d'information "
+                "pertinente pour cette question.)"
+            )
+            system_text = (
+                SYSTEM_PROMPT + directive + "\n\n"
+                + CONTEXT_TEMPLATE.format(context_str=no_ctx)
             )
         else:
             system_text = CONV_SYSTEM_PROMPT + directive
@@ -447,27 +590,49 @@ class RAGEngine:
             if delta:
                 yield ("token", delta)
 
-        yield ("sources", self._format_sources(items) if use_docs else [])
+        yield ("sources", self._format_sources(items, scoped=scoped) if use_docs else [])
 
     @staticmethod
-    def _format_sources(items: list[dict]) -> list[dict]:
-        sources = []
-        seen = set()  # one source per document (best-scoring chunk)
-        for it in items or []:
-            md = it["metadata"]
-            key = md.get("document_id") or md.get("file_name")
-            if key in seen:
+    def _format_sources(items: list[dict], scoped: bool = False) -> list[dict]:
+        """Build the user-facing sources list. For normal questions, show only the
+        clearly-relevant matches (near the best score, above a floor) so an unrelated
+        long tail isn't displayed and small talk shows nothing. For scoped
+        (attached-document) queries, always surface the chosen document(s).
+        One entry per file (collapses multi-chunk hits and org/personal same-name)."""
+        if not items:
+            return []
+        ranked = sorted(items, key=lambda it: float(it.get("score") or 0), reverse=True)
+        top = float(ranked[0].get("score") or 0)
+        sources: list[dict] = []
+        seen = set()  # one source per file
+        for it in ranked:
+            score = float(it.get("score") or 0)
+            if not scoped:
+                # Sorted desc: once we hit a weak/out-of-gap chunk, all the rest are
+                # worse, so stop. This drops the irrelevant tail and (when even the
+                # best match is weak, e.g. greetings) shows no source.
+                if score < SOURCE_MIN_SCORE:
+                    break
+                if sources and score < top - SOURCE_REL_GAP:
+                    break
+            md = it.get("metadata") or {}
+            key = md.get("file_name") or md.get("rag_doc_id")
+            if not key or key in seen:
                 continue
             seen.add(key)
             text = it.get("text") or ""
             sources.append({
                 "text": text[:320] + ("…" if len(text) > 320 else ""),
-                "score": round(float(it.get("score") or 0), 4),
+                "score": round(score, 4),
                 "filename": md.get("file_name", "Unknown"),
                 "page": md.get("page_label", "?"),
-                "document_id": md.get("document_id"),
+                "document_id": md.get("rag_doc_id"),
                 "version": md.get("version"),
             })
+            if len(sources) >= SOURCE_MAX:
+                break
+        print(f"[RAG] sources: scoped={scoped} top={round(top, 4)} "
+              f"shown={len(sources)}/{len(items)} -> {[(s['filename'], s['score']) for s in sources]}")
         return sources
 
     # ─── Ingestion & version management ────────────────────────────────────────
@@ -482,7 +647,11 @@ class RAGEngine:
                 node.metadata.update({
                     "file_name": filename,
                     "source": filename,
-                    "document_id": document_id,
+                    # LlamaIndex reserves and OVERWRITES "document_id" with its own
+                    # ref_doc_id on insert, so a where={"document_id": ...} filter
+                    # never matches our id. Store our identity under "rag_doc_id"
+                    # and filter on that everywhere.
+                    "rag_doc_id": document_id,
                     "version": version,
                     "is_latest": True,
                     "owner_id": owner_id or "",   # Chroma metadata can't be None
@@ -495,7 +664,7 @@ class RAGEngine:
     def _set_latest_for_document(self, document_id: str, latest_version):
         """Set is_latest=true only for chunks of `latest_version` (None => none)."""
         try:
-            got = self._chroma_collection.get(where={"document_id": document_id}, include=["metadatas"])
+            got = self._chroma_collection.get(where={"rag_doc_id": document_id}, include=["metadatas"])
             ids = got.get("ids", []) or []
             mds = got.get("metadatas", []) or []
             cids, cmds = [], []
@@ -526,7 +695,7 @@ class RAGEngine:
         """Hard-delete: permanently remove all of a document's vectors."""
         with self._write_lock:
             try:
-                self._chroma_collection.delete(where={"document_id": document_id})
+                self._chroma_collection.delete(where={"rag_doc_id": document_id})
             except Exception as e:
                 print(f"[RAG] purge error ({e})")
 
@@ -552,7 +721,7 @@ class RAGEngine:
         }
 
     def reset(self):
-        client = chromadb.PersistentClient(path=CHROMA_PATH)
+        client = chromadb.PersistentClient(path=CHROMA_PATH, settings=CHROMA_SETTINGS)
         try:
             client.delete_collection(COLLECTION_NAME)
         except Exception:
