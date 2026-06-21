@@ -267,8 +267,6 @@ export default function UsersPage() {
           </Button>
         </Box>
         <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
-          Gérez les comptes : créez, modifiez le rôle ou réinitialisez le mot de passe, et supprimez
-          des utilisateurs.
         </Typography>
 
         <Card sx={{ p: 0 }}>
@@ -282,7 +280,7 @@ export default function UsersPage() {
             pageSizeOptions={[10, 25, 50]} initialState={{ pagination: { paginationModel: { pageSize: 10 } } }}
             sx={{ border: 0, '& .MuiDataGrid-columnHeaders': { bgcolor: 'grey.100' },
               '& .MuiDataGrid-cell:focus, & .MuiDataGrid-cell:focus-within': { outline: 'none' } }}
-            localeText={{ noRowsLabel: 'Aucun utilisateur.' }}
+            localeText={{ noRowsLabel: 'Aucun utilisateur.', MuiTablePagination: { labelRowsPerPage: 'Lignes par page :' } }}
           />
         </Card>
       </Box>
