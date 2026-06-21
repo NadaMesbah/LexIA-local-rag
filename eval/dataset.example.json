@@ -1,0 +1,18 @@
+[
+  {
+    "question": "ما هو الحد الأدنى للإيداع للاستفادة من النسبة الجديدة؟",
+    "ground_truth": "الحد الأدنى للإيداع للاستفادة من النسبة الجديدة هو 5000 درهم."
+  },
+  {
+    "question": "ما هي نسبة الفائدة الجديدة على حسابات الادخار؟",
+    "ground_truth": "نسبة الفائدة الجديدة على حسابات الادخار هي 3.5%."
+  },
+  {
+    "question": "Quelle est la commission appliquée par Switch Pay ?",
+    "ground_truth": "Switch Pay applique une commission de 2,9% pour les transactions en devise locale et 3,6% pour les transactions internationales."
+  },
+  {
+    "question": "Combien de PME se sont déjà inscrites au service Switch Pay ?",
+    "ground_truth": "Plus de 12 400 PME se sont déjà inscrites au service Switch Pay."
+  }
+]
