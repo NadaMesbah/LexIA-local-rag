@@ -257,7 +257,7 @@ export default function ChatPage() {
 
       <Box sx={{ flexGrow: 1, minWidth: 0, display: 'flex', flexDirection: 'column', height: '100%' }}>
         <Box sx={{ px: 3, py: 1.75, borderBottom: '1px dashed rgba(145,158,171,0.2)', bgcolor: 'background.paper' }}>
-          <Typography variant="subtitle1" sx={{ fontWeight: 700 }} noWrap>
+          <Typography dir="auto" variant="subtitle1" sx={{ fontWeight: 700 }} noWrap>
             {sessions.find((s) => s.id === currentId)?.title || 'Nouvelle conversation'}
           </Typography>
         </Box>
@@ -301,7 +301,7 @@ export default function ChatPage() {
                   ) : cur.error ? (
                     <Typography variant="body2" color="error">⚠️ {cur.error}</Typography>
                   ) : (
-                    <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap', lineHeight: 1.7 }}>
+                    <Typography dir="auto" variant="body2" sx={{ whiteSpace: 'pre-wrap', lineHeight: 1.7 }}>
                       {cur.answer}
                       <Box component="span" sx={{ animation: 'blink 1s steps(2) infinite', '@keyframes blink': { '50%': { opacity: 0 } } }}>▋</Box>
                     </Typography>

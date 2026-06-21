@@ -61,7 +61,7 @@ function SourceRow({ s }: { s: Source }) {
         </Typography>
         {s.page && s.page !== '?' && <Chip label={`p.${s.page}`} size="small" sx={{ height: 18, fontSize: 10 }} />}
       </Box>
-      <Typography variant="caption" color="text.secondary" sx={{
+      <Typography dir="auto" variant="caption" color="text.secondary" sx={{
         display: '-webkit-box', WebkitLineClamp: open ? 'unset' : 2, WebkitBoxOrient: 'vertical', overflow: 'hidden',
       }}>
         {s.text}
@@ -164,6 +164,7 @@ export default function MessageItem({
               onChange={(e) => setDraft(e.target.value)}
               autoFocus
               size="small"
+              inputProps={{ dir: 'auto' }}
             />
             <Box sx={{ display: 'flex', gap: 1, justifyContent: 'flex-end', mt: 1 }}>
               <Button size="small" color="inherit" onClick={() => { setEditing(false); setDraft(m.content); }}>
@@ -191,7 +192,7 @@ export default function MessageItem({
               borderBottomRightRadius: 4,
             }}
           >
-            <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap', lineHeight: 1.7 }}>
+            <Typography dir="auto" variant="body2" sx={{ whiteSpace: 'pre-wrap', lineHeight: 1.7 }}>
               {m.content}
             </Typography>
           </Paper>
