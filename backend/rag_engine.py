@@ -476,17 +476,10 @@ class RAGEngine:
             return fallback
 
     def _should_use_docs(self, message: str, history: list[dict]) -> bool:
-        try:
-            convo = ""
-            for m in history[-4:]:
-                who = "User" if m["role"] == "user" else "Assistant"
-                convo += f"{who}: {m['content'][:300]}\n"
-            resp = Settings.llm.complete(ROUTER_PROMPT.format(conversation=convo, message=message))
-            ans = (resp.text or "").strip().lower()
-            return ans.startswith("y") or "yes" in ans[:8]
-        except Exception as e:
-            print(f"[RAG] router error ({e}); defaulting to document search")
-            return True
+        # Deprecated: retrieval is now always attempted when the KB is non-empty
+        # (the relevance cutoff decides grounding). Kept as a no-op for safety; the
+        # old LLM yes/no gate misfired for non-English answers. Always returns True.
+        return True
 
     async def stream_chat(self, message: str, history: list[dict],
                           scope: Optional[dict] = None, user: Optional[dict] = None):
@@ -516,11 +509,15 @@ class RAGEngine:
             print(f"[RAG] chat: scoped_docs={scoped_ids} items={len(items)} "
                   f"role={(user or {}).get('role')}")
         elif self.doc_count() > 0:
-            wants = await loop.run_in_executor(None, self._should_use_docs, message, history)
-            print(f"[RAG] chat: doc_count={self.doc_count()} use_docs_router={wants} "
+            # Always retrieve when the KB is non-empty. A previous LLM yes/no
+            # "router" gated this per message, but it misfired badly for non-English
+            # replies — the model answering "Oui"/"نعم" was parsed as "no search" —
+            # so French/Arabic questions were answered WITHOUT the documents. The
+            # relevance cutoff already decides whether the hits are good enough to
+            # ground on, so the gate was both redundant and harmful.
+            items = await loop.run_in_executor(None, self._relevant_nodes, message, scope, user)
+            print(f"[RAG] chat: doc_count={self.doc_count()} items={len(items)} "
                   f"role={(user or {}).get('role')}")
-            if wants:
-                items = await loop.run_in_executor(None, self._relevant_nodes, message, scope, user)
         else:
             print("[RAG] chat: knowledge base is empty (doc_count=0) — answering conversationally")
 
