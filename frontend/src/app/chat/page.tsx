@@ -14,6 +14,7 @@ import Snackbar from '@mui/material/Snackbar';
 import Alert from '@mui/material/Alert';
 import RefreshRoundedIcon from '@mui/icons-material/RefreshRounded';
 import AutoAwesomeRoundedIcon from '@mui/icons-material/AutoAwesomeRounded';
+import AttachFileRoundedIcon from '@mui/icons-material/AttachFileRounded';
 
 import ConversationsRail from '@/components/chat/ConversationsRail';
 import MessageItem from '@/components/chat/MessageItem';
@@ -267,6 +268,12 @@ export default function ChatPage() {
         onNew={newConversation}
         onSelect={openSession}
         onDelete={(id) => setConfirmId(id)}
+        onRename={async (id, title) => {
+          try {
+            await api.renameSession(id, title);
+            setSessions((prev) => prev.map((s) => s.id === id ? { ...s, title } : s));
+          } catch { /* silent */ }
+        }}
       />
 
       <Box sx={{ flexGrow: 1, minWidth: 0, display: 'flex', flexDirection: 'column', height: '100%' }}>
@@ -287,7 +294,7 @@ export default function ChatPage() {
                   Interrogez votre base de connaissance
                 </Typography>
                 <Typography variant="body2" sx={{ mt: 1, maxWidth: 460, mx: 'auto' }}>
-                  Posez une question, ou joignez un document avec 📎 et l&apos;assistant répondra
+                  Posez une question, ou joignez un document avec <AttachFileRoundedIcon sx={{ fontSize: 16, verticalAlign: 'middle', mx: 0.3 }} /> et l&apos;assistant répondra
                   en s&apos;appuyant dessus — avec sources.
                 </Typography>
               </Box>

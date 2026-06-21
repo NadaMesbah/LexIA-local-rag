@@ -2,6 +2,8 @@ import type {
   AuthResponse,
   DocumentItem,
   DocumentVersion,
+  ManagedUser,
+  Role,
   SessionDetail,
   SessionSummary,
   Status,
@@ -117,6 +119,49 @@ export const register = async (
 
 export const me = () =>
   fetch(`${API_BASE}/auth/me`, { headers: authHeaders() }).then((r) => asJson<User>(r));
+
+// ─── Users (admin) ───────────────────────────────────────────────────────────
+export const listUsers = () =>
+  fetch(`${API_BASE}/users`, { headers: authHeaders() }).then((r) =>
+    asJson<{ users: ManagedUser[] }>(r)
+  );
+
+export interface CreateUserInput {
+  first_name: string;
+  last_name: string;
+  username: string;
+  email: string;
+  password: string;
+  role: Role;
+}
+
+export const createUser = (data: CreateUserInput) =>
+  fetch(`${API_BASE}/users`, {
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(data),
+  }).then((r) => asJson<ManagedUser>(r));
+
+export interface UpdateUserInput {
+  first_name?: string;
+  last_name?: string;
+  username?: string;
+  email?: string;
+  role?: Role;
+  password?: string;
+}
+
+export const updateUser = (id: string, data: UpdateUserInput) =>
+  fetch(`${API_BASE}/users/${id}`, {
+    method: 'PATCH',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(data),
+  }).then((r) => asJson<ManagedUser>(r));
+
+export const deleteUser = (id: string) =>
+  fetch(`${API_BASE}/users/${id}`, { method: 'DELETE', headers: authHeaders() }).then((r) =>
+    asJson(r)
+  );
 
 // ─── Status ────────────────────────────────────────────────────────────────
 export const getStatus = () =>

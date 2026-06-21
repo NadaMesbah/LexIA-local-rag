@@ -247,6 +247,8 @@ export default function DocumentsPage() {
           versionCount: d.version_count,
           status: d.latest?.indexing_status || 'pending',
           chunks: d.latest?.chunks ?? 0,
+          uploadedById: d.uploaded_by ?? null,
+          uploadedByName: d.uploaded_by_name ?? null,
           updated: d.updated_at ? new Date(d.updated_at * 1000) : null,
         })),
     [docs, trash, tab, query]
@@ -290,7 +292,24 @@ export default function DocumentsPage() {
         ),
     },
     { field: 'status', headerName: 'Statut', width: 150, renderCell: (p) => <StatusChip s={p.row.status} /> },
-    { field: 'chunks', headerName: 'Chunks', width: 100, type: 'number' },
+    ...(isAdmin
+      ? [
+          {
+            field: 'uploadedBy',
+            headerName: 'Ajouté par',
+            width: 190,
+            renderCell: (p: any) =>
+              p.row.uploadedById && p.row.uploadedById === user?.id ? (
+                <Chip label="Vous" size="small" color="primary" variant="outlined"
+                  icon={<PersonRoundedIcon />} sx={{ height: 22, fontWeight: 700 }} />
+              ) : (
+                <Typography variant="body2" noWrap title={p.row.uploadedByName || undefined}>
+                  {p.row.uploadedByName || '—'}
+                </Typography>
+              ),
+          } as GridColDef,
+        ]
+      : []),
     {
       field: 'updated', headerName: 'Mis à jour', width: 170,
       valueFormatter: (value) => (value ? new Date(value as Date).toLocaleString() : '—'),

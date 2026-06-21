@@ -207,6 +207,10 @@ def init_db() -> None:
             conn.execute("ALTER TABLE documents ADD COLUMN owner_id TEXT")
         if "scope" not in dcols:
             conn.execute("ALTER TABLE documents ADD COLUMN scope TEXT NOT NULL DEFAULT 'org'")
+        # Who uploaded the document (user id). Org docs have a NULL owner_id, so
+        # this is the only record of the uploader for the canonical KB.
+        if "uploaded_by" not in dcols:
+            conn.execute("ALTER TABLE documents ADD COLUMN uploaded_by TEXT")
         # Names on users (migrate older auth schema that only had username).
         ucols = _columns(conn, "users")
         if "first_name" not in ucols:
@@ -272,6 +276,61 @@ def set_user_email(user_id: str, email: str) -> None:
         conn.execute("UPDATE users SET email=? WHERE id=?", (email, user_id))
 
 
+def update_user(user_id: str, first_name: Optional[str] = None, last_name: Optional[str] = None,
+                username: Optional[str] = None, email: Optional[str] = None,
+                role: Optional[str] = None, password_hash: Optional[str] = None) -> Optional[dict]:
+    """Update the provided fields of a user (only non-None values are changed)."""
+    fields: list[str] = []
+    params: list = []
+    if first_name is not None:
+        fields.append("first_name=?"); params.append(first_name)
+    if last_name is not None:
+        fields.append("last_name=?"); params.append(last_name)
+    if username is not None:
+        fields.append("username=?"); params.append(username)
+    if email is not None:
+        fields.append("email=?"); params.append(email)
+    if role is not None:
+        fields.append("role=?"); params.append(role)
+    if password_hash is not None:
+        fields.append("password_hash=?"); params.append(password_hash)
+    if fields:
+        params.append(user_id)
+        with _connect() as conn:
+            conn.execute(f"UPDATE users SET {', '.join(fields)} WHERE id=?", params)
+    return get_user(user_id)
+
+
+def delete_user(user_id: str) -> bool:
+    with _connect() as conn:
+        cur = conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+        return cur.rowcount > 0
+
+
+def count_admins() -> int:
+    """Number of admin accounts — used to protect the last administrator."""
+    with _connect() as conn:
+        return int(conn.execute(
+            "SELECT COUNT(*) AS c FROM users WHERE role='admin'"
+        ).fetchone()["c"])
+
+
+def delete_user_sessions(user_id: str) -> int:
+    """Delete all chat sessions owned by a user (messages cascade)."""
+    with _connect() as conn:
+        cur = conn.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+        return cur.rowcount
+
+
+def user_personal_document_ids(owner_id: str) -> list[str]:
+    """All personal document ids owned by a user (for cleanup on account deletion)."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT id FROM documents WHERE scope='personal' AND owner_id=?", (owner_id,)
+        ).fetchall()
+    return [r["id"] for r in rows]
+
+
 def list_users() -> list[dict]:
     with _connect() as conn:
         rows = conn.execute(
@@ -311,6 +370,11 @@ def assign_legacy_owner(admin_id: str) -> None:
         conn.execute("UPDATE sessions SET user_id=? WHERE user_id IS NULL", (admin_id,))
         conn.execute(
             "UPDATE documents SET owner_id=?, scope='org' WHERE owner_id IS NULL", (admin_id,)
+        )
+        # Attribute documents with no recorded uploader to the admin (they were
+        # imported before this column existed).
+        conn.execute(
+            "UPDATE documents SET uploaded_by=? WHERE uploaded_by IS NULL", (admin_id,)
         )
 
 
@@ -506,7 +570,8 @@ def count_messages(session_id: str) -> int:
 
 # ─── Documents (versioned) ───────────────────────────────────────────────────
 
-def get_or_create_document(name: str, scope: str = "org", owner_id: Optional[str] = None) -> dict:
+def get_or_create_document(name: str, scope: str = "org", owner_id: Optional[str] = None,
+                           uploaded_by: Optional[str] = None) -> dict:
     """
     Return the active document identified by (scope, owner, name), creating it
     (version 0) if needed. Org docs are keyed by name globally; personal docs are
@@ -529,12 +594,13 @@ def get_or_create_document(name: str, scope: str = "org", owner_id: Optional[str
             return dict(row)
         did = _new_id()
         conn.execute(
-            "INSERT INTO documents (id,name,owner_id,scope,current_version,status,created_at,updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (did, name, owner_id, scope, 0, "active", ts, ts),
+            "INSERT INTO documents (id,name,owner_id,scope,uploaded_by,current_version,status,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (did, name, owner_id, scope, uploaded_by, 0, "active", ts, ts),
         )
         return {"id": did, "name": name, "owner_id": owner_id, "scope": scope,
-                "current_version": 0, "status": "active", "created_at": ts, "updated_at": ts}
+                "uploaded_by": uploaded_by, "current_version": 0, "status": "active",
+                "created_at": ts, "updated_at": ts}
 
 
 def add_version(document_id: str, filename: str, stored_path: Optional[str] = None) -> dict:
@@ -704,6 +770,16 @@ def list_documents(include_deleted: bool = False, owner_id: Optional[str] = None
             ).fetchone()["c"]
             d["latest"] = _public_version(dict(v)) if v else None
             d["version_count"] = int(c)
+            # Resolve the uploader's display name (full name, else username).
+            d["uploaded_by_name"] = None
+            uid = d.get("uploaded_by")
+            if uid:
+                u = conn.execute(
+                    "SELECT first_name, last_name, username FROM users WHERE id=?", (uid,)
+                ).fetchone()
+                if u:
+                    full = f"{u['first_name']} {u['last_name']}".strip()
+                    d["uploaded_by_name"] = full or u["username"]
     return docs
 
 

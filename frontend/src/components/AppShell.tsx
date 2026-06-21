@@ -16,6 +16,7 @@ import Tooltip from '@mui/material/Tooltip';
 import CircularProgress from '@mui/material/CircularProgress';
 import ChatBubbleOutlineRoundedIcon from '@mui/icons-material/ChatBubbleOutlineRounded';
 import FolderOutlinedIcon from '@mui/icons-material/FolderOutlined';
+import GroupOutlinedIcon from '@mui/icons-material/GroupOutlined';
 import AutoAwesomeRoundedIcon from '@mui/icons-material/AutoAwesomeRounded';
 import LogoutRoundedIcon from '@mui/icons-material/LogoutRounded';
 import { useAuth } from '@/lib/auth';
@@ -25,6 +26,11 @@ const NAV_WIDTH = 260;
 const NAV = [
   { label: 'Chat', href: '/chat', icon: <ChatBubbleOutlineRoundedIcon /> },
   { label: 'Documents', href: '/documents', icon: <FolderOutlinedIcon /> },
+];
+
+// Navigation entries restricted to administrators.
+const ADMIN_NAV = [
+  { label: 'Utilisateurs', href: '/users', icon: <GroupOutlinedIcon /> },
 ];
 
 export default function AppShell({ children }: { children: React.ReactNode }) {
@@ -94,7 +100,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         </Typography>
 
         <List sx={{ px: 1.5, pt: 1 }}>
-          {NAV.map((item) => {
+          {[...NAV, ...(user.role === 'admin' ? ADMIN_NAV : [])].map((item) => {
             const active = pathname === item.href || pathname?.startsWith(item.href + '/');
             return (
               <ListItemButton

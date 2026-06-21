@@ -117,6 +117,24 @@ class RegisterRequest(BaseModel):
     password: str
 
 
+class CreateUserRequest(BaseModel):
+    first_name: str
+    last_name: str
+    username: str
+    email: str
+    password: str
+    role: Optional[str] = "user"   # "admin" | "user"
+
+
+class UpdateUserRequest(BaseModel):
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    username: Optional[str] = None
+    email: Optional[str] = None
+    role: Optional[str] = None           # "admin" | "user"
+    password: Optional[str] = None       # when set, resets the user's password
+
+
 class CreateSessionRequest(BaseModel):
     title: Optional[str] = None
 
@@ -229,6 +247,124 @@ async def me(user: dict = Depends(auth.current_user)):
 @app.get("/users")
 async def users(user: dict = Depends(auth.admin_user)):
     return {"users": db.list_users()}
+
+
+def _public_user(u: dict) -> dict:
+    return {
+        "id": u["id"],
+        "username": u.get("username", ""),
+        "email": u.get("email", ""),
+        "first_name": u.get("first_name", ""),
+        "last_name": u.get("last_name", ""),
+        "role": u.get("role", "user"),
+        "created_at": u.get("created_at"),
+    }
+
+
+@app.post("/users", status_code=201)
+async def create_user(req: CreateUserRequest, admin: dict = Depends(auth.admin_user)):
+    """Admin-only: create a user with an explicit role."""
+    first_name = (req.first_name or "").strip()
+    last_name = (req.last_name or "").strip()
+    username = (req.username or "").strip()
+    email = (req.email or "").strip()
+    role = (req.role or "user").lower()
+    if not first_name or not last_name:
+        raise HTTPException(status_code=400, detail="First and last name are required.")
+    if len(username) < 3:
+        raise HTTPException(status_code=400, detail="Username must be at least 3 characters.")
+    if not _EMAIL_RE.match(email):
+        raise HTTPException(status_code=400, detail="A valid email address is required.")
+    if len(req.password or "") < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
+    if role not in ("admin", "user"):
+        raise HTTPException(status_code=400, detail="Role must be 'admin' or 'user'.")
+    if db.get_user_by_username(username):
+        raise HTTPException(status_code=409, detail="Username already taken.")
+    if db.get_user_by_email(email):
+        raise HTTPException(status_code=409, detail="Email already registered.")
+    created = db.create_user(username, auth.hash_password(req.password), role=role,
+                             first_name=first_name, last_name=last_name, email=email)
+    db.log_audit(admin["id"], admin["username"], "user_create", detail=f"{username} ({role})")
+    return _public_user(created)
+
+
+@app.patch("/users/{user_id}")
+async def update_user(user_id: str, req: UpdateUserRequest, admin: dict = Depends(auth.admin_user)):
+    """Admin-only: update a user's details, role and/or password."""
+    target = db.get_user(user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    first_name = req.first_name.strip() if req.first_name is not None else None
+    last_name = req.last_name.strip() if req.last_name is not None else None
+    username = req.username.strip() if req.username is not None else None
+    email = req.email.strip() if req.email is not None else None
+    role = req.role.lower() if req.role is not None else None
+    password_hash = None
+
+    if first_name is not None and not first_name:
+        raise HTTPException(status_code=400, detail="First name cannot be empty.")
+    if last_name is not None and not last_name:
+        raise HTTPException(status_code=400, detail="Last name cannot be empty.")
+    if username is not None:
+        if len(username) < 3:
+            raise HTTPException(status_code=400, detail="Username must be at least 3 characters.")
+        clash = db.get_user_by_username(username)
+        if clash and clash["id"] != user_id:
+            raise HTTPException(status_code=409, detail="Username already taken.")
+    if email is not None:
+        if not _EMAIL_RE.match(email):
+            raise HTTPException(status_code=400, detail="A valid email address is required.")
+        clash = db.get_user_by_email(email)
+        if clash and clash["id"] != user_id:
+            raise HTTPException(status_code=409, detail="Email already registered.")
+    if role is not None and role not in ("admin", "user"):
+        raise HTTPException(status_code=400, detail="Role must be 'admin' or 'user'.")
+    if req.password is not None:
+        if len(req.password) < 8:
+            raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
+        password_hash = auth.hash_password(req.password)
+
+    # Guard: never demote the last remaining administrator.
+    if role == "user" and target["role"] == "admin" and db.count_admins() <= 1:
+        raise HTTPException(status_code=400, detail="Cannot demote the last administrator.")
+
+    updated = db.update_user(user_id, first_name=first_name, last_name=last_name,
+                             username=username, email=email, role=role,
+                             password_hash=password_hash)
+    db.log_audit(admin["id"], admin["username"], "user_update", detail=target["username"])
+    return _public_user(updated)
+
+
+@app.delete("/users/{user_id}")
+async def remove_user(user_id: str, admin: dict = Depends(auth.admin_user)):
+    """Admin-only: delete a user and clean up their sessions + personal documents."""
+    target = db.get_user(user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found.")
+    if user_id == admin["id"]:
+        raise HTTPException(status_code=400, detail="You cannot delete your own account.")
+    if target["role"] == "admin" and db.count_admins() <= 1:
+        raise HTTPException(status_code=400, detail="Cannot delete the last administrator.")
+
+    # Clean up the user's personal documents (vectors + DB rows + stored files).
+    for doc_id in db.user_personal_document_ids(user_id):
+        stored = db.document_stored_paths(doc_id)
+        try:
+            rag.purge_document(doc_id)
+        except Exception:
+            pass
+        db.hard_delete_document(doc_id)
+        for p in stored:
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
+    db.delete_user_sessions(user_id)
+    db.delete_user(user_id)
+    db.log_audit(admin["id"], admin["username"], "user_delete", detail=target["username"])
+    return {"ok": True}
 
 
 @app.get("/audit")
@@ -566,7 +702,8 @@ async def create_document(file: UploadFile = File(...), scope: Optional[str] = F
     # Stream to a temp file first so the size cap is enforced before any DB rows
     # or vectors are created.
     tmp = _save_temp(file, suffix)
-    doc = db.get_or_create_document(file.filename, scope=doc_scope, owner_id=owner_id)
+    doc = db.get_or_create_document(file.filename, scope=doc_scope, owner_id=owner_id,
+                                    uploaded_by=user["id"])
     ver = db.add_version(doc["id"], file.filename)
     stored = _store_file(tmp, ver["id"], suffix)
     db.set_version_file(ver["id"], stored)

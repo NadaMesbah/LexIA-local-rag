@@ -114,7 +114,7 @@ export default function Composer({
         )}
       </Box>
       <Typography variant="caption" sx={{ display: 'block', textAlign: 'center', mt: 1, color: 'text.disabled' }}>
-        {uploading ? 'Indexation du document en cours…' : 'Entrée pour envoyer · Shift+Entrée pour un saut de ligne · 📎 pour joindre un document'}
+        {uploading ? 'Indexation du document en cours…' : <>Entrée pour envoyer · Shift+Entrée pour un saut de ligne · <AttachFileRoundedIcon sx={{ fontSize: 13, verticalAlign: 'middle', mx: 0.2 }} /> pour joindre un document</>}
       </Typography>
     </Box>
   );
