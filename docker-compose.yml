@@ -19,9 +19,12 @@ services:
     environment:
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       - LLM_MODEL=${LLM_MODEL:-qwen2.5:7b}
+      - TITLE_MODEL=${TITLE_MODEL:-}
       - EMBED_MODEL=${EMBED_MODEL:-bge-m3}
       - CHROMA_PATH=/app/data/chroma
       - SQLITE_PATH=/app/data/rag.db
+      # Fully local: no ChromaDB product telemetry (zero outbound calls at runtime).
+      - ANONYMIZED_TELEMETRY=False
       - COLLECTION_NAME=${COLLECTION_NAME:-rag_knowledge_base}
       - CONTEXT_WINDOW=${CONTEXT_WINDOW:-8192}
       - NUM_OUTPUT=${NUM_OUTPUT:-1024}
@@ -30,7 +33,7 @@ services:
       - CHUNK_OVERLAP=${CHUNK_OVERLAP:-64}
       - RETRIEVE_TOP_K=${RETRIEVE_TOP_K:-5}
       - RERANK_TOP_N=${RERANK_TOP_N:-4}
-      - RELEVANCE_CUTOFF=${RELEVANCE_CUTOFF:-0.6}
+      - RELEVANCE_CUTOFF=${RELEVANCE_CUTOFF:-0.35}
       - RERANK_ENABLED=${RERANK_ENABLED:-false}
       - RERANK_MODEL=${RERANK_MODEL:-BAAI/bge-reranker-v2-m3}
       - RERANK_DEVICE=${RERANK_DEVICE:-cpu}

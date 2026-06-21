@@ -6,25 +6,35 @@ import TextField from '@mui/material/TextField';
 import IconButton from '@mui/material/IconButton';
 import Typography from '@mui/material/Typography';
 import Tooltip from '@mui/material/Tooltip';
+import Chip from '@mui/material/Chip';
 import CircularProgress from '@mui/material/CircularProgress';
 import SendRoundedIcon from '@mui/icons-material/SendRounded';
 import StopRoundedIcon from '@mui/icons-material/StopRounded';
 import AttachFileRoundedIcon from '@mui/icons-material/AttachFileRounded';
+import CheckCircleRoundedIcon from '@mui/icons-material/CheckCircleRounded';
+import ErrorOutlineRoundedIcon from '@mui/icons-material/ErrorOutlineRounded';
+import type { IndexingStatus, PendingAttachment } from '@/lib/types';
 
 const ACCEPT = '.pdf,.txt,.docx,.md,.csv,.xlsx';
+
+export type { PendingAttachment };
 
 export default function Composer({
   streaming,
   uploading,
+  attachments = [],
   onSend,
   onStop,
   onAttach,
+  onRemoveAttachment,
 }: {
   streaming: boolean;
   uploading: boolean;
+  attachments?: PendingAttachment[];
   onSend: (text: string) => void;
   onStop: () => void;
   onAttach: (files: FileList) => void;
+  onRemoveAttachment?: (id: string) => void;
 }) {
   const [value, setValue] = useState('');
   const fileRef = useRef<HTMLInputElement>(null);
@@ -36,8 +46,35 @@ export default function Composer({
     onSend(t);
   };
 
+  const statusIcon = (s: IndexingStatus) => {
+    if (s === 'indexed') return <CheckCircleRoundedIcon sx={{ color: 'success.main' }} />;
+    if (s === 'failed') return <ErrorOutlineRoundedIcon sx={{ color: 'error.main' }} />;
+    return <CircularProgress size={14} />;
+  };
+
   return (
     <Box sx={{ px: { xs: 2, md: 6 }, pb: 2.5, pt: 1 }}>
+      {attachments.length > 0 && (
+        <Box sx={{ maxWidth: 900, mx: 'auto', mb: 1, display: 'flex', flexWrap: 'wrap', gap: 0.75 }}>
+          {attachments.map((a) => (
+            <Chip
+              key={a.id}
+              icon={statusIcon(a.status)}
+              label={
+                a.status === 'indexed'
+                  ? a.filename
+                  : a.status === 'failed'
+                    ? `${a.filename} (échec)`
+                    : `${a.filename} · indexation…`
+              }
+              onDelete={onRemoveAttachment ? () => onRemoveAttachment(a.id) : undefined}
+              size="small"
+              variant="outlined"
+              sx={{ maxWidth: 280, borderColor: 'rgba(0,167,111,0.4)' }}
+            />
+          ))}
+        </Box>
+      )}
       <Box
         sx={{
           display: 'flex', alignItems: 'flex-end', gap: 1, p: 1, pl: 1,

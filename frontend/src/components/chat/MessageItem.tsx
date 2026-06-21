@@ -18,8 +18,34 @@ import ChevronLeftRoundedIcon from '@mui/icons-material/ChevronLeftRounded';
 import ChevronRightRoundedIcon from '@mui/icons-material/ChevronRightRounded';
 import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
 import DescriptionOutlinedIcon from '@mui/icons-material/DescriptionOutlined';
+import AttachFileRoundedIcon from '@mui/icons-material/AttachFileRounded';
+import CheckCircleRoundedIcon from '@mui/icons-material/CheckCircleRounded';
+import ErrorOutlineRoundedIcon from '@mui/icons-material/ErrorOutlineRounded';
+import CircularProgress from '@mui/material/CircularProgress';
 import Markdown from '@/components/Markdown';
-import type { Message, Source } from '@/lib/types';
+import type { IndexingStatus, Message, Source } from '@/lib/types';
+
+function AttachmentChip({ id, filename, status }: { id: string; filename: string; status?: IndexingStatus | null }) {
+  // Visualise the attached document's real indexing status.
+  let icon = <AttachFileRoundedIcon />;
+  let label = filename;
+  if (status === 'indexed') icon = <CheckCircleRoundedIcon sx={{ color: 'success.main' }} />;
+  else if (status === 'failed') { icon = <ErrorOutlineRoundedIcon sx={{ color: 'error.main' }} />; label = `${filename} (échec)`; }
+  else if (status === 'pending' || status === 'processing') { icon = <CircularProgress size={13} />; label = `${filename} · indexation…`; }
+  return (
+    <Chip
+      icon={icon}
+      label={label}
+      size="small"
+      sx={{
+        maxWidth: 260,
+        bgcolor: 'rgba(0,167,111,0.08)',
+        border: '1px solid rgba(0,167,111,0.24)',
+        '& .MuiChip-label': { fontWeight: 600 },
+      }}
+    />
+  );
+}
 
 function SourceRow({ s }: { s: Source }) {
   const [open, setOpen] = useState(false);
@@ -94,12 +120,16 @@ function VersionNav({ m, onSwitch }: { m: Message; onSwitch: (id: string) => voi
 export default function MessageItem({
   m,
   showGroundingFlag,
+  streaming = false,
+  statusOf,
   onSwitchVersion,
   onEdit,
   onRegenerate,
 }: {
   m: Message;
   showGroundingFlag: boolean;
+  streaming?: boolean;
+  statusOf?: (id: string) => IndexingStatus | undefined;
   onSwitchVersion: (id: string) => void;
   onEdit: (id: string, text: string) => void;
   onRegenerate: (userMessageId: string) => void;
@@ -112,6 +142,18 @@ export default function MessageItem({
   if (isUser) {
     return (
       <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 0.5 }}>
+        {!editing && m.attachments && m.attachments.length > 0 && (
+          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.75, justifyContent: 'flex-end', maxWidth: '78%' }}>
+            {m.attachments.map((a) => (
+              <AttachmentChip
+                key={a.id}
+                id={a.id}
+                filename={a.filename}
+                status={(statusOf && statusOf(a.id)) ?? a.indexing_status}
+              />
+            ))}
+          </Box>
+        )}
         {editing ? (
           <Box sx={{ width: '100%', maxWidth: 720 }}>
             <TextField
@@ -158,11 +200,15 @@ export default function MessageItem({
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.25 }}>
             <VersionNav m={m} onSwitch={onSwitchVersion} />
             <CopyButton text={m.content} />
-            <Tooltip title="Modifier">
-              <IconButton size="small" onClick={() => { setDraft(m.content); setEditing(true); }} sx={{ color: 'text.disabled' }}>
-                <EditRoundedIcon fontSize="small" />
-              </IconButton>
-            </Tooltip>
+            {/* Editing is hidden while a reply is generating: editing then would
+                race the in-flight answer and target an id that isn't persisted yet. */}
+            {!streaming && (
+              <Tooltip title="Modifier">
+                <IconButton size="small" onClick={() => { setDraft(m.content); setEditing(true); }} sx={{ color: 'text.disabled' }}>
+                  <EditRoundedIcon fontSize="small" />
+                </IconButton>
+              </Tooltip>
+            )}
           </Box>
         )}
       </Box>
@@ -200,7 +246,7 @@ export default function MessageItem({
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.25 }}>
         <VersionNav m={m} onSwitch={onSwitchVersion} />
         <CopyButton text={m.content} />
-        {m.parent_id && (
+        {m.parent_id && !streaming && (
           <Tooltip title="Régénérer">
             <IconButton size="small" onClick={() => onRegenerate(m.parent_id as string)} sx={{ color: 'text.disabled' }}>
               <RefreshRoundedIcon fontSize="small" />
