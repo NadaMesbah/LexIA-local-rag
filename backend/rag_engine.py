@@ -77,9 +77,17 @@ TEMPERATURE     = float(os.getenv("TEMPERATURE", "0.2"))
 CHUNK_SIZE      = int(os.getenv("CHUNK_SIZE", "512"))
 CHUNK_OVERLAP   = int(os.getenv("CHUNK_OVERLAP", "64"))
 
-RETRIEVE_TOP_K  = int(os.getenv("RETRIEVE_TOP_K", "5"))
-RERANK_TOP_N    = int(os.getenv("RERANK_TOP_N", "4"))
+RETRIEVE_TOP_K  = int(os.getenv("RETRIEVE_TOP_K", "6"))
+# Wider candidate pool pulled from each retriever before fusion/rerank/cutoff.
+RETRIEVE_CANDIDATES = int(os.getenv("RETRIEVE_CANDIDATES", "20"))
+RERANK_TOP_N    = int(os.getenv("RERANK_TOP_N", "5"))
 RERANK_ENABLED  = os.getenv("RERANK_ENABLED", "false").lower() in ("1", "true", "yes")
+# Hybrid lexical (BM25) retrieval on top of dense vectors — catches exact terms,
+# names, codes, dates and short queries that pure vector search misses.
+HYBRID_ENABLED  = os.getenv("HYBRID_ENABLED", "true").lower() in ("1", "true", "yes")
+# Strict RAG: answer ONLY from documents (never fall back to general chat). Off by
+# default so casual small talk still works; can be forced per-request or via env.
+STRICT_RAG_DEFAULT = os.getenv("STRICT_RAG", "false").lower() in ("1", "true", "yes")
 # Minimum cosine similarity (score = 1 - cosine_distance) for a chunk to count as
 # relevant. With bge-m3 and the reranker OFF, genuinely relevant passages often
 # score ~0.4-0.6, so a high cutoff silently discards them and the answer falls
@@ -106,16 +114,28 @@ SUPPORTED_EXTS = {".pdf", ".txt", ".docx", ".md", ".csv", ".xlsx"}
 
 SYSTEM_PROMPT = (
     "You are a precise, helpful assistant for a private knowledge base. "
-    "Answer using the context below. If the context does NOT contain the answer, say "
-    "clearly that you couldn't find it in the documents — do NOT invent or guess. "
+    "Answer using the context extracts below. Do NOT use general/prior knowledge to "
+    "add or invent facts that are not in the extracts. If the extracts do NOT contain "
+    "the answer, say clearly (in the user's language) that you couldn't find it in the "
+    "documents — do NOT guess. "
     "Do NOT add a 'Sources', 'Source' or citations list to your answer, and do NOT "
     "mention file names or version numbers — the application displays the sources "
     "separately. Be clear, concise and well structured."
 )
 
+# Used when strict RAG is on: documents-only, no general knowledge, refuse if absent.
+SYSTEM_PROMPT_STRICT = (
+    "You are a STRICT retrieval assistant for a private knowledge base. Answer ONLY "
+    "from the context extracts below. Never use general or prior knowledge to complete "
+    "or guess. If the exact answer is not explicitly present in the extracts, reply (in "
+    "the user's language) exactly: \"Je n'ai pas trouvé cette information dans les "
+    "documents.\" Do NOT add a sources/citations list or mention file names — the app "
+    "shows sources separately. Be concise and faithful to the extracts."
+)
+
 CONTEXT_TEMPLATE = (
-    "Voici des extraits potentiellement pertinents de la base de connaissance "
-    "(ils peuvent être vides ou hors-sujet — utilise-les seulement s'ils aident) :\n"
+    "Extraits de la base de connaissance (utilise-les comme seule source factuelle "
+    "pour répondre) :\n"
     "---------------------\n"
     "{context_str}\n"
     "---------------------"
@@ -511,7 +531,8 @@ class RAGEngine:
         return True
 
     async def stream_chat(self, message: str, history: list[dict],
-                          scope: Optional[dict] = None, user: Optional[dict] = None):
+                          scope: Optional[dict] = None, user: Optional[dict] = None,
+                          strict: Optional[bool] = None):
         """
         Yields ("token", str)… then ("sources", list).
 
@@ -527,6 +548,7 @@ class RAGEngine:
         """
         loop = asyncio.get_event_loop()
         directive = _language_directive(message)
+        strict = STRICT_RAG_DEFAULT if strict is None else bool(strict)
         scoped_ids = self._scoped_ids(scope)
         scoped = bool(scoped_ids)
 
@@ -551,22 +573,22 @@ class RAGEngine:
             print("[RAG] chat: knowledge base is empty (doc_count=0) — answering conversationally")
 
         use_docs = len(items) > 0
+        base_prompt = SYSTEM_PROMPT_STRICT if strict else SYSTEM_PROMPT
         if use_docs:
             system_text = (
-                SYSTEM_PROMPT + directive + "\n\n"
+                base_prompt + directive + "\n\n"
                 + CONTEXT_TEMPLATE.format(context_str=self._context_block(items))
             )
-        elif scoped:
-            # Attached document(s) but nothing retrievable (indexing failed, or the
-            # documents don't answer the question). Stay grounded: instruct the
-            # model to say so rather than inventing a generic answer.
+        elif scoped or strict:
+            # Scoped to attachments (nothing retrievable) OR strict mode with no
+            # match: stay grounded and instruct the model to say it couldn't find
+            # the answer rather than inventing one or chatting from general knowledge.
             no_ctx = (
-                "(Aucun extrait des documents joints n'a pu être récupéré : soit leur "
-                "indexation vient d'échouer, soit ils ne contiennent pas d'information "
-                "pertinente pour cette question.)"
+                "(Aucun extrait pertinent n'a été trouvé dans les documents pour cette "
+                "question.)"
             )
             system_text = (
-                SYSTEM_PROMPT + directive + "\n\n"
+                base_prompt + directive + "\n\n"
                 + CONTEXT_TEMPLATE.format(context_str=no_ctx)
             )
         else:
