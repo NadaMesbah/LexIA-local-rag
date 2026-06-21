@@ -86,6 +86,17 @@ RERANK_ENABLED  = os.getenv("RERANK_ENABLED", "false").lower() in ("1", "true", 
 # back to "general" with no sources. 0.35 favours recall; raise it (e.g. 0.5)
 # only if the reranker is enabled or answers pull in off-topic chunks.
 RELEVANCE_CUTOFF = float(os.getenv("RELEVANCE_CUTOFF", "0.35"))
+
+# Source DISPLAY filtering (independent of retrieval/context). Retrieval keeps a
+# low cutoff for recall, but we only SHOW the user sources that are clearly
+# relevant: close to the best match (relative gap), above a modest floor, and
+# capped in number — so a correct answer isn't accompanied by an unrelated long
+# tail, and pure small talk (no real match) shows no source at all. Tunable via
+# env without touching answer quality. For the sharpest source precision, enable
+# the cross-encoder reranker (RERANK_ENABLED=true).
+SOURCE_MIN_SCORE = float(os.getenv("SOURCE_MIN_SCORE", "0.40"))
+SOURCE_REL_GAP   = float(os.getenv("SOURCE_REL_GAP", "0.10"))
+SOURCE_MAX       = int(os.getenv("SOURCE_MAX", "4"))
 RERANK_MODEL    = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
 RERANK_DEVICE   = os.getenv("RERANK_DEVICE", "cpu")
 
@@ -579,27 +590,49 @@ class RAGEngine:
             if delta:
                 yield ("token", delta)
 
-        yield ("sources", self._format_sources(items) if use_docs else [])
+        yield ("sources", self._format_sources(items, scoped=scoped) if use_docs else [])
 
     @staticmethod
-    def _format_sources(items: list[dict]) -> list[dict]:
-        sources = []
-        seen = set()  # one source per document (best-scoring chunk)
-        for it in items or []:
-            md = it["metadata"]
-            key = md.get("rag_doc_id") or md.get("file_name")
-            if key in seen:
+    def _format_sources(items: list[dict], scoped: bool = False) -> list[dict]:
+        """Build the user-facing sources list. For normal questions, show only the
+        clearly-relevant matches (near the best score, above a floor) so an unrelated
+        long tail isn't displayed and small talk shows nothing. For scoped
+        (attached-document) queries, always surface the chosen document(s).
+        One entry per file (collapses multi-chunk hits and org/personal same-name)."""
+        if not items:
+            return []
+        ranked = sorted(items, key=lambda it: float(it.get("score") or 0), reverse=True)
+        top = float(ranked[0].get("score") or 0)
+        sources: list[dict] = []
+        seen = set()  # one source per file
+        for it in ranked:
+            score = float(it.get("score") or 0)
+            if not scoped:
+                # Sorted desc: once we hit a weak/out-of-gap chunk, all the rest are
+                # worse, so stop. This drops the irrelevant tail and (when even the
+                # best match is weak, e.g. greetings) shows no source.
+                if score < SOURCE_MIN_SCORE:
+                    break
+                if sources and score < top - SOURCE_REL_GAP:
+                    break
+            md = it.get("metadata") or {}
+            key = md.get("file_name") or md.get("rag_doc_id")
+            if not key or key in seen:
                 continue
             seen.add(key)
             text = it.get("text") or ""
             sources.append({
                 "text": text[:320] + ("…" if len(text) > 320 else ""),
-                "score": round(float(it.get("score") or 0), 4),
+                "score": round(score, 4),
                 "filename": md.get("file_name", "Unknown"),
                 "page": md.get("page_label", "?"),
                 "document_id": md.get("rag_doc_id"),
                 "version": md.get("version"),
             })
+            if len(sources) >= SOURCE_MAX:
+                break
+        print(f"[RAG] sources: scoped={scoped} top={round(top, 4)} "
+              f"shown={len(sources)}/{len(items)} -> {[(s['filename'], s['score']) for s in sources]}")
         return sources
 
     # ─── Ingestion & version management ────────────────────────────────────────
