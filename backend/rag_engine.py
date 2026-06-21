@@ -237,11 +237,15 @@ def _tokenize(text: str) -> list[str]:
 
 
 def _cosine(a, b) -> float:
-    if not a or not b:
+    # NumPy-safe: Chroma returns embeddings as numpy arrays, so avoid truthiness
+    # checks like `not a` (ambiguous for arrays) — use explicit None/length tests.
+    if a is None or b is None:
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    na = math.sqrt(sum(x * x for x in a))
-    nb = math.sqrt(sum(y * y for y in b))
+    if len(a) == 0 or len(b) == 0:
+        return 0.0
+    dot = sum(float(x) * float(y) for x, y in zip(a, b))
+    na = math.sqrt(sum(float(x) * float(x) for x in a))
+    nb = math.sqrt(sum(float(y) * float(y) for y in b))
     return dot / (na * nb) if na and nb else 0.0
 
 
@@ -608,7 +612,11 @@ class RAGEngine:
         if missing:
             try:
                 got = self._chroma_collection.get(ids=[it["id"] for it in missing], include=["embeddings"])
-                emap = dict(zip(got.get("ids", []) or [], got.get("embeddings", []) or []))
+                got_ids = got.get("ids") or []
+                got_embs = got.get("embeddings")
+                if got_embs is None:
+                    got_embs = []
+                emap = dict(zip(got_ids, got_embs))
                 for it in missing:
                     e = emap.get(it["id"])
                     it["score"] = _cosine(qemb, e) if e is not None else RELEVANCE_CUTOFF

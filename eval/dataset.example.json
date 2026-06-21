@@ -1,18 +1,110 @@
 [
   {
-    "question": "ما هو الحد الأدنى للإيداع للاستفادة من النسبة الجديدة؟",
-    "ground_truth": "الحد الأدنى للإيداع للاستفادة من النسبة الجديدة هو 5000 درهم."
+    "question": "Quel a été le score du match entre le Maroc et l'Écosse, et à quelle journée du groupe C ?",
+    "ground_truth": "Le score du match entre le Maroc et l'Écosse était de 1-0, lors de la deuxième journée du groupe C de la Coupe du monde 2026."
   },
   {
-    "question": "ما هي نسبة الفائدة الجديدة على حسابات الادخار؟",
-    "ground_truth": "نسبة الفائدة الجديدة على حسابات الادخار هي 3.5%."
+    "question": "Quels sujets Mohamed Ouahbi a-t-il abordés en conférence de presse après ce match ?",
+    "ground_truth": "Mohamed Ouahbi a abordé l'analyse tactique, la gestion du groupe, les ambitions pour la suite du tournoi, et son soutien affiché à Achraf Hakimi."
   },
   {
-    "question": "Quelle est la commission appliquée par Switch Pay ?",
-    "ground_truth": "Switch Pay applique une commission de 2,9% pour les transactions en devise locale et 3,6% pour les transactions internationales."
+    "question": "Selon le Digital News Report 2026 du Reuters Institute, qu'est-ce qui est devenu la principale porte d'entrée vers l'actualité dans le monde ?",
+    "ground_truth": "Les réseaux sociaux et les plateformes vidéo sont devenus la principale porte d'entrée vers l'actualité dans le monde, devant les sites des médias et la télévision."
   },
   {
-    "question": "Combien de PME se sont déjà inscrites au service Switch Pay ?",
-    "ground_truth": "Plus de 12 400 PME se sont déjà inscrites au service Switch Pay."
+    "question": "Comment évolue la confiance du public dans l'information selon ce même rapport ?",
+    "ground_truth": "La confiance dans l'information atteint son niveau le plus bas depuis une décennie."
+  },
+  {
+    "question": "Pourquoi Bank Al-Maghrib a-t-elle émis un avertissement en lien avec le Mondial 2026 ?",
+    "ground_truth": "Bank Al-Maghrib a alerté sur une recrudescence des cyberattaques (phishing, fraude en ligne) exploitant l'engouement du public pour le Mondial 2026, et a appelé les établissements bancaires à renforcer la sensibilisation de leur clientèle."
+  },
+  {
+    "question": "Quels sont la longueur et la capacité annuelle de l'infrastructure qui alimentera Marrakech en eau dessalée depuis Safi ?",
+    "ground_truth": "L'infrastructure mesure 185,3 km et peut acheminer près de 100 millions de m³ d'eau par an."
+  },
+  {
+    "question": "Quel est le montant de l'investissement de ce projet d'eau dessalée, et qui le porte ?",
+    "ground_truth": "Le projet représente un investissement de 4,2 milliards de dirhams et est porté par la Société régionale multiservices (SRM) de Marrakech-Safi."
+  },
+  {
+    "question": "À partir de quand l'eau dessalée doit-elle alimenter Marrakech ?",
+    "ground_truth": "L'eau dessalée doit alimenter le Grand Marrakech à partir de fin juillet."
+  },
+  {
+    "question": "Quelle température maximale est annoncée, et dans quelles régions ?",
+    "ground_truth": "Des températures pouvant atteindre 46°C sont attendues, notamment dans l'Oriental, le sud-est, la vallée de la Moulouya et le sud des provinces sahariennes."
+  },
+  {
+    "question": "Qu'est-ce que la fuite \"FortiBleed\" a exposé, et qui appelle à renforcer la sécurité face à cette menace ?",
+    "ground_truth": "La fuite \"FortiBleed\" a exposé des milliers d'identifiants d'administration et d'accès VPN actifs, dont certains liés à des entités marocaines ; la DGSSI appelle les organisations utilisant des solutions Fortinet à renforcer sans délai leurs mesures de sécurité."
+  },
+  {
+    "question": "Quel dispositif l'ONCF a-t-il annoncé pour l'été 2026, et dans quel but ?",
+    "ground_truth": "L'ONCF a annoncé le déploiement de son \"Plan Spécial Été 2026\", un dispositif conçu pour répondre à l'affluence exceptionnelle attendue sur le réseau ferroviaire national durant la saison estivale."
+  },
+  {
+    "question": "من ترأس أشغال تجديد فرع حزب الاستقلال بالفنيدق؟",
+    "ground_truth": "منصف الطوب هو من ترأس أشغال تجديد فرع حزب الاستقلال بالفنيدق."
+  },
+  {
+    "question": "في أي مدينة وفي أي تاريخ احتضنت هذه الفعالية؟",
+    "ground_truth": "احتضنت مدينة الفنيدق هذه الفعالية يوم الجمعة 19 يونيو 2026."
+  },
+  {
+    "question": "بماذا أشادت فرنسا فيما يخص تعاونها مع المغرب في مجال الهجرة؟",
+    "ground_truth": "أشادت فرنسا بـ\"التعاون الغني للغاية\" والمهيكل مع المغرب في مجال الهجرة."
+  },
+  {
+    "question": "من صرح بهذا التصريح، وما منصبه؟",
+    "ground_truth": "صرح بذلك فريديريك جورام، مدير الهجرة بوزارة الداخلية الفرنسية."
+  },
+  {
+    "question": "أي فريق تأهل رسميا إلى القسم الوطني الأول للبطولة الاحترافية؟",
+    "ground_truth": "نادي وداد تمارة هو الفريق الذي تأهل رسميا إلى القسم الوطني الأول."
+  },
+  {
+    "question": "ما اسم المركب السياحي الذي يشهد حالة احتقان اجتماعي، وفي أي مدينة يقع؟",
+    "ground_truth": "المركب السياحي يسمى \"كيمادو\" ويقع بمدينة الحسيمة."
+  },
+  {
+    "question": "من وصف حالة التوتر والاحتقان بهذا المركب؟",
+    "ground_truth": "المكتب النقابي لعمال وأطر المؤسسة هو من وصف حالة التوتر والاحتقان."
+  },
+  {
+    "question": "في أي منطقة ومدينة وقعت حادثة استخدام السلاح الوظيفي ضد شخصين، وفي أي تاريخ؟",
+    "ground_truth": "وقعت الحادثة بمنطقة العيايدة بمدينة سلا، يوم السبت 20 يونيو 2026."
+  },
+  {
+    "question": "لماذا اضطر الضابط والمفتش لاستخدام سلاحيهما الوظيفيين؟",
+    "ground_truth": "اضطرا لاستخدام سلاحيهما الوظيفيين لتحييد الخطر الصادر عن شخصين مبحوث عنهما في جريمة قتل."
+  },
+  {
+    "question": "أي مدينة ستحتضن الدورة الثالثة للملتقى الدولي للأعمال، وما الفترة الزمنية؟",
+    "ground_truth": "ستحتضن مدينة طنجة الدورة الثالثة للملتقى الدولي للأعمال، من 30 يونيو إلى 2 يوليوز."
+  },
+  {
+    "question": "ما الهدف من هذا الملتقى الاقتصادي؟",
+    "ground_truth": "الهدف من الملتقى هو تطوير المقاولات الصغرى وتحسين مناخ الاستثمار."
+  },
+  {
+    "question": "ما درجة الحرارة القصوى المتوقعة حسب نشرة الإنذار؟",
+    "ground_truth": "درجة الحرارة القصوى المتوقعة تتجاوز 45 درجة."
+  },
+  {
+    "question": "من أصدر نشرة الإنذار بموجة الحر، ومتى؟",
+    "ground_truth": "أصدرت المديرية العامة للأرصاد الجوية نشرة الإنذار يوم الخميس 18 يونيو 2026."
+  },
+  {
+    "question": "من ينظم المؤتمر الدولي الأول للروبوتيك في الصحة، وفي أي تاريخ؟",
+    "ground_truth": "تنظم الجمعية المغربية للروبوتيك في الصحة (SMRS) هذا المؤتمر يومي 19 و20 يونيو 2026."
+  },
+  {
+    "question": "ما الهدف المعلن لهذا المؤتمر؟",
+    "ground_truth": "الهدف المعلن هو الولوج العادل والمنصف للجراحة الروبوتية."
+  },
+  {
+    "question": "أي لجنة صادقت على مشروع قانون إعادة تنظيم المجلس الوطني للصحافة؟",
+    "ground_truth": "صادقت لجنة التعليم والشؤون الثقافية والاجتماعية بمجلس المستشارين على هذا المشروع."
   }
 ]

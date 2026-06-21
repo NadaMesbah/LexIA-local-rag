@@ -5,6 +5,7 @@ these run fast and offline while still exercising auth, documents, permissions,
 chat streaming and the debug endpoint end-to-end. Requires `httpx` (TestClient).
 """
 
+import json
 import os
 
 import pytest
@@ -47,9 +48,13 @@ class FakeEngine:
         yield ("sources", [])
 
 
+# Patch the engine class ONLY for main's `rag = RAGEngine()` at import, then RESTORE
+# it — otherwise the fake leaks into other test modules (e.g. test_retrieval_logic,
+# which imports the real RAGEngine for its static methods).
+_REAL_ENGINE = rag_engine.RAGEngine
 rag_engine.RAGEngine = FakeEngine
-
 import main  # noqa: E402
+rag_engine.RAGEngine = _REAL_ENGINE
 import db  # noqa: E402
 import auth  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
@@ -99,7 +104,7 @@ def test_debug_endpoint_is_admin_only(client):
     r = client.post("/debug/retrieve", headers=admin, json={"message": "hello"})
     assert r.status_code == 200 and "items" in r.json()
 
-    _register(client, username="u", email="u@x.com")
+    _register(client, username="user1", email="u@x.com")
     user = _login(client, "u@x.com", "password123")
     assert client.post("/debug/retrieve", headers=user, json={"message": "hi"}).status_code in (401, 403)
 
@@ -125,7 +130,15 @@ def test_chat_round_trip_persists_answer(client):
     sid = client.post("/sessions", headers=h, json={}).json()["id"]
     r = client.post(f"/sessions/{sid}/chat", headers=h, json={"message": "Bonjour"})
     assert r.status_code == 200
-    assert "Réponse de test." in r.text   # streamed NDJSON body
+    # The body is NDJSON with JSON-escaped unicode; reassemble the streamed tokens.
+    tokens = ""
+    for line in r.text.splitlines():
+        if not line:
+            continue
+        ev = json.loads(line)
+        if ev.get("type") == "token":
+            tokens += ev.get("data", "")
+    assert "Réponse de test." in tokens
 
     detail = client.get(f"/sessions/{sid}", headers=h).json()
     roles = [m["role"] for m in detail["messages"]]
