@@ -9,6 +9,17 @@ export interface User {
   role: Role;
 }
 
+// A user as returned by the admin user-management endpoints (includes created_at).
+export interface ManagedUser {
+  id: string;
+  username: string;
+  email: string;
+  first_name: string;
+  last_name: string;
+  role: Role;
+  created_at: number;
+}
+
 export interface AuthResponse {
   access_token: string;
   token_type: string;
@@ -86,6 +97,10 @@ export interface DocumentItem {
   name: string;
   scope?: 'org' | 'personal';
   owner_id?: string | null;
+  // Uploader: user id + display name (resolved server-side). Used by the admin
+  // documents view to show who added each file.
+  uploaded_by?: string | null;
+  uploaded_by_name?: string | null;
   current_version: number;
   status: 'active' | 'deleted';
   created_at: number;
