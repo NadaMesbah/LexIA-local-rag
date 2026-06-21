@@ -608,6 +608,27 @@ def get_document(document_id: str) -> Optional[dict]:
     return dict(row) if row else None
 
 
+def find_document_id(name: str, scope: str, owner_id: Optional[str]) -> Optional[str]:
+    """Resolve a document id from (name, scope, owner) — used to repair Chroma
+    chunks whose document key was lost. Prefers an active, most-recent match."""
+    if not name:
+        return None
+    with _connect() as conn:
+        if scope == "personal":
+            row = conn.execute(
+                "SELECT id FROM documents WHERE name=? AND scope='personal' AND owner_id=? "
+                "ORDER BY (status!='deleted') DESC, updated_at DESC LIMIT 1",
+                (name, owner_id),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT id FROM documents WHERE name=? AND scope='org' "
+                "ORDER BY (status!='deleted') DESC, updated_at DESC LIMIT 1",
+                (name,),
+            ).fetchone()
+    return row["id"] if row else None
+
+
 def get_version(version_id: str) -> Optional[dict]:
     with _connect() as conn:
         row = conn.execute("SELECT * FROM document_versions WHERE id=?", (version_id,)).fetchone()

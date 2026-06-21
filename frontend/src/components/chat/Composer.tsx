@@ -97,6 +97,7 @@ export default function Composer({
           value={value} onChange={(e) => setValue(e.target.value)}
           onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); } }}
           InputProps={{ disableUnderline: true }}
+          inputProps={{ dir: 'auto' }}
           sx={{ '& textarea': { fontSize: 14, lineHeight: 1.6, py: 1 } }}
         />
 

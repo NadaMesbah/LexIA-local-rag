@@ -84,6 +84,7 @@ export default function ConversationsRail({
                 sx={{ mr: 1, color: active ? 'primary.main' : 'text.disabled' }}
               />
               <Typography
+                dir="auto"
                 variant="body2"
                 noWrap
                 sx={{ flexGrow: 1, fontWeight: active ? 700 : 500, color: active ? 'text.primary' : 'text.secondary' }}
