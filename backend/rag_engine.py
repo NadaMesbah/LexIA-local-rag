@@ -22,6 +22,7 @@ import re
 import math
 import asyncio
 import threading
+import unicodedata
 from typing import Optional
 
 import chromadb
@@ -116,10 +117,12 @@ SUPPORTED_EXTS = {".pdf", ".txt", ".docx", ".md", ".csv", ".xlsx"}
 SYSTEM_PROMPT = (
     "You are a precise, helpful assistant for a private knowledge base. "
     "Use the context extracts below when they are relevant, and prefer them over "
-    "prior knowledge for facts about the documents. If the question is about the "
-    "documents and the answer is not in the extracts, say clearly (in the user's "
-    "language) that you couldn't find it — do NOT invent document facts. For general "
-    "questions or small talk unrelated to the documents, answer naturally. "
+    "prior knowledge for facts about the documents. NEVER fabricate specific figures, "
+    "amounts, numbers, dates or names: state such details ONLY if they appear in the "
+    "extracts, copying them exactly. If the question is about the documents and the "
+    "answer (or the requested figure) is not in the extracts, say clearly (in the "
+    "user's language) that you couldn't find it — do NOT guess. For general questions "
+    "or small talk unrelated to the documents, answer naturally. "
     "Do NOT add a 'Sources', 'Source' or citations list to your answer, and do NOT "
     "mention file names or version numbers — the application displays the sources "
     "separately. Be clear, concise and well structured."
@@ -219,10 +222,18 @@ def _language_directive(text: str) -> str:
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
 
 
+def _normalize_text(text: str) -> str:
+    # NFKC folds Arabic presentation-form glyphs (e.g. ﺍﻟﺤﺪ) back to standard
+    # letters (الحد). PDF extractors often emit presentation forms, which (a) read
+    # poorly for the LLM and (b) use different codepoints than a user's typed query
+    # — breaking BM25/embedding matches. Normalizing fixes all three.
+    return unicodedata.normalize("NFKC", text or "")
+
+
 def _tokenize(text: str) -> list[str]:
-    # \w with re.UNICODE keeps Arabic/accented letters and digits — works for the
-    # French/Arabic/English mix in this app.
-    return _WORD_RE.findall((text or "").lower())
+    # Normalize first so Arabic written as presentation forms matches a query typed
+    # in standard Arabic. \w with re.UNICODE keeps Arabic/accented letters + digits.
+    return _WORD_RE.findall(_normalize_text(text).lower())
 
 
 def _cosine(a, b) -> float:
@@ -818,11 +829,72 @@ class RAGEngine:
 
     # ─── Ingestion & version management ────────────────────────────────────────
 
+    def _load_documents(self, file_path: str, filename: str) -> list:
+        """Load a file into LlamaIndex Documents. PDFs use an Arabic/RTL-aware
+        extractor (PyMuPDF, then pypdfium2) that preserves reading order and
+        embedded digits — the default pypdf path drops Arabic numbers and emits
+        presentation-form glyphs. All extracted text is NFKC-normalized."""
+        suffix = os.path.splitext(file_path)[1].lower()
+        docs = None
+        if suffix == ".pdf":
+            docs = self._pdf_via_pymupdf(file_path) or self._pdf_via_pdfium(file_path)
+        if not docs:
+            docs = SimpleDirectoryReader(input_files=[file_path]).load_data()
+        for d in docs:
+            try:
+                d.text = _normalize_text(d.text)
+            except Exception:
+                pass
+        return docs
+
+    @staticmethod
+    def _pdf_via_pymupdf(file_path: str) -> Optional[list]:
+        """Best Arabic/RTL extraction. PyMuPDF (`fitz`) — AGPL; install `pymupdf`."""
+        try:
+            import fitz  # PyMuPDF
+            from llama_index.core import Document
+        except Exception:
+            return None
+        try:
+            out = []
+            with fitz.open(file_path) as pdf:
+                for i, page in enumerate(pdf):
+                    text = page.get_text("text")
+                    if text and text.strip():
+                        out.append(Document(text=text, metadata={"page_label": str(i + 1)}))
+            return out or None
+        except Exception as e:
+            print(f"[RAG] PyMuPDF extraction failed ({e}); trying next extractor")
+            return None
+
+    @staticmethod
+    def _pdf_via_pdfium(file_path: str) -> Optional[list]:
+        """Permissively-licensed fallback (pypdfium2, BSD/Apache) — good Arabic too."""
+        try:
+            import pypdfium2 as pdfium
+            from llama_index.core import Document
+        except Exception:
+            return None
+        try:
+            out = []
+            pdf = pdfium.PdfDocument(file_path)
+            try:
+                for i in range(len(pdf)):
+                    text = pdf[i].get_textpage().get_text_range()
+                    if text and text.strip():
+                        out.append(Document(text=text, metadata={"page_label": str(i + 1)}))
+            finally:
+                pdf.close()
+            return out or None
+        except Exception as e:
+            print(f"[RAG] pypdfium2 extraction failed ({e}); falling back to default")
+            return None
+
     def index_version(self, file_path: str, filename: str, document_id: str, version: int,
                       owner_id: Optional[str] = None, scope: str = "org") -> int:
         """Chunk/embed a file as a new version, mark it is_latest, demote older ones."""
         with self._write_lock:
-            documents = SimpleDirectoryReader(input_files=[file_path]).load_data()
+            documents = self._load_documents(file_path, filename)
             nodes = Settings.node_parser.get_nodes_from_documents(documents)
             for node in nodes:
                 node.metadata.update({

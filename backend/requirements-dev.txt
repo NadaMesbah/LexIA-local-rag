@@ -1,0 +1,12 @@
+# Test + evaluation dependencies (install on top of requirements.txt).
+#   pip install -r requirements.txt -r requirements-dev.txt
+
+pytest==8.3.4
+httpx==0.27.2            # required by FastAPI's TestClient
+
+# ── RAGAS evaluation (optional, heavier) ──────────────────────────────────────
+# Quantifies RAG quality (faithfulness, answer relevancy, context precision/recall).
+# Versions move fast; if imports differ, align these to your installed ragas.
+ragas==0.2.10
+datasets==3.2.0
+langchain-community==0.3.14

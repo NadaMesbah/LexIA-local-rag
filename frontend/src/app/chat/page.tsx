@@ -30,7 +30,7 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [confirmId, setConfirmId] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
-  const [toast, setToast] = useState<{ msg: string; sev: 'success' | 'error' | 'info' } | null>(null);
+  const [toast, setToast] = useState<{ msg: string; sev: 'success' | 'error' | 'info'; sid?: string } | null>(null);
 
   // Streaming lives ABOVE this page (in a layout-level provider), so a running
   // generation survives navigating to /documents and back — no false "réponse
@@ -118,11 +118,25 @@ export default function ChatPage() {
       if (!ok && errored) {
         setToast({ msg: `⚠️ ${errMsg || 'Erreur'}`, sev: 'error' });
       }
-    } else if (ok) {
-      const t = title || sessionsRef.current.find((s) => s.id === sid)?.title || 'une conversation';
-      setToast({ msg: `Réponse prête : « ${t} »`, sev: 'success' });
+    } else if (ok && !isActive(sid)) {
+      // A generation we navigated away from has finished. Show a notification that
+      // names the real conversation and lets the user jump straight to it. Resolve
+      // the title from the (just-finished) auto-title, the session list, or a fresh
+      // fetch — never the meaningless "une conversation" placeholder.
+      void (async () => {
+        let t = title || sessionsRef.current.find((s) => s.id === sid)?.title || '';
+        if (!t) {
+          try { t = (await api.getSession(sid)).title; } catch {/* ignore */}
+        }
+        if (isActive(sid)) return; // a new generation started in the meantime
+        setToast({
+          msg: t ? `Réponse prête dans « ${t} »` : 'Une réponse est prête dans une autre conversation',
+          sev: 'success',
+          sid,
+        });
+      })();
     }
-  }, [completion, refreshSessions, reloadCurrent]);
+  }, [completion, refreshSessions, reloadCurrent, isActive]);
 
   const handleSend = useCallback(
     async (text: string) => {
@@ -342,8 +356,18 @@ export default function ChatPage() {
         </DialogActions>
       </Dialog>
 
-      <Snackbar open={!!toast} autoHideDuration={4000} onClose={() => setToast(null)} anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}>
-        {toast ? <Alert severity={toast.sev} variant="filled" onClose={() => setToast(null)}>{toast.msg}</Alert> : undefined}
+      <Snackbar open={!!toast} autoHideDuration={5000} onClose={() => setToast(null)} anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}>
+        {toast ? (
+          <Alert
+            severity={toast.sev}
+            variant="filled"
+            onClose={() => setToast(null)}
+            onClick={toast.sid ? () => { openSession(toast.sid as string); setToast(null); } : undefined}
+            sx={toast.sid ? { cursor: 'pointer' } : undefined}
+          >
+            {toast.msg}{toast.sid ? ' — cliquer pour ouvrir' : ''}
+          </Alert>
+        ) : undefined}
       </Snackbar>
     </Box>
   );

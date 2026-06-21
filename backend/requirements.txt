@@ -28,6 +28,13 @@ docx2txt==0.8
 pandas==2.2.3
 openpyxl==3.1.5
 
+# PDF text extraction for Arabic/RTL (preserves reading order + embedded digits
+# that pypdf drops, and avoids presentation-form glyphs). PyMuPDF gives the best
+# quality but is AGPL-licensed; if a permissive licence is required, comment it out
+# and uncomment pypdfium2 (the engine tries PyMuPDF, then pypdfium2, then pypdf).
+pymupdf==1.24.14
+# pypdfium2==4.30.0   # permissive (BSD/Apache) alternative
+
 # ── Utilities ─────────────────────────────────────────────────────────────────
 python-dotenv==1.0.1
 aiofiles==24.1.0
