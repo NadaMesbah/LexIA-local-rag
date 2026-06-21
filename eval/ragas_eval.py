@@ -80,7 +80,7 @@ def build_samples(dataset):
     return samples
 
 
-def run_ragas(samples):
+def run_ragas(samples, metric_names: str = ""):
     # Local, offline judge + embeddings via Ollama.
     try:
         from langchain_ollama import ChatOllama, OllamaEmbeddings  # preferred (newer)
@@ -104,20 +104,27 @@ def run_ragas(samples):
     judge = LangchainLLMWrapper(ChatOllama(model=LLM_MODEL, base_url=OLLAMA_BASE_URL, temperature=0))
     embeddings = LangchainEmbeddingsWrapper(OllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_BASE_URL))
 
+    available = {
+        "faithfulness": Faithfulness(llm=judge),
+        "answer_relevancy": ResponseRelevancy(llm=judge, embeddings=embeddings),
+        "context_precision": LLMContextPrecisionWithReference(llm=judge),
+        "context_recall": LLMContextRecall(llm=judge),
+    }
+    names = [n.strip() for n in metric_names.split(",") if n.strip()] if metric_names else list(available)
+    metrics = [available[n] for n in names if n in available]
+    if not metrics:
+        metrics = list(available.values())
+
     dataset = EvaluationDataset.from_list(samples)
-    metrics = [
-        Faithfulness(llm=judge),
-        ResponseRelevancy(llm=judge, embeddings=embeddings),
-        LLMContextPrecisionWithReference(llm=judge),
-        LLMContextRecall(llm=judge),
-    ]
     # A local 7B judge is SLOW and Ollama serializes requests, so hammering it with
-    # many parallel jobs just makes them all time out. Serialize (low max_workers)
-    # and give each job a generous timeout. Tune via RAGAS_WORKERS / RAGAS_TIMEOUT.
+    # many parallel jobs just makes them all time out (-> nan). Serialize (low
+    # max_workers) with a generous timeout. Tune via RAGAS_WORKERS / RAGAS_TIMEOUT.
     run_config = RunConfig(
         timeout=int(os.getenv("RAGAS_TIMEOUT", "1800")),
         max_workers=int(os.getenv("RAGAS_WORKERS", "1")),
     )
+    print(f"Evaluating {len(samples)} question(s) x {len(metrics)} metric(s) "
+          f"[{', '.join(n for n in names if n in available)}] — be patient on a local judge…")
     result = evaluate(dataset=dataset, metrics=metrics, llm=judge, embeddings=embeddings,
                       run_config=run_config)
     print("\n================ RAGAS scores ================")
@@ -133,11 +140,18 @@ def run_ragas(samples):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", default="eval/dataset.example.json")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="evaluate only the first N questions (0 = all). Start small on a local judge.")
+    ap.add_argument("--metrics", default="",
+                    help="comma list: faithfulness,answer_relevancy,context_precision,context_recall "
+                         "(default: all). Fewer = faster.")
     args = ap.parse_args()
     with open(args.dataset, encoding="utf-8") as f:
         dataset = json.load(f)
+    if args.limit:
+        dataset = dataset[:args.limit]
     samples = build_samples(dataset)
-    run_ragas(samples)
+    run_ragas(samples, args.metrics)
 
 
 if __name__ == "__main__":
