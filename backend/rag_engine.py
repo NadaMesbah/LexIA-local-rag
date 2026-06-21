@@ -115,16 +115,17 @@ SUPPORTED_EXTS = {".pdf", ".txt", ".docx", ".md", ".csv", ".xlsx"}
 
 SYSTEM_PROMPT = (
     "You are a precise, helpful assistant for a private knowledge base. "
-    "Answer using the context extracts below. Do NOT use general/prior knowledge to "
-    "add or invent facts that are not in the extracts. If the extracts do NOT contain "
-    "the answer, say clearly (in the user's language) that you couldn't find it in the "
-    "documents — do NOT guess. "
+    "Use the context extracts below when they are relevant, and prefer them over "
+    "prior knowledge for facts about the documents. If the question is about the "
+    "documents and the answer is not in the extracts, say clearly (in the user's "
+    "language) that you couldn't find it — do NOT invent document facts. For general "
+    "questions or small talk unrelated to the documents, answer naturally. "
     "Do NOT add a 'Sources', 'Source' or citations list to your answer, and do NOT "
     "mention file names or version numbers — the application displays the sources "
     "separately. Be clear, concise and well structured."
 )
 
-# Used when strict RAG is on: documents-only, no general knowledge, refuse if absent.
+# Used ONLY when strict RAG is on (opt-in): documents-only, refuse if absent.
 SYSTEM_PROMPT_STRICT = (
     "You are a STRICT retrieval assistant for a private knowledge base. Answer ONLY "
     "from the context extracts below. Never use general or prior knowledge to complete "
@@ -135,8 +136,8 @@ SYSTEM_PROMPT_STRICT = (
 )
 
 CONTEXT_TEMPLATE = (
-    "Extraits de la base de connaissance (utilise-les comme seule source factuelle "
-    "pour répondre) :\n"
+    "Voici des extraits potentiellement pertinents de la base de connaissance "
+    "(ils peuvent être vides ou hors-sujet — utilise-les seulement s'ils aident) :\n"
     "---------------------\n"
     "{context_str}\n"
     "---------------------"
