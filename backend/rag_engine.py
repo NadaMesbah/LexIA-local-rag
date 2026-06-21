@@ -19,8 +19,10 @@ hard-delete purges them.
 
 import os
 import re
+import math
 import asyncio
 import threading
+import unicodedata
 from typing import Optional
 
 import chromadb
@@ -77,9 +79,17 @@ TEMPERATURE     = float(os.getenv("TEMPERATURE", "0.2"))
 CHUNK_SIZE      = int(os.getenv("CHUNK_SIZE", "512"))
 CHUNK_OVERLAP   = int(os.getenv("CHUNK_OVERLAP", "64"))
 
-RETRIEVE_TOP_K  = int(os.getenv("RETRIEVE_TOP_K", "5"))
-RERANK_TOP_N    = int(os.getenv("RERANK_TOP_N", "4"))
+RETRIEVE_TOP_K  = int(os.getenv("RETRIEVE_TOP_K", "6"))
+# Wider candidate pool pulled from each retriever before fusion/rerank/cutoff.
+RETRIEVE_CANDIDATES = int(os.getenv("RETRIEVE_CANDIDATES", "20"))
+RERANK_TOP_N    = int(os.getenv("RERANK_TOP_N", "5"))
 RERANK_ENABLED  = os.getenv("RERANK_ENABLED", "false").lower() in ("1", "true", "yes")
+# Hybrid lexical (BM25) retrieval on top of dense vectors — catches exact terms,
+# names, codes, dates and short queries that pure vector search misses.
+HYBRID_ENABLED  = os.getenv("HYBRID_ENABLED", "true").lower() in ("1", "true", "yes")
+# Strict RAG: answer ONLY from documents (never fall back to general chat). Off by
+# default so casual small talk still works; can be forced per-request or via env.
+STRICT_RAG_DEFAULT = os.getenv("STRICT_RAG", "false").lower() in ("1", "true", "yes")
 # Minimum cosine similarity (score = 1 - cosine_distance) for a chunk to count as
 # relevant. With bge-m3 and the reranker OFF, genuinely relevant passages often
 # score ~0.4-0.6, so a high cutoff silently discards them and the answer falls
@@ -106,11 +116,26 @@ SUPPORTED_EXTS = {".pdf", ".txt", ".docx", ".md", ".csv", ".xlsx"}
 
 SYSTEM_PROMPT = (
     "You are a precise, helpful assistant for a private knowledge base. "
-    "Answer using the context below. If the context does NOT contain the answer, say "
-    "clearly that you couldn't find it in the documents — do NOT invent or guess. "
+    "Use the context extracts below when they are relevant, and prefer them over "
+    "prior knowledge for facts about the documents. NEVER fabricate specific figures, "
+    "amounts, numbers, dates or names: state such details ONLY if they appear in the "
+    "extracts, copying them exactly. If the question is about the documents and the "
+    "answer (or the requested figure) is not in the extracts, say clearly (in the "
+    "user's language) that you couldn't find it — do NOT guess. For general questions "
+    "or small talk unrelated to the documents, answer naturally. "
     "Do NOT add a 'Sources', 'Source' or citations list to your answer, and do NOT "
     "mention file names or version numbers — the application displays the sources "
     "separately. Be clear, concise and well structured."
+)
+
+# Used ONLY when strict RAG is on (opt-in): documents-only, refuse if absent.
+SYSTEM_PROMPT_STRICT = (
+    "You are a STRICT retrieval assistant for a private knowledge base. Answer ONLY "
+    "from the context extracts below. Never use general or prior knowledge to complete "
+    "or guess. If the exact answer is not explicitly present in the extracts, reply (in "
+    "the user's language) exactly: \"Je n'ai pas trouvé cette information dans les "
+    "documents.\" Do NOT add a sources/citations list or mention file names — the app "
+    "shows sources separately. Be concise and faithful to the extracts."
 )
 
 CONTEXT_TEMPLATE = (
@@ -193,6 +218,80 @@ def _language_directive(text: str) -> str:
     )
 
 
+# ─── Lexical search (BM25) for hybrid retrieval ───────────────────────────────
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def _normalize_text(text: str) -> str:
+    # NFKC folds Arabic presentation-form glyphs (e.g. ﺍﻟﺤﺪ) back to standard
+    # letters (الحد). PDF extractors often emit presentation forms, which (a) read
+    # poorly for the LLM and (b) use different codepoints than a user's typed query
+    # — breaking BM25/embedding matches. Normalizing fixes all three.
+    return unicodedata.normalize("NFKC", text or "")
+
+
+def _tokenize(text: str) -> list[str]:
+    # Normalize first so Arabic written as presentation forms matches a query typed
+    # in standard Arabic. \w with re.UNICODE keeps Arabic/accented letters + digits.
+    return _WORD_RE.findall(_normalize_text(text).lower())
+
+
+def _cosine(a, b) -> float:
+    # NumPy-safe: Chroma returns embeddings as numpy arrays, so avoid truthiness
+    # checks like `not a` (ambiguous for arrays) — use explicit None/length tests.
+    if a is None or b is None:
+        return 0.0
+    if len(a) == 0 or len(b) == 0:
+        return 0.0
+    dot = sum(float(x) * float(y) for x, y in zip(a, b))
+    na = math.sqrt(sum(float(x) * float(x) for x in a))
+    nb = math.sqrt(sum(float(y) * float(y) for y in b))
+    return dot / (na * nb) if na and nb else 0.0
+
+
+class _BM25:
+    """Minimal BM25-Okapi over an in-memory chunk corpus. Pure Python, no extra
+    dependency, fully offline — the lexical half of hybrid retrieval, catching
+    exact terms/names/codes/dates that dense vectors miss."""
+
+    def __init__(self, ids: list, texts: list, metas: list, k1: float = 1.5, b: float = 0.75):
+        self.ids, self.texts, self.metas, self.k1, self.b = ids, texts, metas, k1, b
+        docs = [_tokenize(t) for t in texts]
+        self._len = [len(d) for d in docs]
+        self.N = len(docs)
+        self.avgdl = (sum(self._len) / self.N) if self.N else 0.0
+        df: dict[str, int] = {}
+        self._tf: list[dict[str, int]] = []
+        for d in docs:
+            tf: dict[str, int] = {}
+            for term in d:
+                tf[term] = tf.get(term, 0) + 1
+            self._tf.append(tf)
+            for term in tf:
+                df[term] = df.get(term, 0) + 1
+        self._idf = {t: math.log(1 + (self.N - n + 0.5) / (n + 0.5)) for t, n in df.items()}
+
+    def search(self, query: str, n: int) -> list[tuple]:
+        q = _tokenize(query)
+        if not q or self.N == 0:
+            return []
+        scored: list[tuple] = []
+        for i in range(self.N):
+            tf, dl = self._tf[i], (self._len[i] or 1)
+            s = 0.0
+            for term in q:
+                f = tf.get(term)
+                if not f:
+                    continue
+                s += self._idf.get(term, 0.0) * (f * (self.k1 + 1)) / (
+                    f + self.k1 * (1 - self.b + self.b * dl / self.avgdl)
+                )
+            if s > 0:
+                scored.append((i, s))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [(self.ids[i], self.texts[i], self.metas[i], sc) for i, sc in scored[:n]]
+
+
 def _trim_history(history: list[dict]) -> list[dict]:
     """Keep the most recent turns within the memory budget (~4 chars/token)."""
     budget = MEMORY_TOKEN_LIMIT * 4
@@ -212,13 +311,15 @@ def _trim_history(history: list[dict]) -> list[dict]:
 
 class RAGEngine:
     """Persistent, session-aware, version-aware RAG engine."""
-
     def __init__(self):
         self._index: Optional[VectorStoreIndex] = None
         self._vector_store: Optional[ChromaVectorStore] = None
         self._chroma_collection = None
         self._reranker = None
         self._title_llm = None
+        # Lexical (BM25) index over latest chunks, lazily (re)built and cached.
+        self._bm25 = None
+        self._bm25_dirty = True
         self._write_lock = threading.Lock()
         self._setup()
 
@@ -333,6 +434,7 @@ class RAGEngine:
             if up_ids:
                 self._chroma_collection.update(ids=up_ids, metadatas=up_mds)
                 print(f"[RAG] Backfilled {len(up_ids)} chunks (rag_doc_id / version / owner / scope).")
+            self._invalidate_bm25()
         except Exception as e:
             print(f"[RAG] backfill skipped ({e})")
 
@@ -366,6 +468,7 @@ class RAGEngine:
             if cids:
                 self._chroma_collection.update(ids=cids, metadatas=cmds)
                 print(f"[RAG] Reconciled is_latest on {len(cids)} chunks.")
+            self._invalidate_bm25()
         except Exception as e:
             print(f"[RAG] reconcile skipped ({e})")
 
@@ -437,45 +540,140 @@ class RAGEngine:
             return items
 
     def _relevant_nodes(self, message: str, scope: Optional[dict], user: Optional[dict]) -> list[dict]:
-        """Vector search with the visibility filter pushed into Chroma, then cutoff + rerank.
+        """Hybrid retrieval: dense vector search + lexical BM25, fused with
+        Reciprocal Rank Fusion, then optional rerank and a relevance filter.
 
-        When the query is explicitly scoped to attached documents, the relevance
-        cutoff is bypassed: the user has already chosen those documents, so we
-        return their best-matching chunks unconditionally (capped at top-k) rather
-        than risk filtering them all out and forcing an un-grounded answer."""
+        - Lexical BM25 catches exact terms/names/codes the vector search misses.
+        - Scoped (attached-doc) queries skip the cosine cutoff (the user chose the doc).
+        - Degrades gracefully to vector-only if the lexical index is unavailable."""
         where = self._visibility_where(user, scope)
-        scoped = bool(self._scoped_ids(scope))
+        scoped_ids = self._scoped_ids(scope)
+        scoped = bool(scoped_ids)
+
         try:
-            emb = Settings.embed_model.get_query_embedding(message)
-            n = max(RETRIEVE_TOP_K * 3, 12) if self._reranker else RETRIEVE_TOP_K
+            qemb = Settings.embed_model.get_query_embedding(message)
+        except Exception as e:
+            print(f"[RAG] embed error ({e})")
+            return []
+
+        by_id: dict[str, dict] = {}
+        vec_ids: list[str] = []
+        # 1) Dense vector candidates (visibility pushed into Chroma).
+        try:
             res = self._chroma_collection.query(
-                query_embeddings=[emb], n_results=n, where=where,
+                query_embeddings=[qemb], n_results=RETRIEVE_CANDIDATES, where=where,
                 include=["documents", "metadatas", "distances"],
             )
+            for cid, t, m, d in zip((res.get("ids") or [[]])[0], (res.get("documents") or [[]])[0],
+                                    (res.get("metadatas") or [[]])[0], (res.get("distances") or [[]])[0]):
+                by_id[cid] = {"id": cid, "text": t or "", "metadata": m or {},
+                              "score": 1.0 - float(d), "bm25": None}
+                vec_ids.append(cid)
         except Exception as e:
-            print(f"[RAG] retrieval error ({e}); where={where}")
+            print(f"[RAG] vector retrieval error ({e}); where={where}")
+
+        # 2) Lexical BM25 candidates (visibility filtered in Python).
+        lex_ids: list[str] = []
+        if HYBRID_ENABLED:
+            bm = self._ensure_bm25()
+            if bm is not None:
+                try:
+                    for cid, t, m, sc in bm.search(message, RETRIEVE_CANDIDATES * 3):
+                        if not self._visible(m, user, scoped_ids):
+                            continue
+                        if cid in by_id:
+                            by_id[cid]["bm25"] = sc
+                        else:
+                            by_id[cid] = {"id": cid, "text": t or "", "metadata": m or {},
+                                          "score": None, "bm25": sc}
+                        lex_ids.append(cid)
+                        if len(lex_ids) >= RETRIEVE_CANDIDATES:
+                            break
+                except Exception as e:
+                    print(f"[RAG] bm25 search error ({e})")
+
+        if not by_id:
+            print(f"[RAG] retrieve: where={where} scoped={scoped} raw=0 (no hits)")
             return []
-        docs = (res.get("documents") or [[]])[0]
-        metas = (res.get("metadatas") or [[]])[0]
-        dists = (res.get("distances") or [[]])[0]
-        items = [
-            {"text": t or "", "metadata": m or {}, "score": 1.0 - float(d)}
-            for t, m, d in zip(docs, metas, dists)
-        ]
-        raw = len(items)
-        top_raw = round(max((it["score"] for it in items), default=0.0), 4)
-        # Scoped queries skip the cutoff (the document choice is the relevance signal).
-        kept = items if scoped else [it for it in items if it["score"] >= RELEVANCE_CUTOFF]
-        after_cutoff = len(kept)
+
+        # 3) Reciprocal Rank Fusion of the two rankings.
+        rv = {cid: i for i, cid in enumerate(vec_ids)}
+        rl = {cid: i for i, cid in enumerate(lex_ids)}
+        K = 60
+        fused = sorted(
+            by_id.values(),
+            key=lambda it: (1.0 / (K + rv[it["id"]]) if it["id"] in rv else 0.0)
+                           + (1.0 / (K + rl[it["id"]]) if it["id"] in rl else 0.0),
+            reverse=True,
+        )
+
+        # 4) Cosine score for BM25-only hits (for the cutoff + source display).
+        missing = [it for it in fused if it["score"] is None]
+        if missing:
+            try:
+                got = self._chroma_collection.get(ids=[it["id"] for it in missing], include=["embeddings"])
+                got_ids = got.get("ids") or []
+                got_embs = got.get("embeddings")
+                if got_embs is None:
+                    got_embs = []
+                emap = dict(zip(got_ids, got_embs))
+                for it in missing:
+                    e = emap.get(it["id"])
+                    it["score"] = _cosine(qemb, e) if e is not None else RELEVANCE_CUTOFF
+            except Exception as e:
+                print(f"[RAG] embedding fetch error ({e})")
+                for it in missing:
+                    it["score"] = RELEVANCE_CUTOFF
+
+        raw = len(fused)
+        top_raw = round(max((it["score"] for it in fused), default=0.0), 4)
+
+        # 5) Relevance filter: keep lexical (exact-term) hits OR vector hits above
+        # the cutoff. Scoped queries keep everything (the document choice is the signal).
+        if scoped:
+            kept = fused
+        else:
+            kept = [it for it in fused if it.get("bm25") is not None or (it["score"] or 0) >= RELEVANCE_CUTOFF]
+
         kept = self._rerank(kept, message)
         result = kept[:RETRIEVE_TOP_K]
-        # Diagnostics: pinpoint where retrieval drops to zero (filter vs. cutoff).
-        # `raw == 0` => the visibility `where` matched no chunk (check is_latest/
-        # scope/owner_id metadata); `raw > 0 but after_cutoff == 0` => the best
-        # match scored below RELEVANCE_CUTOFF (compare with top_raw and lower it).
-        print(f"[RAG] retrieve: where={where} scoped={scoped} raw={raw} top_score={top_raw} "
-              f"after_cutoff={after_cutoff} returned={len(result)} cutoff={RELEVANCE_CUTOFF}")
+        print(f"[RAG] retrieve: where={where} scoped={scoped} vec={len(vec_ids)} bm25={len(lex_ids)} "
+              f"fused={raw} top_score={top_raw} kept={len(kept)} returned={len(result)} "
+              f"cutoff={RELEVANCE_CUTOFF}")
         return result
+
+    # ─── Lexical index (BM25) ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _visible(md: dict, user: Optional[dict], scoped_ids: list[str]) -> bool:
+        """Python mirror of _visibility_where, for filtering BM25 results."""
+        if not md.get("is_latest"):
+            return False
+        if scoped_ids and md.get("rag_doc_id") not in scoped_ids:
+            return False
+        if user and user.get("role") != "admin":
+            if md.get("scope") != "org" and md.get("owner_id") != user.get("id"):
+                return False
+        return True
+
+    def _invalidate_bm25(self):
+        self._bm25_dirty = True
+
+    def _ensure_bm25(self):
+        """(Re)build the lexical index over all latest chunks when stale."""
+        if self._bm25 is not None and not self._bm25_dirty:
+            return self._bm25
+        try:
+            got = self._chroma_collection.get(where={"is_latest": True},
+                                              include=["documents", "metadatas"])
+            ids = got.get("ids", []) or []
+            self._bm25 = _BM25(ids, got.get("documents", []) or [], got.get("metadatas", []) or [])
+            self._bm25_dirty = False
+            print(f"[RAG] BM25 lexical index built over {len(ids)} latest chunks.")
+        except Exception as e:
+            print(f"[RAG] BM25 build failed ({e}); vector-only this query")
+            self._bm25, self._bm25_dirty = None, False
+        return self._bm25
 
     @staticmethod
     def _context_block(items: list[dict]) -> str:
@@ -511,7 +709,8 @@ class RAGEngine:
         return True
 
     async def stream_chat(self, message: str, history: list[dict],
-                          scope: Optional[dict] = None, user: Optional[dict] = None):
+                          scope: Optional[dict] = None, user: Optional[dict] = None,
+                          strict: Optional[bool] = None):
         """
         Yields ("token", str)… then ("sources", list).
 
@@ -527,6 +726,7 @@ class RAGEngine:
         """
         loop = asyncio.get_event_loop()
         directive = _language_directive(message)
+        strict = STRICT_RAG_DEFAULT if strict is None else bool(strict)
         scoped_ids = self._scoped_ids(scope)
         scoped = bool(scoped_ids)
 
@@ -551,22 +751,22 @@ class RAGEngine:
             print("[RAG] chat: knowledge base is empty (doc_count=0) — answering conversationally")
 
         use_docs = len(items) > 0
+        base_prompt = SYSTEM_PROMPT_STRICT if strict else SYSTEM_PROMPT
         if use_docs:
             system_text = (
-                SYSTEM_PROMPT + directive + "\n\n"
+                base_prompt + directive + "\n\n"
                 + CONTEXT_TEMPLATE.format(context_str=self._context_block(items))
             )
-        elif scoped:
-            # Attached document(s) but nothing retrievable (indexing failed, or the
-            # documents don't answer the question). Stay grounded: instruct the
-            # model to say so rather than inventing a generic answer.
+        elif scoped or strict:
+            # Scoped to attachments (nothing retrievable) OR strict mode with no
+            # match: stay grounded and instruct the model to say it couldn't find
+            # the answer rather than inventing one or chatting from general knowledge.
             no_ctx = (
-                "(Aucun extrait des documents joints n'a pu être récupéré : soit leur "
-                "indexation vient d'échouer, soit ils ne contiennent pas d'information "
-                "pertinente pour cette question.)"
+                "(Aucun extrait pertinent n'a été trouvé dans les documents pour cette "
+                "question.)"
             )
             system_text = (
-                SYSTEM_PROMPT + directive + "\n\n"
+                base_prompt + directive + "\n\n"
                 + CONTEXT_TEMPLATE.format(context_str=no_ctx)
             )
         else:
@@ -637,11 +837,72 @@ class RAGEngine:
 
     # ─── Ingestion & version management ────────────────────────────────────────
 
+    def _load_documents(self, file_path: str, filename: str) -> list:
+        """Load a file into LlamaIndex Documents. PDFs use an Arabic/RTL-aware
+        extractor (PyMuPDF, then pypdfium2) that preserves reading order and
+        embedded digits — the default pypdf path drops Arabic numbers and emits
+        presentation-form glyphs. All extracted text is NFKC-normalized."""
+        suffix = os.path.splitext(file_path)[1].lower()
+        docs = None
+        if suffix == ".pdf":
+            docs = self._pdf_via_pymupdf(file_path) or self._pdf_via_pdfium(file_path)
+        if not docs:
+            docs = SimpleDirectoryReader(input_files=[file_path]).load_data()
+        for d in docs:
+            try:
+                d.text = _normalize_text(d.text)
+            except Exception:
+                pass
+        return docs
+
+    @staticmethod
+    def _pdf_via_pymupdf(file_path: str) -> Optional[list]:
+        """Best Arabic/RTL extraction. PyMuPDF (`fitz`) — AGPL; install `pymupdf`."""
+        try:
+            import fitz  # PyMuPDF
+            from llama_index.core import Document
+        except Exception:
+            return None
+        try:
+            out = []
+            with fitz.open(file_path) as pdf:
+                for i, page in enumerate(pdf):
+                    text = page.get_text("text")
+                    if text and text.strip():
+                        out.append(Document(text=text, metadata={"page_label": str(i + 1)}))
+            return out or None
+        except Exception as e:
+            print(f"[RAG] PyMuPDF extraction failed ({e}); trying next extractor")
+            return None
+
+    @staticmethod
+    def _pdf_via_pdfium(file_path: str) -> Optional[list]:
+        """Permissively-licensed fallback (pypdfium2, BSD/Apache) — good Arabic too."""
+        try:
+            import pypdfium2 as pdfium
+            from llama_index.core import Document
+        except Exception:
+            return None
+        try:
+            out = []
+            pdf = pdfium.PdfDocument(file_path)
+            try:
+                for i in range(len(pdf)):
+                    text = pdf[i].get_textpage().get_text_range()
+                    if text and text.strip():
+                        out.append(Document(text=text, metadata={"page_label": str(i + 1)}))
+            finally:
+                pdf.close()
+            return out or None
+        except Exception as e:
+            print(f"[RAG] pypdfium2 extraction failed ({e}); falling back to default")
+            return None
+
     def index_version(self, file_path: str, filename: str, document_id: str, version: int,
                       owner_id: Optional[str] = None, scope: str = "org") -> int:
         """Chunk/embed a file as a new version, mark it is_latest, demote older ones."""
         with self._write_lock:
-            documents = SimpleDirectoryReader(input_files=[file_path]).load_data()
+            documents = self._load_documents(file_path, filename)
             nodes = Settings.node_parser.get_nodes_from_documents(documents)
             for node in nodes:
                 node.metadata.update({
@@ -659,6 +920,7 @@ class RAGEngine:
                 })
             self._index.insert_nodes(nodes)
             self._demote_other_versions(document_id, keep_version=version)
+            self._invalidate_bm25()
             return len(nodes)
 
     def _set_latest_for_document(self, document_id: str, latest_version):
@@ -675,6 +937,7 @@ class RAGEngine:
                     cids.append(cid); cmds.append(md)
             if cids:
                 self._chroma_collection.update(ids=cids, metadatas=cmds)
+            self._invalidate_bm25()
         except Exception as e:
             print(f"[RAG] set-latest error ({e})")
 
@@ -696,6 +959,7 @@ class RAGEngine:
         with self._write_lock:
             try:
                 self._chroma_collection.delete(where={"rag_doc_id": document_id})
+                self._invalidate_bm25()
             except Exception as e:
                 print(f"[RAG] purge error ({e})")
 

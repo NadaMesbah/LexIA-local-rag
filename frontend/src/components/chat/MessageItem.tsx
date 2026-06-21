@@ -220,7 +220,7 @@ export default function MessageItem({
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 0.5 }}>
       <Typography variant="caption" sx={{ color: 'warning.dark', fontWeight: 700, letterSpacing: 0.5 }}>
-        ASSISTANT
+        OWANA
       </Typography>
       <Paper
         sx={{

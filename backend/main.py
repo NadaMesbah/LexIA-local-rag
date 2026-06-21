@@ -147,6 +147,7 @@ class ChatRequest(BaseModel):
     message: str
     scope: Optional[dict] = None   # {"type": "all"} | {"type": "document", "id"/"ids": ...}
     attachments: Optional[list] = None  # [{"id": "...", "filename": "..."}] shown on the user message
+    strict: Optional[bool] = None  # documents-only mode (overrides server default when set)
 
 
 # ─── Ownership helpers ───────────────────────────────────────────────────────
@@ -469,7 +470,7 @@ async def delete_session(session_id: str, user: dict = Depends(auth.current_user
 
 def _reply_generator(session_id: str, fallback_title: str, parent_user_id: str,
                      user_content: str, history: list[dict], scope: Optional[dict] = None,
-                     user: Optional[dict] = None):
+                     user: Optional[dict] = None, strict: Optional[bool] = None):
     """
     Stream an assistant reply as a child of an EXISTING user message and persist
     it (the answer survives a client disconnect via the `finally` block). Shared
@@ -490,7 +491,7 @@ def _reply_generator(session_id: str, fallback_title: str, parent_user_id: str,
             saved["done"] = True
 
         try:
-            async for kind, payload in rag.stream_chat(user_content, history, scope, user):
+            async for kind, payload in rag.stream_chat(user_content, history, scope, user, strict):
                 if kind == "token":
                     answer_parts.append(payload)
                     yield json.dumps({"type": "token", "data": payload}) + "\n"
@@ -521,6 +522,17 @@ def _history_before(session_id: str, message_id: str) -> list[dict]:
     return history
 
 
+def _scope_from_attachments(att_json) -> Optional[dict]:
+    """Rebuild a document scope from a message's persisted attachments, so editing
+    or regenerating a question keeps grounding on the originally attached file(s)."""
+    try:
+        atts = json.loads(att_json) if att_json else []
+    except Exception:
+        atts = []
+    ids = [a.get("id") for a in atts if isinstance(a, dict) and a.get("id")]
+    return {"type": "document", "ids": ids} if ids else None
+
+
 @app.post("/sessions/{session_id}/chat")
 async def chat(session_id: str, req: ChatRequest, user: dict = Depends(auth.current_user)):
     """Session-aware, streaming RAG chat with conversation memory."""
@@ -535,7 +547,7 @@ async def chat(session_id: str, req: ChatRequest, user: dict = Depends(auth.curr
     att = json.dumps(req.attachments) if req.attachments else None
     uid = db.add_message(session_id, "user", message, parent_id=parent_id, attachments=att)["id"]
 
-    gen = _reply_generator(session_id, session["title"], uid, message, history, req.scope, user)
+    gen = _reply_generator(session_id, session["title"], uid, message, history, req.scope, user, req.strict)
     return StreamingResponse(gen(), media_type="application/x-ndjson")
 
 
@@ -555,9 +567,12 @@ async def edit_message(session_id: str, message_id: str, req: ChatRequest,
         raise HTTPException(status_code=400, detail="Empty message.")
 
     history = _history_before(session_id, message_id)
-    att = json.dumps(req.attachments) if req.attachments else None
+    # Carry over the original message's attachments (the client doesn't resend them
+    # on edit) so the edited question stays grounded on the same document(s).
+    att = json.dumps(req.attachments) if req.attachments else target.get("attachments")
+    scope = req.scope or _scope_from_attachments(att)
     uid = db.add_message(session_id, "user", content, parent_id=target["parent_id"], attachments=att)["id"]
-    gen = _reply_generator(session_id, session["title"], uid, content, history, req.scope, user)
+    gen = _reply_generator(session_id, session["title"], uid, content, history, scope, user, req.strict)
     return StreamingResponse(gen(), media_type="application/x-ndjson")
 
 
@@ -574,9 +589,35 @@ async def regenerate_message(session_id: str, message_id: str,
         raise HTTPException(status_code=404, detail="User message not found.")
 
     history = _history_before(session_id, message_id)
+    # Keep grounding on the document(s) originally attached to this question.
+    scope = _scope_from_attachments(target.get("attachments"))
     gen = _reply_generator(session_id, session["title"], message_id, target["content"],
-                           history, None, user)
+                           history, scope, user)
     return StreamingResponse(gen(), media_type="application/x-ndjson")
+
+
+@app.post("/debug/retrieve")
+async def debug_retrieve(req: ChatRequest, user: dict = Depends(auth.admin_user)):
+    """Admin-only: inspect exactly what retrieval returns for a query (chunks,
+    scores, BM25 hits, metadata) — to diagnose grounding without guessing."""
+    import asyncio
+    loop = asyncio.get_event_loop()
+    items = await loop.run_in_executor(None, rag._relevant_nodes, req.message, req.scope, user)
+    return {
+        "count": len(items),
+        "items": [
+            {
+                "score": round(float(it.get("score") or 0), 4),
+                "bm25": it.get("bm25"),
+                "filename": (it.get("metadata") or {}).get("file_name"),
+                "rag_doc_id": (it.get("metadata") or {}).get("rag_doc_id"),
+                "version": (it.get("metadata") or {}).get("version"),
+                "page": (it.get("metadata") or {}).get("page_label"),
+                "text": (it.get("text") or "")[:300],
+            }
+            for it in items
+        ],
+    }
 
 
 # ─── Documents (versioned) ───────────────────────────────────────────────────
