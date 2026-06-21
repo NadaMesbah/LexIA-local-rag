@@ -6,7 +6,10 @@ bge-reranker.
 
 Versioning / freshness
 ----------------------
-Every chunk in Chroma carries metadata: document_id, version, is_latest.
+Every chunk in Chroma carries metadata: rag_doc_id, version, is_latest (plus
+owner_id/scope for access control). NOTE: we deliberately do NOT use the key
+"document_id" — LlamaIndex reserves it and overwrites it with its own ref_doc_id
+on insert, which silently breaks any where-filter on it.
 Retrieval always filters on is_latest == true, so the chat answers only from the
 newest indexed version of each document. Uploading a new version inserts fresh
 is_latest chunks and flips the previous version's chunks to is_latest=false
@@ -274,8 +277,10 @@ class RAGEngine:
             return None
 
     def _backfill_legacy(self):
-        """Give pre-auth chunks the metadata (version + owner/scope) they need to
-        stay retrievable and correctly visibility-filtered."""
+        """Repair chunk metadata at startup so existing chunks stay retrievable and
+        correctly filtered: give pre-versioning chunks version/owner/scope, and
+        backfill `rag_doc_id` for chunks indexed before that key existed (their
+        reserved "document_id" was clobbered by LlamaIndex with its ref_doc_id)."""
         try:
             got = self._chroma_collection.get(include=["metadatas"])
             ids = got.get("ids", []) or []
@@ -284,26 +289,39 @@ class RAGEngine:
             for cid, md in zip(ids, mds):
                 md = dict(md or {})
                 changed = False
-                if "is_latest" not in md or "document_id" not in md:
+                # Pre-versioning chunks: no version/is_latest at all.
+                if "is_latest" not in md or "version" not in md:
                     name = md.get("file_name") or md.get("source") or "Unknown"
                     info = db.ensure_legacy_document(name, 0)
                     md["file_name"] = name
-                    md["document_id"] = info["document_id"]
+                    md.setdefault("rag_doc_id", info["document_id"])
                     md.setdefault("version", info["version"])
                     md["is_latest"] = True
-                    md["owner_id"] = info["owner_id"] or ""
-                    md["scope"] = info["scope"]
+                    md.setdefault("owner_id", info["owner_id"] or "")
+                    md.setdefault("scope", info["scope"])
                     changed = True
                 if "scope" not in md or "owner_id" not in md:
-                    doc = db.get_document(md.get("document_id")) if md.get("document_id") else None
-                    md["scope"] = (doc or {}).get("scope") or "org"
-                    md["owner_id"] = (doc or {}).get("owner_id") or ""
+                    doc = db.get_document(md.get("rag_doc_id")) if md.get("rag_doc_id") else None
+                    md["scope"] = (doc or {}).get("scope") or md.get("scope") or "org"
+                    md["owner_id"] = (doc or {}).get("owner_id") or md.get("owner_id") or ""
                     changed = True
+                # Backfill our document key for chunks indexed before "rag_doc_id"
+                # existed. We can still resolve it from (file_name, scope, owner_id),
+                # which LlamaIndex does NOT clobber.
+                if not md.get("rag_doc_id"):
+                    did = db.find_document_id(
+                        md.get("file_name") or md.get("source") or "",
+                        md.get("scope") or "org",
+                        md.get("owner_id") or None,
+                    )
+                    if did:
+                        md["rag_doc_id"] = did
+                        changed = True
                 if changed:
                     up_ids.append(cid); up_mds.append(md)
             if up_ids:
                 self._chroma_collection.update(ids=up_ids, metadatas=up_mds)
-                print(f"[RAG] Backfilled {len(up_ids)} chunks with version/owner metadata.")
+                print(f"[RAG] Backfilled {len(up_ids)} chunks (rag_doc_id / version / owner / scope).")
         except Exception as e:
             print(f"[RAG] backfill skipped ({e})")
 
@@ -329,7 +347,7 @@ class RAGEngine:
             cids, cmds = [], []
             for cid, md in zip(ids, mds):
                 md = dict(md or {})
-                did = md.get("document_id")
+                did = md.get("rag_doc_id")
                 want = did in latest and latest[did] is not None and md.get("version") == latest[did]
                 if bool(md.get("is_latest")) != want:
                     md["is_latest"] = want
@@ -386,9 +404,9 @@ class RAGEngine:
         conds: list[dict] = [{"is_latest": True}]
         ids = RAGEngine._scoped_ids(scope)
         if len(ids) == 1:
-            conds.append({"document_id": ids[0]})
+            conds.append({"rag_doc_id": ids[0]})
         elif len(ids) > 1:
-            conds.append({"document_id": {"$in": ids}})
+            conds.append({"rag_doc_id": {"$in": ids}})
         if user and user.get("role") != "admin":
             conds.append({"$or": [{"scope": "org"}, {"owner_id": user["id"]}]})
         return {"$and": conds} if len(conds) > 1 else conds[0]
@@ -569,7 +587,7 @@ class RAGEngine:
         seen = set()  # one source per document (best-scoring chunk)
         for it in items or []:
             md = it["metadata"]
-            key = md.get("document_id") or md.get("file_name")
+            key = md.get("rag_doc_id") or md.get("file_name")
             if key in seen:
                 continue
             seen.add(key)
@@ -579,7 +597,7 @@ class RAGEngine:
                 "score": round(float(it.get("score") or 0), 4),
                 "filename": md.get("file_name", "Unknown"),
                 "page": md.get("page_label", "?"),
-                "document_id": md.get("document_id"),
+                "document_id": md.get("rag_doc_id"),
                 "version": md.get("version"),
             })
         return sources
@@ -596,7 +614,11 @@ class RAGEngine:
                 node.metadata.update({
                     "file_name": filename,
                     "source": filename,
-                    "document_id": document_id,
+                    # LlamaIndex reserves and OVERWRITES "document_id" with its own
+                    # ref_doc_id on insert, so a where={"document_id": ...} filter
+                    # never matches our id. Store our identity under "rag_doc_id"
+                    # and filter on that everywhere.
+                    "rag_doc_id": document_id,
                     "version": version,
                     "is_latest": True,
                     "owner_id": owner_id or "",   # Chroma metadata can't be None
@@ -609,7 +631,7 @@ class RAGEngine:
     def _set_latest_for_document(self, document_id: str, latest_version):
         """Set is_latest=true only for chunks of `latest_version` (None => none)."""
         try:
-            got = self._chroma_collection.get(where={"document_id": document_id}, include=["metadatas"])
+            got = self._chroma_collection.get(where={"rag_doc_id": document_id}, include=["metadatas"])
             ids = got.get("ids", []) or []
             mds = got.get("metadatas", []) or []
             cids, cmds = [], []
@@ -640,7 +662,7 @@ class RAGEngine:
         """Hard-delete: permanently remove all of a document's vectors."""
         with self._write_lock:
             try:
-                self._chroma_collection.delete(where={"document_id": document_id})
+                self._chroma_collection.delete(where={"rag_doc_id": document_id})
             except Exception as e:
                 print(f"[RAG] purge error ({e})")
 
