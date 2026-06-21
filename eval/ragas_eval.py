@@ -36,8 +36,13 @@ import json
 import os
 import sys
 
-# Import the engine from backend/
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backend"))
+# Locate the backend code (rag_engine.py) whether run from the repo (<repo>/backend)
+# or inside the container (flat /app layout).
+_here = os.path.dirname(os.path.abspath(__file__))
+for _cand in (os.path.join(os.path.dirname(_here), "backend"), os.path.dirname(_here), os.getcwd()):
+    if os.path.exists(os.path.join(_cand, "rag_engine.py")):
+        sys.path.insert(0, _cand)
+        break
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:7b")
