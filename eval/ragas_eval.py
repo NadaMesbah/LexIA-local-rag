@@ -82,9 +82,16 @@ def build_samples(dataset):
 
 def run_ragas(samples):
     # Local, offline judge + embeddings via Ollama.
-    from langchain_community.chat_models import ChatOllama
-    from langchain_community.embeddings import OllamaEmbeddings
+    try:
+        from langchain_ollama import ChatOllama, OllamaEmbeddings  # preferred (newer)
+    except Exception:
+        from langchain_community.chat_models import ChatOllama
+        from langchain_community.embeddings import OllamaEmbeddings
     from ragas import evaluate, EvaluationDataset
+    try:
+        from ragas import RunConfig
+    except Exception:
+        from ragas.run_config import RunConfig
     from ragas.llms import LangchainLLMWrapper
     from ragas.embeddings import LangchainEmbeddingsWrapper
     from ragas.metrics import (
@@ -104,7 +111,15 @@ def run_ragas(samples):
         LLMContextPrecisionWithReference(llm=judge),
         LLMContextRecall(llm=judge),
     ]
-    result = evaluate(dataset=dataset, metrics=metrics, llm=judge, embeddings=embeddings)
+    # A local 7B judge is SLOW and Ollama serializes requests, so hammering it with
+    # many parallel jobs just makes them all time out. Serialize (low max_workers)
+    # and give each job a generous timeout. Tune via RAGAS_WORKERS / RAGAS_TIMEOUT.
+    run_config = RunConfig(
+        timeout=int(os.getenv("RAGAS_TIMEOUT", "1800")),
+        max_workers=int(os.getenv("RAGAS_WORKERS", "1")),
+    )
+    result = evaluate(dataset=dataset, metrics=metrics, llm=judge, embeddings=embeddings,
+                      run_config=run_config)
     print("\n================ RAGAS scores ================")
     print(result)
     try:
