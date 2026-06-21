@@ -19,6 +19,7 @@ hard-delete purges them.
 
 import os
 import re
+import math
 import asyncio
 import threading
 from typing import Optional
@@ -213,6 +214,68 @@ def _language_directive(text: str) -> str:
     )
 
 
+# ─── Lexical search (BM25) for hybrid retrieval ───────────────────────────────
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def _tokenize(text: str) -> list[str]:
+    # \w with re.UNICODE keeps Arabic/accented letters and digits — works for the
+    # French/Arabic/English mix in this app.
+    return _WORD_RE.findall((text or "").lower())
+
+
+def _cosine(a, b) -> float:
+    if not a or not b:
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    return dot / (na * nb) if na and nb else 0.0
+
+
+class _BM25:
+    """Minimal BM25-Okapi over an in-memory chunk corpus. Pure Python, no extra
+    dependency, fully offline — the lexical half of hybrid retrieval, catching
+    exact terms/names/codes/dates that dense vectors miss."""
+
+    def __init__(self, ids: list, texts: list, metas: list, k1: float = 1.5, b: float = 0.75):
+        self.ids, self.texts, self.metas, self.k1, self.b = ids, texts, metas, k1, b
+        docs = [_tokenize(t) for t in texts]
+        self._len = [len(d) for d in docs]
+        self.N = len(docs)
+        self.avgdl = (sum(self._len) / self.N) if self.N else 0.0
+        df: dict[str, int] = {}
+        self._tf: list[dict[str, int]] = []
+        for d in docs:
+            tf: dict[str, int] = {}
+            for term in d:
+                tf[term] = tf.get(term, 0) + 1
+            self._tf.append(tf)
+            for term in tf:
+                df[term] = df.get(term, 0) + 1
+        self._idf = {t: math.log(1 + (self.N - n + 0.5) / (n + 0.5)) for t, n in df.items()}
+
+    def search(self, query: str, n: int) -> list[tuple]:
+        q = _tokenize(query)
+        if not q or self.N == 0:
+            return []
+        scored: list[tuple] = []
+        for i in range(self.N):
+            tf, dl = self._tf[i], (self._len[i] or 1)
+            s = 0.0
+            for term in q:
+                f = tf.get(term)
+                if not f:
+                    continue
+                s += self._idf.get(term, 0.0) * (f * (self.k1 + 1)) / (
+                    f + self.k1 * (1 - self.b + self.b * dl / self.avgdl)
+                )
+            if s > 0:
+                scored.append((i, s))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [(self.ids[i], self.texts[i], self.metas[i], sc) for i, sc in scored[:n]]
+
+
 def _trim_history(history: list[dict]) -> list[dict]:
     """Keep the most recent turns within the memory budget (~4 chars/token)."""
     budget = MEMORY_TOKEN_LIMIT * 4
@@ -232,13 +295,15 @@ def _trim_history(history: list[dict]) -> list[dict]:
 
 class RAGEngine:
     """Persistent, session-aware, version-aware RAG engine."""
-
     def __init__(self):
         self._index: Optional[VectorStoreIndex] = None
         self._vector_store: Optional[ChromaVectorStore] = None
         self._chroma_collection = None
         self._reranker = None
         self._title_llm = None
+        # Lexical (BM25) index over latest chunks, lazily (re)built and cached.
+        self._bm25 = None
+        self._bm25_dirty = True
         self._write_lock = threading.Lock()
         self._setup()
 
@@ -353,6 +418,7 @@ class RAGEngine:
             if up_ids:
                 self._chroma_collection.update(ids=up_ids, metadatas=up_mds)
                 print(f"[RAG] Backfilled {len(up_ids)} chunks (rag_doc_id / version / owner / scope).")
+            self._invalidate_bm25()
         except Exception as e:
             print(f"[RAG] backfill skipped ({e})")
 
@@ -386,6 +452,7 @@ class RAGEngine:
             if cids:
                 self._chroma_collection.update(ids=cids, metadatas=cmds)
                 print(f"[RAG] Reconciled is_latest on {len(cids)} chunks.")
+            self._invalidate_bm25()
         except Exception as e:
             print(f"[RAG] reconcile skipped ({e})")
 
@@ -457,45 +524,136 @@ class RAGEngine:
             return items
 
     def _relevant_nodes(self, message: str, scope: Optional[dict], user: Optional[dict]) -> list[dict]:
-        """Vector search with the visibility filter pushed into Chroma, then cutoff + rerank.
+        """Hybrid retrieval: dense vector search + lexical BM25, fused with
+        Reciprocal Rank Fusion, then optional rerank and a relevance filter.
 
-        When the query is explicitly scoped to attached documents, the relevance
-        cutoff is bypassed: the user has already chosen those documents, so we
-        return their best-matching chunks unconditionally (capped at top-k) rather
-        than risk filtering them all out and forcing an un-grounded answer."""
+        - Lexical BM25 catches exact terms/names/codes the vector search misses.
+        - Scoped (attached-doc) queries skip the cosine cutoff (the user chose the doc).
+        - Degrades gracefully to vector-only if the lexical index is unavailable."""
         where = self._visibility_where(user, scope)
-        scoped = bool(self._scoped_ids(scope))
+        scoped_ids = self._scoped_ids(scope)
+        scoped = bool(scoped_ids)
+
         try:
-            emb = Settings.embed_model.get_query_embedding(message)
-            n = max(RETRIEVE_TOP_K * 3, 12) if self._reranker else RETRIEVE_TOP_K
+            qemb = Settings.embed_model.get_query_embedding(message)
+        except Exception as e:
+            print(f"[RAG] embed error ({e})")
+            return []
+
+        by_id: dict[str, dict] = {}
+        vec_ids: list[str] = []
+        # 1) Dense vector candidates (visibility pushed into Chroma).
+        try:
             res = self._chroma_collection.query(
-                query_embeddings=[emb], n_results=n, where=where,
+                query_embeddings=[qemb], n_results=RETRIEVE_CANDIDATES, where=where,
                 include=["documents", "metadatas", "distances"],
             )
+            for cid, t, m, d in zip((res.get("ids") or [[]])[0], (res.get("documents") or [[]])[0],
+                                    (res.get("metadatas") or [[]])[0], (res.get("distances") or [[]])[0]):
+                by_id[cid] = {"id": cid, "text": t or "", "metadata": m or {},
+                              "score": 1.0 - float(d), "bm25": None}
+                vec_ids.append(cid)
         except Exception as e:
-            print(f"[RAG] retrieval error ({e}); where={where}")
+            print(f"[RAG] vector retrieval error ({e}); where={where}")
+
+        # 2) Lexical BM25 candidates (visibility filtered in Python).
+        lex_ids: list[str] = []
+        if HYBRID_ENABLED:
+            bm = self._ensure_bm25()
+            if bm is not None:
+                try:
+                    for cid, t, m, sc in bm.search(message, RETRIEVE_CANDIDATES * 3):
+                        if not self._visible(m, user, scoped_ids):
+                            continue
+                        if cid in by_id:
+                            by_id[cid]["bm25"] = sc
+                        else:
+                            by_id[cid] = {"id": cid, "text": t or "", "metadata": m or {},
+                                          "score": None, "bm25": sc}
+                        lex_ids.append(cid)
+                        if len(lex_ids) >= RETRIEVE_CANDIDATES:
+                            break
+                except Exception as e:
+                    print(f"[RAG] bm25 search error ({e})")
+
+        if not by_id:
+            print(f"[RAG] retrieve: where={where} scoped={scoped} raw=0 (no hits)")
             return []
-        docs = (res.get("documents") or [[]])[0]
-        metas = (res.get("metadatas") or [[]])[0]
-        dists = (res.get("distances") or [[]])[0]
-        items = [
-            {"text": t or "", "metadata": m or {}, "score": 1.0 - float(d)}
-            for t, m, d in zip(docs, metas, dists)
-        ]
-        raw = len(items)
-        top_raw = round(max((it["score"] for it in items), default=0.0), 4)
-        # Scoped queries skip the cutoff (the document choice is the relevance signal).
-        kept = items if scoped else [it for it in items if it["score"] >= RELEVANCE_CUTOFF]
-        after_cutoff = len(kept)
+
+        # 3) Reciprocal Rank Fusion of the two rankings.
+        rv = {cid: i for i, cid in enumerate(vec_ids)}
+        rl = {cid: i for i, cid in enumerate(lex_ids)}
+        K = 60
+        fused = sorted(
+            by_id.values(),
+            key=lambda it: (1.0 / (K + rv[it["id"]]) if it["id"] in rv else 0.0)
+                           + (1.0 / (K + rl[it["id"]]) if it["id"] in rl else 0.0),
+            reverse=True,
+        )
+
+        # 4) Cosine score for BM25-only hits (for the cutoff + source display).
+        missing = [it for it in fused if it["score"] is None]
+        if missing:
+            try:
+                got = self._chroma_collection.get(ids=[it["id"] for it in missing], include=["embeddings"])
+                emap = dict(zip(got.get("ids", []) or [], got.get("embeddings", []) or []))
+                for it in missing:
+                    e = emap.get(it["id"])
+                    it["score"] = _cosine(qemb, e) if e is not None else RELEVANCE_CUTOFF
+            except Exception as e:
+                print(f"[RAG] embedding fetch error ({e})")
+                for it in missing:
+                    it["score"] = RELEVANCE_CUTOFF
+
+        raw = len(fused)
+        top_raw = round(max((it["score"] for it in fused), default=0.0), 4)
+
+        # 5) Relevance filter: keep lexical (exact-term) hits OR vector hits above
+        # the cutoff. Scoped queries keep everything (the document choice is the signal).
+        if scoped:
+            kept = fused
+        else:
+            kept = [it for it in fused if it.get("bm25") is not None or (it["score"] or 0) >= RELEVANCE_CUTOFF]
+
         kept = self._rerank(kept, message)
         result = kept[:RETRIEVE_TOP_K]
-        # Diagnostics: pinpoint where retrieval drops to zero (filter vs. cutoff).
-        # `raw == 0` => the visibility `where` matched no chunk (check is_latest/
-        # scope/owner_id metadata); `raw > 0 but after_cutoff == 0` => the best
-        # match scored below RELEVANCE_CUTOFF (compare with top_raw and lower it).
-        print(f"[RAG] retrieve: where={where} scoped={scoped} raw={raw} top_score={top_raw} "
-              f"after_cutoff={after_cutoff} returned={len(result)} cutoff={RELEVANCE_CUTOFF}")
+        print(f"[RAG] retrieve: where={where} scoped={scoped} vec={len(vec_ids)} bm25={len(lex_ids)} "
+              f"fused={raw} top_score={top_raw} kept={len(kept)} returned={len(result)} "
+              f"cutoff={RELEVANCE_CUTOFF}")
         return result
+
+    # ─── Lexical index (BM25) ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _visible(md: dict, user: Optional[dict], scoped_ids: list[str]) -> bool:
+        """Python mirror of _visibility_where, for filtering BM25 results."""
+        if not md.get("is_latest"):
+            return False
+        if scoped_ids and md.get("rag_doc_id") not in scoped_ids:
+            return False
+        if user and user.get("role") != "admin":
+            if md.get("scope") != "org" and md.get("owner_id") != user.get("id"):
+                return False
+        return True
+
+    def _invalidate_bm25(self):
+        self._bm25_dirty = True
+
+    def _ensure_bm25(self):
+        """(Re)build the lexical index over all latest chunks when stale."""
+        if self._bm25 is not None and not self._bm25_dirty:
+            return self._bm25
+        try:
+            got = self._chroma_collection.get(where={"is_latest": True},
+                                              include=["documents", "metadatas"])
+            ids = got.get("ids", []) or []
+            self._bm25 = _BM25(ids, got.get("documents", []) or [], got.get("metadatas", []) or [])
+            self._bm25_dirty = False
+            print(f"[RAG] BM25 lexical index built over {len(ids)} latest chunks.")
+        except Exception as e:
+            print(f"[RAG] BM25 build failed ({e}); vector-only this query")
+            self._bm25, self._bm25_dirty = None, False
+        return self._bm25
 
     @staticmethod
     def _context_block(items: list[dict]) -> str:
@@ -681,6 +839,7 @@ class RAGEngine:
                 })
             self._index.insert_nodes(nodes)
             self._demote_other_versions(document_id, keep_version=version)
+            self._invalidate_bm25()
             return len(nodes)
 
     def _set_latest_for_document(self, document_id: str, latest_version):
@@ -697,6 +856,7 @@ class RAGEngine:
                     cids.append(cid); cmds.append(md)
             if cids:
                 self._chroma_collection.update(ids=cids, metadatas=cmds)
+            self._invalidate_bm25()
         except Exception as e:
             print(f"[RAG] set-latest error ({e})")
 
@@ -718,6 +878,7 @@ class RAGEngine:
         with self._write_lock:
             try:
                 self._chroma_collection.delete(where={"rag_doc_id": document_id})
+                self._invalidate_bm25()
             except Exception as e:
                 print(f"[RAG] purge error ({e})")
 
