@@ -31,6 +31,7 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [confirmId, setConfirmId] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
+  const [docsOnly, setDocsOnly] = useState(false);   // strict RAG: answer only from documents
   const [toast, setToast] = useState<{ msg: string; sev: 'success' | 'error' | 'info'; sid?: string } | null>(null);
 
   // Streaming lives ABOVE this page (in a layout-level provider), so a running
@@ -173,12 +174,12 @@ export default function ChatPage() {
 
       startStream({
         url: api.chatUrl(sid),
-        body: { message: text, scope, attachments: atts.length ? atts : undefined },
+        body: { message: text, scope, attachments: atts.length ? atts : undefined, strict: docsOnly || undefined },
         sid,
         firstTurn,
       });
     },
-    [currentId, messages.length, pendingAttachments, isActive, startStream, refreshSessions, clearPending]
+    [currentId, messages.length, pendingAttachments, isActive, startStream, refreshSessions, clearPending, docsOnly]
   );
 
   const handleEdit = useCallback(
@@ -347,6 +348,8 @@ export default function ChatPage() {
           streaming={!!cur?.active}
           uploading={uploading}
           attachments={pendingAttachments}
+          strict={docsOnly}
+          onStrictChange={setDocsOnly}
           onSend={handleSend}
           onStop={handleStop}
           onAttach={handleAttach}

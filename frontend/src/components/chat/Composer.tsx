@@ -13,6 +13,7 @@ import StopRoundedIcon from '@mui/icons-material/StopRounded';
 import AttachFileRoundedIcon from '@mui/icons-material/AttachFileRounded';
 import CheckCircleRoundedIcon from '@mui/icons-material/CheckCircleRounded';
 import ErrorOutlineRoundedIcon from '@mui/icons-material/ErrorOutlineRounded';
+import FactCheckRoundedIcon from '@mui/icons-material/FactCheckRounded';
 import type { IndexingStatus, PendingAttachment } from '@/lib/types';
 
 const ACCEPT = '.pdf,.txt,.docx,.md,.csv,.xlsx';
@@ -23,6 +24,8 @@ export default function Composer({
   streaming,
   uploading,
   attachments = [],
+  strict = false,
+  onStrictChange,
   onSend,
   onStop,
   onAttach,
@@ -31,6 +34,8 @@ export default function Composer({
   streaming: boolean;
   uploading: boolean;
   attachments?: PendingAttachment[];
+  strict?: boolean;
+  onStrictChange?: (v: boolean) => void;
   onSend: (text: string) => void;
   onStop: () => void;
   onAttach: (files: FileList) => void;
@@ -54,6 +59,19 @@ export default function Composer({
 
   return (
     <Box sx={{ px: { xs: 2, md: 6 }, pb: 2.5, pt: 1 }}>
+      <Box sx={{ maxWidth: 900, mx: 'auto', mb: 1, display: 'flex', justifyContent: 'flex-end' }}>
+        <Tooltip title="Mode RAG strict : répondre uniquement à partir des documents (refuse si l'information n'y figure pas).">
+          <Chip
+            icon={<FactCheckRoundedIcon />}
+            label="Documents uniquement"
+            color={strict ? 'primary' : 'default'}
+            variant={strict ? 'filled' : 'outlined'}
+            onClick={() => onStrictChange?.(!strict)}
+            size="small"
+            sx={{ cursor: 'pointer' }}
+          />
+        </Tooltip>
+      </Box>
       {attachments.length > 0 && (
         <Box sx={{ maxWidth: 900, mx: 'auto', mb: 1, display: 'flex', flexWrap: 'wrap', gap: 0.75 }}>
           {attachments.map((a) => (

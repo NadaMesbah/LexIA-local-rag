@@ -222,7 +222,14 @@ def test_sources_scoped_bypasses_floor():
     assert names(src) == ["attached.pdf"]
 
 
-def test_sources_capped():
+def test_source_display_top_k_default_one():
+    # Precision-first: by default only the single best source card is shown.
+    items = [_item("a.pdf", 0.60), _item("b.pdf", 0.58), _item("c.pdf", 0.56)]
+    assert len(RAGEngine._format_sources(items)) == 1
+
+
+def test_sources_cap_respects_top_k_and_source_max(monkeypatch):
+    monkeypatch.setattr(rg, "SOURCE_DISPLAY_TOP_K", 10)
     items = [_item(f"{i}.pdf", 0.60) for i in range(8)]
     assert len(RAGEngine._format_sources(items)) == rg.SOURCE_MAX
 
@@ -242,16 +249,35 @@ def test_lexical_only_chunk_is_not_displayed_as_source():
     assert names(RAGEngine._format_sources(pool)) == ["Weather.pdf"]
 
 
-def test_ensure_one_surfaces_grounded_source_when_all_below_floor():
-    # Grounded Arabic answer: chunks below the display floor → no card normally,
-    # but ensure_one shows the single best one so it isn't flagged "hors documents".
-    ar = [_item("AL-ALAM2026-AR.pdf", 0.33), _item("AL-ALAM2026-AR.pdf", 0.31)]
-    assert RAGEngine._format_sources(ar) == []
-    assert names(RAGEngine._format_sources(ar, ensure_one=True)) == ["AL-ALAM2026-AR.pdf"]
+def test_ensure_one_rejects_weak_or_unrelated_source(monkeypatch):
+    # ensure_one must NEVER force an unrelated/weak source (the ML-for-Arabic bug).
+    monkeypatch.setattr(rg, "ENSURE_ONE_MIN_SCORE", 0.50)
+    weak = [_item("Machine_Learning_Ch1.pdf", 0.3919)]      # high-ish cosine, still < 0.50
+    assert RAGEngine._format_sources(weak, ensure_one=True) == []
+
+
+def test_ensure_one_forces_only_a_strong_source(monkeypatch):
+    monkeypatch.setattr(rg, "ENSURE_ONE_MIN_SCORE", 0.50)
+    strong = [_item("AL-ALAM2026-AR.pdf", 0.61)]
+    assert names(RAGEngine._format_sources(strong, ensure_one=True)) == ["AL-ALAM2026-AR.pdf"]
+
+
+def test_ensure_one_never_forces_lexical_only(monkeypatch):
+    monkeypatch.setattr(rg, "ENSURE_ONE_MIN_SCORE", 0.10)   # low floor on purpose
+    lex = [_lex("Machine_Learning_Ch4.pdf", 0.20, 5.0)]     # lexical-only, big BM25
+    assert RAGEngine._format_sources(lex, ensure_one=True) == []
+
+
+def test_scripts_detects_foreign_script_injection():
+    # Used to reject a query rewrite that injects Latin ('Mercer') into Arabic.
+    assert "latin" not in rg._scripts("من وصف حالة الاحتقان بهذا المركب؟")
+    assert "latin" in rg._scripts("من وصف بالم Mercer الكيمادو؟")
+    assert "arabic" in rg._scripts("المركب السياحي كيمادو")
 
 
 def test_display_is_rerank_aware(monkeypatch):
     monkeypatch.setattr(rg, "SOURCE_DISPLAY_MIN_RERANK", 0.3)
+    monkeypatch.setattr(rg, "SOURCE_DISPLAY_TOP_K", 5)   # see more than the top-1 card
     rr = [
         {"id": "c", "score": 0.20, "rerank": 0.95, "text": "t", "metadata": {"file_name": "C.pdf"}},
         {"id": "a", "score": 0.55, "rerank": 0.80, "text": "t", "metadata": {"file_name": "A.pdf"}},

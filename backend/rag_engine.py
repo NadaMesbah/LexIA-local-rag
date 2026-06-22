@@ -127,6 +127,15 @@ SOURCE_MAX       = int(os.getenv("SOURCE_MAX", "4"))
 SOURCE_DISPLAY_MIN_SCORE  = float(os.getenv("SOURCE_DISPLAY_MIN_SCORE", str(SOURCE_MIN_SCORE)))
 SOURCE_DISPLAY_MIN_RERANK = float(os.getenv("SOURCE_DISPLAY_MIN_RERANK", "0.0"))
 SOURCE_DISPLAY_REQUIRE_RERANK = os.getenv("SOURCE_DISPLAY_REQUIRE_RERANK", "false").lower() in ("1", "true", "yes")
+# Max source cards to show. Default 1 favours PRECISION (one correct source beats
+# three where two are wrong) — raise it if you want more recall in the cards.
+SOURCE_DISPLAY_TOP_K = int(os.getenv("SOURCE_DISPLAY_TOP_K", "1"))
+# When a grounded answer has no card clearing the strict bar, optionally force the
+# single best one. OFF by default: forcing a weak/unrelated source is worse than
+# showing none. When ON it is still gated by ENSURE_ONE_MIN_SCORE (never forces a
+# weak or lexical-only chunk).
+SOURCE_ENSURE_ONE = os.getenv("SOURCE_ENSURE_ONE", "false").lower() in ("1", "true", "yes")
+ENSURE_ONE_MIN_SCORE = float(os.getenv("ENSURE_ONE_MIN_SCORE", "0.50"))
 
 # Rewrite follow-up questions into standalone retrieval queries using recent
 # conversation, so anaphora ("this complex", "ce projet", "بهذا المركب") resolves
@@ -213,6 +222,24 @@ _CJK = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
 _AR = re.compile(r"[\u0600-\u06ff]")
 _CYR = re.compile(r"[\u0400-\u04ff]")
 _FR_ACC = re.compile(r"[àâçéèêëîïôûùüœ]")
+
+
+def _scripts(text: str) -> set:
+    """The set of writing systems present in `text` (latin/arabic/cyrillic/cjk).
+    Used to reject a query rewrite that injects a foreign script (e.g. the Latin
+    word 'Mercer' leaking from a corrupted assistant answer into an Arabic query)."""
+    out = set()
+    for ch in text or "":
+        o = ord(ch)
+        if "a" <= ch.lower() <= "z":
+            out.add("latin")
+        elif 0x0600 <= o <= 0x06FF or 0x0750 <= o <= 0x077F or 0x08A0 <= o <= 0x08FF:
+            out.add("arabic")
+        elif 0x0400 <= o <= 0x04FF:
+            out.add("cyrillic")
+        elif 0x4E00 <= o <= 0x9FFF or 0x3400 <= o <= 0x4DBF:
+            out.add("cjk")
+    return out
 
 
 def _detect_language(text: str) -> Optional[str]:
@@ -1073,31 +1100,49 @@ class RAGEngine:
         """Rewrite a follow-up into a standalone retrieval query using recent turns,
         resolving anaphora (e.g. 'بهذا المركب' → 'المركب السياحي كيمادو'). Returns the
         ORIGINAL message on the first turn, when disabled, or whenever the rewrite
-        looks unsafe (empty, far too long, or a different language). Used for
-        retrieval only — never shown and never used for the final answer."""
+        looks unsafe. Used for retrieval only — never shown, never used to answer.
+
+        Hardened against contamination: prior assistant answers can be wrong/corrupted
+        (e.g. a hallucinated 'Mercer'), so the rewrite is REJECTED if it introduces a
+        foreign script, contains corruption, drifts off-topic, or is malformed — in
+        which case we fall back to the (unmodified) original question."""
         if not (QUERY_REWRITE_ENABLED and history):
             return message
         try:
             recent = _trim_history(history)[-6:]
             if not recent:
                 return message
+            # Clean each turn so corrupted glyphs (CJK/control) don't seed the rewrite.
             convo = "\n".join(
-                f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}"
+                f"{'User' if m['role'] == 'user' else 'Assistant'}: {_clean_context_text(m['content'])}"
                 for m in recent
             )[:2000]
             prompt = QUERY_REWRITE_PROMPT.format(history=convo, question=message)
             resp = (self._title_llm or Settings.llm).complete(prompt.strip())
             rewritten = ((resp.text or "").strip().strip('"').strip())
-            rewritten = rewritten.splitlines()[0].strip() if rewritten else ""
-            # Safety guards: keep retrieval robust if the rewrite misbehaves.
+            rewritten = _clean_context_text(rewritten.splitlines()[0]) if rewritten else ""
+
+            def reject(reason):
+                print(f"[RAG] query-rewrite REJECTED ({reason}): {message!r} -> {rewritten!r}")
+                return message
+
             if not rewritten or rewritten.lower() == message.strip().lower():
                 return message
             if len(rewritten) > len(message) * 4 + 120:
-                return message
+                return reject("too long")
+            # Anti-contamination: the rewrite must not introduce a writing system
+            # absent from the user's question (this is what catches 'Mercer').
+            new_scripts = _scripts(rewritten) - _scripts(message)
+            if new_scripts:
+                return reject(f"introduced foreign script {sorted(new_scripts)}")
             lm, lr = _detect_language(message), _detect_language(rewritten)
             if lm and lr and lm != lr:
-                return message
-            print(f"[RAG] query-rewrite: {message!r} -> {rewritten!r}")
+                return reject(f"language drift {lm}->{lr}")
+            # Must stay on-topic: share at least one content token with the question.
+            q_terms, r_terms = set(_content_tokens(message)), set(_content_tokens(rewritten))
+            if q_terms and not (q_terms & r_terms):
+                return reject("no shared content token with the question")
+            print(f"[RAG] query-rewrite ACCEPTED: {message!r} -> {rewritten!r}")
             return rewritten
         except Exception as e:
             print(f"[RAG] query-rewrite error ({e})")
@@ -1171,14 +1216,17 @@ class RAGEngine:
             yield ("sources", [])
             return
 
-        # Sources to SHOW. Non-strict + grounded: guarantee the single best supporting
-        # chunk is shown (ensure_one) so a document-grounded answer is never flagged
-        # "hors documents" merely because cosine was modest (typical for Arabic).
+        # Sources to SHOW. Non-strict + grounded but nothing cleared the strict bar:
+        # only force a card if SOURCE_ENSURE_ONE is on (and the candidate is genuinely
+        # relevant — see _select_source_items). Otherwise show none rather than risk a
+        # wrong source.
         if strict or display_strict or not use_docs:
             display_sources = display_strict
-        else:
+        elif SOURCE_ENSURE_ONE:
             display_sources = self._format_sources(items, scoped=scoped, query=retrieval_query,
                                                    reranked_applied=reranked_applied, ensure_one=True)
+        else:
+            display_sources = display_strict   # [] — honest, never a forced wrong source
         grounded = bool(display_sources) or (scoped and use_docs)
 
         base_prompt = SYSTEM_PROMPT_STRICT if strict else SYSTEM_PROMPT
@@ -1255,6 +1303,9 @@ class RAGEngine:
         use_rerank = reranked_applied and any(it.get("rerank") is not None for it in items)
         ranked = sorted(items, key=lambda it: RAGEngine._source_eff(it, use_rerank), reverse=True)
         top = RAGEngine._source_eff(ranked[0], use_rerank)
+        # Cards favour PRECISION: cap to SOURCE_DISPLAY_TOP_K for global search
+        # (default 1). Scoped queries may show up to SOURCE_MAX of the chosen docs.
+        limit = SOURCE_MAX if scoped else min(SOURCE_MAX, max(1, SOURCE_DISPLAY_TOP_K))
 
         chosen, seen = [], set()
         for it in ranked:
@@ -1279,15 +1330,30 @@ class RAGEngine:
                 continue
             seen.add(key)
             chosen.append(it)
-            if len(chosen) >= SOURCE_MAX:
+            if len(chosen) >= limit:
                 break
 
         if not chosen and ensure_one and not scoped and ranked:
-            # Grounded answer but nothing cleared the strict display bar (common for
-            # Arabic, where cosine runs low): show the single best-ranked chunk so the
-            # reply isn't mislabelled "hors documents". The query-relevant snippet
-            # keeps the card informative. Enable the reranker for precise scoring.
-            chosen.append(ranked[0])
+            # Grounded answer but nothing cleared the strict display bar. Optionally
+            # force the single best chunk — but ONLY if it is genuinely relevant, so
+            # we never surface an unrelated file (e.g. an ML PDF for an Arabic news
+            # question). Otherwise show nothing (honest 'hors documents' / refuse).
+            best = ranked[0]
+            e = RAGEngine._source_eff(best, use_rerank)
+            reason = None
+            if RAGEngine._is_lexical_only(best):
+                reason = "best candidate is lexical-only (no semantic support)"
+            elif use_rerank:
+                if SOURCE_DISPLAY_MIN_RERANK > 0 and e < SOURCE_DISPLAY_MIN_RERANK:
+                    reason = f"best rerank {round(e, 4)} < SOURCE_DISPLAY_MIN_RERANK {SOURCE_DISPLAY_MIN_RERANK}"
+            elif e < ENSURE_ONE_MIN_SCORE:
+                reason = f"best cosine {round(e, 4)} < ENSURE_ONE_MIN_SCORE {ENSURE_ONE_MIN_SCORE}"
+            if reason:
+                print(f"[RAG] ensure_one: NOT forcing a source — {reason}")
+            else:
+                fn = (best.get("metadata") or {}).get("file_name")
+                print(f"[RAG] ensure_one: forcing best source ({fn}, eff={round(e, 4)})")
+                chosen.append(best)
         return chosen
 
     @staticmethod
