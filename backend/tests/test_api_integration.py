@@ -16,7 +16,9 @@ import rag_engine
 
 class FakeEngine:
     def __init__(self):
-        pass
+        # Records the args of the most recent stream_chat call so tests can assert
+        # what the chat / edit / regenerate endpoints forwarded (scope + strict).
+        self.last_call = None
 
     def get_status(self):
         return {"status": "ready", "doc_count": 0, "collection_name": "test",
@@ -40,7 +42,7 @@ class FakeEngine:
     def generate_title(self, message):
         return "Titre test"
 
-    def _relevant_nodes(self, message, scope, user, debug=False):
+    def _relevant_nodes(self, message, scope=None, user=None, debug=False):
         # Mirrors the real engine's contract: a plain list of nodes normally, but a
         # diagnostics dict (summary + items) when debug=True (used by /debug/retrieve).
         if debug:
@@ -49,6 +51,8 @@ class FakeEngine:
         return []
 
     async def stream_chat(self, message, history, scope=None, user=None, strict=None):
+        self.last_call = {"message": message, "history": history, "scope": scope,
+                          "user": user, "strict": strict}
         yield ("token", "Réponse de test.")
         yield ("sources", [])
 
@@ -107,7 +111,12 @@ def test_register_requires_email_and_login_is_email_based(client):
 def test_debug_endpoint_is_admin_only(client):
     admin = _login(client, "admin@test.local", "testadminpw")
     r = client.post("/debug/retrieve", headers=admin, json={"message": "hello"})
-    assert r.status_code == 200 and "items" in r.json()
+    assert r.status_code == 200
+    body = r.json()
+    # Diagnostics shape returned by /debug/retrieve (built from the engine's
+    # debug=True diagnostics object).
+    assert {"query", "strict_default", "summary", "count", "items"}.issubset(body)
+    assert body["count"] == len(body["items"]) and isinstance(body["summary"], dict)
 
     _register(client, username="user1", email="u@x.com")
     user = _login(client, "u@x.com", "password123")
@@ -148,3 +157,102 @@ def test_chat_round_trip_persists_answer(client):
     detail = client.get(f"/sessions/{sid}", headers=h).json()
     roles = [m["role"] for m in detail["messages"]]
     assert "user" in roles and "assistant" in roles
+
+
+
+# ─── Edit / regenerate preserve strict + scope (vs a normal send) ─────────────
+# These assert what the endpoints FORWARD to the engine (FakeEngine.last_call),
+# which is exactly what the production fix guarantees: edit & regenerate use the
+# same effective strict value and active document scope as a normal send.
+
+def _new_session(client, h):
+    return client.post("/sessions", headers=h, json={}).json()["id"]
+
+
+def _first_user_message_id(client, h, sid):
+    msgs = client.get(f"/sessions/{sid}", headers=h).json()["messages"]
+    return next(m["id"] for m in msgs if m["role"] == "user")
+
+
+def test_edit_preserves_strict_and_scope(client):
+    h = _login(client, "admin@test.local", "testadminpw")
+    sid = _new_session(client, h)
+    client.post(f"/sessions/{sid}/chat", headers=h, json={"message": "Question 1"})
+    uid = _first_user_message_id(client, h, sid)
+
+    r = client.post(f"/sessions/{sid}/messages/{uid}/edit", headers=h,
+                    json={"message": "Question éditée", "strict": True,
+                          "scope": {"type": "document", "ids": ["docA"]}})
+    assert r.status_code == 200
+    call = main.rag.last_call
+    assert call["message"] == "Question éditée"
+    assert call["strict"] is True                                   # strict preserved
+    assert call["scope"] == {"type": "document", "ids": ["docA"]}    # active scope preserved
+
+
+def test_edit_global_strict_when_no_scope_selected(client):
+    h = _login(client, "admin@test.local", "testadminpw")
+    sid = _new_session(client, h)
+    client.post(f"/sessions/{sid}/chat", headers=h, json={"message": "Q"})
+    uid = _first_user_message_id(client, h, sid)
+
+    # Documents uniquement ON but no document selected -> global strict RAG (no scope).
+    r = client.post(f"/sessions/{sid}/messages/{uid}/edit", headers=h,
+                    json={"message": "Q2", "strict": True})
+    assert r.status_code == 200
+    assert main.rag.last_call["strict"] is True
+    assert main.rag.last_call["scope"] is None      # global RAG, not a forced doc scope
+
+
+def test_edit_general_mode_when_strict_off(client):
+    h = _login(client, "admin@test.local", "testadminpw")
+    sid = _new_session(client, h)
+    client.post(f"/sessions/{sid}/chat", headers=h, json={"message": "Q"})
+    uid = _first_user_message_id(client, h, sid)
+
+    # Documents uniquement OFF -> the client omits strict; the endpoint must not
+    # force documents-only mode (strict stays None -> server default applies).
+    r = client.post(f"/sessions/{sid}/messages/{uid}/edit", headers=h, json={"message": "Q2"})
+    assert r.status_code == 200
+    assert main.rag.last_call["strict"] is None
+    assert main.rag.last_call["scope"] is None
+
+
+def test_regenerate_preserves_explicit_strict_and_scope(client):
+    h = _login(client, "admin@test.local", "testadminpw")
+    sid = _new_session(client, h)
+    client.post(f"/sessions/{sid}/chat", headers=h, json={"message": "Q"})
+    uid = _first_user_message_id(client, h, sid)
+
+    r = client.post(f"/sessions/{sid}/messages/{uid}/regenerate", headers=h,
+                    json={"strict": True, "scope": {"type": "document", "ids": ["docB"]}})
+    assert r.status_code == 200
+    call = main.rag.last_call
+    assert call["message"] == "Q"                                   # same question reused
+    assert call["strict"] is True
+    assert call["scope"] == {"type": "document", "ids": ["docB"]}
+
+
+def test_regenerate_reconstructs_scope_from_attachments_when_body_empty(client):
+    """Backward-compatible fallback: with no scope in the body, regenerate rebuilds
+    the document scope from the original message's attachments."""
+    h = _login(client, "admin@test.local", "testadminpw")
+    sid = _new_session(client, h)
+    client.post(f"/sessions/{sid}/chat", headers=h,
+                json={"message": "Q", "attachments": [{"id": "docX", "filename": "x.pdf"}]})
+    uid = _first_user_message_id(client, h, sid)
+
+    r = client.post(f"/sessions/{sid}/messages/{uid}/regenerate", headers=h, json={})
+    assert r.status_code == 200
+    assert main.rag.last_call["scope"] == {"type": "document", "ids": ["docX"]}
+
+
+def test_regenerate_empty_body_no_attachments_is_global(client):
+    h = _login(client, "admin@test.local", "testadminpw")
+    sid = _new_session(client, h)
+    client.post(f"/sessions/{sid}/chat", headers=h, json={"message": "Q"})
+    uid = _first_user_message_id(client, h, sid)
+
+    r = client.post(f"/sessions/{sid}/messages/{uid}/regenerate", headers=h, json={})
+    assert r.status_code == 200
+    assert main.rag.last_call["scope"] is None       # global RAG, no fake doc scope

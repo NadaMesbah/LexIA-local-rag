@@ -440,3 +440,36 @@ def test_final_select_rerank_on_trusts_reranker_order_no_premature_cutoff():
 def test_final_select_scoped_keeps_all():
     pool = [_cand("a", score=0.55), _cand("c", score=0.05)]
     assert len(RAGEngine._final_select(pool, scoped=True, reranked_applied=False)) == 2
+
+
+
+# ─── General-answer source guarantees (area 5) ────────────────────────────────
+# Consolidated assertions of the three source-display guarantees, expressed at the
+# layer that actually decides them (no Ollama needed):
+#   - a general answer (nothing retrieved) shows NO document source;
+#   - a strict refusal is detected so stream_chat drops its source cards;
+#   - a genuine document-grounded answer keeps its correct source.
+
+def test_general_answer_shows_no_document_source():
+    assert RAGEngine._format_sources([]) == []                      # nothing retrieved -> no cards
+
+
+def test_strict_refusal_is_detected_so_sources_are_dropped():
+    # stream_chat hides sources when the final answer matches one of these refusals.
+    assert rg._is_refusal("Je n’ai pas trouvé cette information dans les documents fournis.") is True
+    assert rg._is_refusal("I could not find this information in the provided documents.") is True
+    assert rg._is_refusal("لم أجد هذه المعلومة في الوثائق المقدمة.") is True
+
+
+def test_document_grounded_answer_keeps_correct_source():
+    items = [_item("AL-ALAM2026-AR.pdf", 0.55), _item("AL-ALAM2026-AR.pdf", 0.49)]
+    assert names(RAGEngine._format_sources(items)) == ["AL-ALAM2026-AR.pdf"]
+
+
+def test_general_answer_not_grounded_so_sources_would_be_hidden():
+    # Non-strict path: a general answer that barely overlaps the retrieved context
+    # is treated as ungrounded by stream_chat -> sources hidden.
+    answer = ("Le machine learning permet à un programme d'apprendre des motifs à "
+              "partir de données sans être explicitement programmé.")
+    ctx = ["Le Maroc affronte l'Écosse au Mondial 2026, victoire 1-0 au groupe C."]
+    assert rg._answer_grounded(answer, ctx, rg.GROUNDING_MIN_OVERLAP) is False
