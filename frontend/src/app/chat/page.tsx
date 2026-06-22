@@ -218,9 +218,16 @@ export default function ChatPage() {
     [currentId, messages.length, pendingAttachments, isActive, startStream, refreshSessions, clearPending, strictByConv, scopeByConv]
   );
 
+  // Edit and regenerate must reuse the SAME effective strict value and active
+  // document scope as a normal send (handleSend), read from the per-conversation
+  // state. Without this, editing/regenerating silently dropped "Documents
+  // uniquement" and the sticky document scope, falling back to server defaults.
   const handleEdit = useCallback(
     async (id: string, text: string) => {
       if (!currentId || !text || isActive(currentId)) return;
+      const effStrict = strictByConv[currentId] ?? false;
+      const sticky = scopeByConv[currentId] || [];
+      const scope = sticky.length ? { type: 'document', ids: sticky.map((a) => a.id) } : undefined;
       setMessages((prev) => {
         const i = prev.findIndex((m) => m.id === id);
         if (i < 0) return prev;
@@ -228,21 +235,32 @@ export default function ChatPage() {
         copy[i] = { ...copy[i], content: text };
         return copy;
       });
-      startStream({ url: api.editUrl(currentId, id), body: { message: text }, sid: currentId });
+      startStream({
+        url: api.editUrl(currentId, id),
+        body: { message: text, scope, strict: effStrict || undefined },
+        sid: currentId,
+      });
     },
-    [currentId, isActive, startStream]
+    [currentId, isActive, startStream, strictByConv, scopeByConv]
   );
 
   const handleRegenerate = useCallback(
     async (userMessageId: string) => {
       if (!currentId || isActive(currentId)) return;
+      const effStrict = strictByConv[currentId] ?? false;
+      const sticky = scopeByConv[currentId] || [];
+      const scope = sticky.length ? { type: 'document', ids: sticky.map((a) => a.id) } : undefined;
       setMessages((prev) => {
         const i = prev.findIndex((m) => m.id === userMessageId);
         return i < 0 ? prev : prev.slice(0, i + 1);
       });
-      startStream({ url: api.regenerateUrl(currentId, userMessageId), body: {}, sid: currentId });
+      startStream({
+        url: api.regenerateUrl(currentId, userMessageId),
+        body: { scope, strict: effStrict || undefined },
+        sid: currentId,
+      });
     },
-    [currentId, isActive, startStream]
+    [currentId, isActive, startStream, strictByConv, scopeByConv]
   );
 
   const handleSwitchVersion = useCallback(

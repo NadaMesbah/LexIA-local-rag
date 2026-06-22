@@ -435,6 +435,81 @@ def _is_refusal(answer: str) -> bool:
     return bool(a.strip()) and any(m in a for m in _REFUSAL_MARKERS)
 
 
+# ─── Small talk / greeting detection (deterministic, language-aware) ──────────
+# Obvious greetings / thanks / social small talk must be answered NATURALLY without
+# retrieving documents and without showing any source card — even when "Documents
+# uniquement" (strict) is on. This is deliberately conservative: it only fires for
+# short messages made ENTIRELY of greeting/thanks vocabulary, or matching a known
+# small-talk phrase. Any real question — including short ones like "C'est quoi le
+# machine learning ?" — falls through to normal RAG (and strict refusal if needed).
+_SMALLTALK_WORDS = {
+    # French
+    "bonjour", "salut", "coucou", "bonsoir", "cc", "slt", "slut", "cv",
+    "merci", "mercii", "beaucoup", "bien", "bonne", "journee", "soiree", "ok",
+    # English
+    "hi", "hello", "hey", "yo", "sup", "hiya", "thanks", "thank", "thx", "ty",
+    "you", "u", "bye", "goodbye", "greetings", "lot",
+    # Arabic (already folded: أ→ا, ة→ه, ى→ي, diacritics stripped)
+    "مرحبا", "سلام", "السلام", "عليكم", "شكرا", "اهلا", "صباح", "مساء", "الخير",
+}
+_SMALLTALK_PHRASES = (
+    # French
+    "ca va", "comment ca va", "comment vas tu", "comment allez vous",
+    "tu vas bien", "vous allez bien", "ca roule", "quoi de neuf",
+    # English
+    "thank you", "thanks a lot", "how are you", "whats up", "what s up",
+    "how s it going", "how are things", "nice to meet",
+    # Arabic
+    "السلام عليكم", "وعليكم السلام", "كيف حالك", "كيف الحال", "كيفك",
+    "صباح الخير", "مساء الخير",
+)
+
+
+def _smalltalk_key(text: str) -> str:
+    """Fold a message for small-talk matching: strip accents/diacritics, fold Arabic
+    spelling variants and lowercase (é→e, ç→c, أ→ا …) so 'Ça va' matches 'ca va'."""
+    t = unicodedata.normalize("NFKD", text or "")
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    return _fold_arabic(_AR_DIACRITICS.sub("", t)).lower()
+
+
+def _is_small_talk(message: str) -> bool:
+    """True only for obvious, short greetings / thanks / social small talk. Used to
+    bypass retrieval AND source display (and to skip strict refusal) for messages
+    like 'Salut', 'Ça va ?', 'Merci', 'مرحبا', 'السلام عليكم'."""
+    tokens = re.findall(r"\w+", _smalltalk_key(message), re.UNICODE)
+    if not tokens or len(tokens) > 5:
+        return False
+    joined = " ".join(tokens)
+    if any(p in joined for p in _SMALLTALK_PHRASES):
+        return True
+    return all(tok in _SMALLTALK_WORDS for tok in tokens)
+
+
+# Tokens that mark a "thanks" message (vs a plain greeting), used to pick the right
+# instant reply on the fast path.
+_SMALLTALK_THANKS = ("merci", "thank", "thx", "شكر")
+
+
+def _smalltalk_reply(message: str, strict: bool = False) -> str:
+    """Instant, deterministic reply for the small-talk fast path (NO LLM call, NO
+    retrieval). Localized to the user's language; when 'Documents uniquement'
+    (strict) is on, the offer of help mentions the documents."""
+    lang = _detect_language(message) or "French"
+    is_thanks = any(w in _smalltalk_key(message) for w in _SMALLTALK_THANKS)
+    if lang == "Arabic":
+        doc = " في وثائقك" if strict else ""
+        return (f"على الرحب والسعة! كيف يمكنني مساعدتك{doc}؟" if is_thanks
+                else f"مرحباً! كيف يمكنني مساعدتك{doc}؟")
+    if lang == "English":
+        doc = " with your documents" if strict else ""
+        return (f"You're welcome! How can I help you{doc}?" if is_thanks
+                else f"Hello! How can I help you{doc}?")
+    doc = " avec vos documents" if strict else ""
+    return (f"Je vous en prie ! Comment puis-je vous aider{doc} ?" if is_thanks
+            else f"Salut ! Comment puis-je vous aider{doc} ?")
+
+
 def _tokenize(text: str) -> list[str]:
     # Normalize first so Arabic written as presentation forms matches a query typed
     # in standard Arabic. \w with re.UNICODE keeps Arabic/accented letters + digits.
@@ -1229,8 +1304,20 @@ class RAGEngine:
         hallucinating an unrelated answer.
         """
         loop = asyncio.get_event_loop()
-        directive = _language_directive(message)
         strict = STRICT_RAG_DEFAULT if strict is None else bool(strict)
+
+        # FAST PATH — obvious greetings / thanks / small talk are answered instantly
+        # in the user's language and return immediately, BEFORE any query rewrite,
+        # retrieval, embedding, BM25, rerank or strict-refusal logic. This keeps a
+        # simple "Salut"/"Hello" from waiting on the LLM-backed query contextualizer.
+        if _is_small_talk(message):
+            print("[RAG] chat: small-talk/greeting — fast path (no query rewrite, "
+                  "no retrieval, no sources)")
+            yield ("token", _smalltalk_reply(message, strict))
+            yield ("sources", [])
+            return
+
+        directive = _language_directive(message)
         scoped_ids = self._scoped_ids(scope)
         scoped = bool(scoped_ids)
 
