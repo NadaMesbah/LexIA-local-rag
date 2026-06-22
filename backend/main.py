@@ -57,6 +57,7 @@ from pydantic import BaseModel
 
 import db
 import auth
+import rag_engine
 from rag_engine import RAGEngine, SUPPORTED_EXTS
 
 app = FastAPI(title="RAG Local API", version="4.0.0")
@@ -598,25 +599,20 @@ async def regenerate_message(session_id: str, message_id: str,
 
 @app.post("/debug/retrieve")
 async def debug_retrieve(req: ChatRequest, user: dict = Depends(auth.admin_user)):
-    """Admin-only: inspect exactly what retrieval returns for a query (chunks,
-    scores, BM25 hits, metadata) — to diagnose grounding without guessing."""
+    """Admin-only: inspect exactly what retrieval returns for a query — per-chunk
+    dense/BM25/fused/rerank scores, retrieval source, whether each passed the final
+    filter and why, plus a summary (counts per stage + whether strict mode would
+    answer or refuse). Use it to diagnose grounding/Arabic failures without guessing."""
     import asyncio
     loop = asyncio.get_event_loop()
-    items = await loop.run_in_executor(None, rag._relevant_nodes, req.message, req.scope, user)
+    diag = await loop.run_in_executor(
+        None, lambda: rag._relevant_nodes(req.message, req.scope, user, debug=True))
     return {
-        "count": len(items),
-        "items": [
-            {
-                "score": round(float(it.get("score") or 0), 4),
-                "bm25": it.get("bm25"),
-                "filename": (it.get("metadata") or {}).get("file_name"),
-                "rag_doc_id": (it.get("metadata") or {}).get("rag_doc_id"),
-                "version": (it.get("metadata") or {}).get("version"),
-                "page": (it.get("metadata") or {}).get("page_label"),
-                "text": (it.get("text") or "")[:300],
-            }
-            for it in items
-        ],
+        "query": req.message,
+        "strict_default": bool(rag_engine.STRICT_RAG_DEFAULT),
+        "summary": diag.get("summary", {}),
+        "count": len(diag.get("items", [])),
+        "items": diag.get("items", []),
     }
 
 

@@ -13,6 +13,8 @@ import StopRoundedIcon from '@mui/icons-material/StopRounded';
 import AttachFileRoundedIcon from '@mui/icons-material/AttachFileRounded';
 import CheckCircleRoundedIcon from '@mui/icons-material/CheckCircleRounded';
 import ErrorOutlineRoundedIcon from '@mui/icons-material/ErrorOutlineRounded';
+import FactCheckRoundedIcon from '@mui/icons-material/FactCheckRounded';
+import FilterAltRoundedIcon from '@mui/icons-material/FilterAltRounded';
 import type { IndexingStatus, PendingAttachment } from '@/lib/types';
 
 const ACCEPT = '.pdf,.txt,.docx,.md,.csv,.xlsx';
@@ -23,6 +25,10 @@ export default function Composer({
   streaming,
   uploading,
   attachments = [],
+  strict = false,
+  onStrictChange,
+  scopeDocs = [],
+  onClearScope,
   onSend,
   onStop,
   onAttach,
@@ -31,6 +37,10 @@ export default function Composer({
   streaming: boolean;
   uploading: boolean;
   attachments?: PendingAttachment[];
+  strict?: boolean;
+  onStrictChange?: (v: boolean) => void;
+  scopeDocs?: { id: string; filename: string }[];
+  onClearScope?: () => void;
   onSend: (text: string) => void;
   onStop: () => void;
   onAttach: (files: FileList) => void;
@@ -54,6 +64,31 @@ export default function Composer({
 
   return (
     <Box sx={{ px: { xs: 2, md: 6 }, pb: 2.5, pt: 1 }}>
+      <Box sx={{ maxWidth: 900, mx: 'auto', mb: 1, display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+        {scopeDocs.length > 0 && (
+          <Tooltip title="Recherche limitée à ce(s) document(s) pour toute la conversation. Cliquez sur ✕ pour revenir à toute la base.">
+            <Chip
+              icon={<FilterAltRoundedIcon />}
+              label={scopeDocs.length === 1 ? `Portée : ${scopeDocs[0].filename}` : `Portée : ${scopeDocs.length} documents`}
+              color="secondary"
+              variant="filled"
+              onDelete={onClearScope}
+              size="small"
+            />
+          </Tooltip>
+        )}
+        <Tooltip title="Mode RAG strict : répondre uniquement à partir des documents (refuse si l'information n'y figure pas).">
+          <Chip
+            icon={<FactCheckRoundedIcon />}
+            label="Documents uniquement"
+            color={strict ? 'primary' : 'default'}
+            variant={strict ? 'filled' : 'outlined'}
+            onClick={() => onStrictChange?.(!strict)}
+            size="small"
+            sx={{ cursor: 'pointer' }}
+          />
+        </Tooltip>
+      </Box>
       {attachments.length > 0 && (
         <Box sx={{ maxWidth: 900, mx: 'auto', mb: 1, display: 'flex', flexWrap: 'wrap', gap: 0.75 }}>
           {attachments.map((a) => (
