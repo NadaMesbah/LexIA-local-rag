@@ -486,6 +486,30 @@ def _is_small_talk(message: str) -> bool:
     return all(tok in _SMALLTALK_WORDS for tok in tokens)
 
 
+# Tokens that mark a "thanks" message (vs a plain greeting), used to pick the right
+# instant reply on the fast path.
+_SMALLTALK_THANKS = ("merci", "thank", "thx", "شكر")
+
+
+def _smalltalk_reply(message: str, strict: bool = False) -> str:
+    """Instant, deterministic reply for the small-talk fast path (NO LLM call, NO
+    retrieval). Localized to the user's language; when 'Documents uniquement'
+    (strict) is on, the offer of help mentions the documents."""
+    lang = _detect_language(message) or "French"
+    is_thanks = any(w in _smalltalk_key(message) for w in _SMALLTALK_THANKS)
+    if lang == "Arabic":
+        doc = " في وثائقك" if strict else ""
+        return (f"على الرحب والسعة! كيف يمكنني مساعدتك{doc}؟" if is_thanks
+                else f"مرحباً! كيف يمكنني مساعدتك{doc}؟")
+    if lang == "English":
+        doc = " with your documents" if strict else ""
+        return (f"You're welcome! How can I help you{doc}?" if is_thanks
+                else f"Hello! How can I help you{doc}?")
+    doc = " avec vos documents" if strict else ""
+    return (f"Je vous en prie ! Comment puis-je vous aider{doc} ?" if is_thanks
+            else f"Salut ! Comment puis-je vous aider{doc} ?")
+
+
 def _tokenize(text: str) -> list[str]:
     # Normalize first so Arabic written as presentation forms matches a query typed
     # in standard Arabic. \w with re.UNICODE keeps Arabic/accented letters + digits.
@@ -1280,13 +1304,22 @@ class RAGEngine:
         hallucinating an unrelated answer.
         """
         loop = asyncio.get_event_loop()
-        directive = _language_directive(message)
         strict = STRICT_RAG_DEFAULT if strict is None else bool(strict)
+
+        # FAST PATH — obvious greetings / thanks / small talk are answered instantly
+        # in the user's language and return immediately, BEFORE any query rewrite,
+        # retrieval, embedding, BM25, rerank or strict-refusal logic. This keeps a
+        # simple "Salut"/"Hello" from waiting on the LLM-backed query contextualizer.
+        if _is_small_talk(message):
+            print("[RAG] chat: small-talk/greeting — fast path (no query rewrite, "
+                  "no retrieval, no sources)")
+            yield ("token", _smalltalk_reply(message, strict))
+            yield ("sources", [])
+            return
+
+        directive = _language_directive(message)
         scoped_ids = self._scoped_ids(scope)
         scoped = bool(scoped_ids)
-        # Obvious greetings / thanks / small talk: answer naturally, never retrieve,
-        # never show a source card, never trigger a strict refusal.
-        small_talk = _is_small_talk(message)
 
         # Resolve follow-up references against recent turns BEFORE retrieval, so an
         # ambiguous question ("…بهذا المركب", "ce projet") fetches the right chunk.
@@ -1294,10 +1327,7 @@ class RAGEngine:
         retrieval_query = await loop.run_in_executor(None, self._contextualize_query, message, history)
 
         items = []
-        if small_talk:
-            print("[RAG] chat: small-talk/greeting — answering conversationally, "
-                  "no retrieval, no sources")
-        elif scoped:
+        if scoped:
             # Explicit attachment(s): block until they are indexed, then ground on them.
             await self._await_attachments_indexed(scoped_ids)
             items = await loop.run_in_executor(None, self._relevant_nodes, retrieval_query, scope, user)
@@ -1319,7 +1349,7 @@ class RAGEngine:
         # already passed the relevance gate (cosine >= cutoff OR strong BM25, or a
         # scoped match). Strict refusal and the source display BOTH follow grounding
         # — never the other way round. A chunk good enough to answer from is shown.
-        if strict and not small_talk and self._strict_should_refuse(use_docs):
+        if strict and self._strict_should_refuse(use_docs):
             print(f"[RAG] strict: refusing — no grounding chunk retrieved "
                   f"(items=0 scoped={scoped})")
             yield ("token", _strict_refusal(message))
@@ -1342,14 +1372,10 @@ class RAGEngine:
             # Scoped to attachments with nothing retrievable: stay grounded and
             # instruct the model to say it couldn't find the answer (in the user's
             # language) rather than inventing one or chatting from general knowledge.
-            # (Small talk is excluded above — a greeting must answer naturally.)
-            if small_talk:
-                system_text = CONV_SYSTEM_PROMPT + directive
-            else:
-                system_text = (
-                    base_prompt + directive + "\n\n"
-                    + CONTEXT_TEMPLATE.format(context_str=_no_context_note(message))
-                )
+            system_text = (
+                base_prompt + directive + "\n\n"
+                + CONTEXT_TEMPLATE.format(context_str=_no_context_note(message))
+            )
         else:
             system_text = CONV_SYSTEM_PROMPT + directive
 
