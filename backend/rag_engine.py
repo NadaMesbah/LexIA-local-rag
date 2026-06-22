@@ -130,6 +130,13 @@ SOURCE_DISPLAY_TOP_K = int(os.getenv("SOURCE_DISPLAY_TOP_K", "1"))
 # before retrieval. Used ONLY for retrieval — the answer still uses the original
 # message. Skipped on the first turn (no history).
 QUERY_REWRITE_ENABLED = os.getenv("QUERY_REWRITE_ENABLED", "true").lower() in ("1", "true", "yes")
+# Post-answer grounding check (non-strict): minimum fraction of the answer's content
+# tokens that must also appear in the retrieved context for the answer to be treated
+# as document-grounded (and thus show source cards). Below this, the answer is
+# considered general ("hors documents") and NO sources are shown. Lenient on purpose
+# so paraphrased Arabic answers keep their source; high enough to drop obvious
+# mismatches (a design-patterns answer paired with a news chunk).
+GROUNDING_MIN_OVERLAP = float(os.getenv("GROUNDING_MIN_OVERLAP", "0.18"))
 RERANK_MODEL    = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
 RERANK_DEVICE   = os.getenv("RERANK_DEVICE", "cpu")
 
@@ -142,7 +149,10 @@ SYSTEM_PROMPT = (
     "Use the context extracts below when they are relevant, and prefer them over "
     "prior knowledge for facts about the documents. NEVER fabricate specific figures, "
     "amounts, numbers, dates or names: state such details ONLY if they appear in the "
-    "extracts, copying them exactly. If the question is about the documents and the "
+    "extracts, copying them exactly. When the extracts DO contain figures, quantities, "
+    "dates, names or locations relevant to the question, you MUST include them verbatim "
+    "in your answer (e.g. write '700 كيلوغرام', not just 'une quantité'; '46°C', not "
+    "'des températures élevées'). If the question is about the documents and the "
     "answer (or the requested figure) is not in the extracts, say clearly (in the "
     "user's language) that you couldn't find it — do NOT guess. For general questions "
     "or small talk unrelated to the documents, answer naturally. "
@@ -155,7 +165,10 @@ SYSTEM_PROMPT = (
 SYSTEM_PROMPT_STRICT = (
     "You are a STRICT retrieval assistant for a private knowledge base. Answer ONLY "
     "from the context extracts below. Never use general or prior knowledge to complete "
-    "or guess. If the exact answer is not explicitly present in the extracts, reply with "
+    "or guess. Preserve every relevant figure, quantity, date, name and location from "
+    "the extracts VERBATIM (e.g. '700 كيلوغرام', '46°C', exact dates and proper nouns) "
+    "— do not round, omit or generalize them. If the exact answer is not explicitly "
+    "present in the extracts, reply with "
     "ONLY this sentence, in the user's language and nothing else:\n"
     "- English: \"I could not find this information in the provided documents.\"\n"
     "- French: \"Je n’ai pas trouvé cette information dans les documents fournis.\"\n"
@@ -363,6 +376,26 @@ def _clean_context_text(text: str) -> str:
     never legitimate Arabic/Latin content."""
     t = _CONTEXT_GARBAGE.sub("", text or "")
     return re.sub(r"[ \t]{2,}", " ", t).strip()
+
+
+def _answer_grounded(answer: str, contexts: list, min_overlap: float) -> bool:
+    """Heuristic, language-aware check that a generated answer is actually supported
+    by the retrieved context — not produced from general knowledge. Compares content
+    tokens (NFKC + Arabic-folded + stopwords removed), so it works across EN/FR/AR
+    and is robust to paraphrase (it matches shared entities, terms and numbers).
+
+    Returns True if a meaningful fraction of the answer's content tokens also appear
+    in the context, OR several distinct significant terms match (covers long
+    paraphrased answers). Catches e.g. a design-patterns answer paired with a
+    football-news chunk (≈0 overlap) while keeping كيمادو/الحسيمة answers grounded."""
+    ans = {t for t in _content_tokens(answer) if len(t) > 1}
+    if not ans:
+        return True   # nothing meaningful to verify (very short answer) — don't hide
+    ctx: set = set()
+    for c in contexts:
+        ctx |= set(_content_tokens(c or ""))
+    shared = ans & ctx
+    return (len(shared) / len(ans)) >= min_overlap or len(shared) >= 4
 
 
 def _tokenize(text: str) -> list[str]:
@@ -1232,13 +1265,28 @@ class RAGEngine:
 
         gen = await loop.run_in_executor(None, lambda: Settings.llm.stream_chat(msgs))
         sentinel = object()
+        answer_parts: list[str] = []
         while True:
             resp = await loop.run_in_executor(None, next, gen, sentinel)
             if resp is sentinel:
                 break
             delta = getattr(resp, "delta", None)
             if delta:
+                answer_parts.append(delta)
                 yield ("token", delta)
+
+        # POST-ANSWER grounding check (non-strict): if the generated answer barely
+        # overlaps the retrieved context, the model answered from general knowledge —
+        # so DON'T attach document source cards (UI shows 'hors documents'). This
+        # stops e.g. a design-patterns answer being paired with a news source, while
+        # keeping paraphrased Arabic answers (which reuse entities/numbers) grounded.
+        if display_sources and not strict:
+            if not _answer_grounded("".join(answer_parts),
+                                    [it.get("text", "") for it in items], GROUNDING_MIN_OVERLAP):
+                print(f"[RAG] grounding: answer does not overlap retrieved context "
+                      f"(min_overlap={GROUNDING_MIN_OVERLAP}) — hiding {len(display_sources)} "
+                      f"source(s), treating as a general answer")
+                display_sources = []
 
         yield ("sources", display_sources)
 
@@ -1314,21 +1362,36 @@ class RAGEngine:
 
     @staticmethod
     def _snippet(text: str, query: Optional[str], width: int = 320) -> str:
-        """A clean preview that ACTUALLY shows the part of the chunk relevant to the
-        query — not blindly the first N chars. News/roundup chunks often pack several
-        topics; this windows around the first matching query term so the FortiBleed
-        question shows the FortiBleed sentence, not an unrelated lead paragraph."""
+        """A clean preview that shows the part of the chunk that best supports the
+        answer — not blindly the first N chars or the first loosely-matching term.
+        Among all query-term match positions it picks the window covering the MOST
+        distinct query terms, and prefers a window containing a number/date (so a
+        quantity like '700 كيلوغرام' is shown rather than an unrelated lead line)."""
         clean = _clean_context_text(text)
+        if len(clean) <= width:
+            return clean                          # whole (short) chunk fits — no windowing
         toks = _content_tokens(query) if query else []
-        if toks:
-            hay = _fold_arabic(clean.lower())   # length-aligned with `clean`
-            pos = min((hay.find(t) for t in toks if hay.find(t) != -1), default=-1)
-            if pos > 0:
-                start = max(0, pos - 60)
-                end = min(len(clean), start + width)
-                seg = clean[start:end].strip()
-                return ("…" if start > 0 else "") + seg + ("…" if end < len(clean) else "")
-        return clean[:width] + ("…" if len(clean) > width else "")
+        if not toks:
+            return clean[:width] + "…"
+        hay = _fold_arabic(clean.lower())          # length-aligned with `clean`
+        positions = sorted({p for p in (hay.find(t) for t in set(toks)) if p != -1})
+        if not positions:
+            return clean[:width] + "…"
+        best_start, best_score = 0, -1
+        tokset = set(toks)
+        for p in positions:
+            start = max(0, p - 60)
+            end = min(len(clean), start + width)
+            window = hay[start:end]
+            score = sum(1 for t in tokset if t in window)        # query-term coverage
+            if any(ch.isdigit() for ch in clean[start:end]):
+                score += 1                                       # prefer facts/numbers
+            if score > best_score:
+                best_score, best_start = score, start
+        start = best_start
+        end = min(len(clean), start + width)
+        seg = clean[start:end].strip()
+        return ("…" if start > 0 else "") + seg + ("…" if end < len(clean) else "")
 
     @staticmethod
     def _format_sources(items: list[dict], scoped: bool = False, query: Optional[str] = None,

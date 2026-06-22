@@ -31,10 +31,19 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [confirmId, setConfirmId] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
-  const [docsOnly, setDocsOnly] = useState(false);   // strict RAG: answer only from documents
+  // Strict RAG ("Documents uniquement") AND active document scope are stored PER
+  // conversation, so conversation A can be strict while B stays general, and switching
+  // conversations restores each one's own mode + scope. '__draft__' holds the choice
+  // for a not-yet-created conversation (migrated to its id on the first send).
+  const [strictByConv, setStrictByConv] = useState<Record<string, boolean>>({});
   // Sticky document scope, per conversation: once a document is attached/selected it
   // stays the active scope for that conversation's follow-ups until cleared.
   const [scopeByConv, setScopeByConv] = useState<Record<string, { id: string; filename: string }[]>>({});
+  const docsOnly = strictByConv[currentId ?? '__draft__'] ?? false;
+  const setDocsOnly = useCallback(
+    (v: boolean) => setStrictByConv((m) => ({ ...m, [currentId ?? '__draft__']: v })),
+    [currentId],
+  );
   const [toast, setToast] = useState<{ msg: string; sev: 'success' | 'error' | 'info'; sid?: string } | null>(null);
 
   // Streaming lives ABOVE this page (in a layout-level provider), so a running
@@ -147,11 +156,15 @@ export default function ChatPage() {
     async (text: string) => {
       let sid = currentId;
       const firstTurn = !sid || messages.length === 0;
+      // Strict mode chosen for THIS conversation (or the draft, before it exists).
+      const effStrict = strictByConv[currentId ?? '__draft__'] ?? false;
       if (!sid) {
         try {
           const s = await api.createSession();
           sid = s.id;
           setCurrentId(sid);
+          // Carry the draft strict choice onto the freshly-created conversation.
+          setStrictByConv((m) => ({ ...m, [sid as string]: effStrict }));
           await refreshSessions();
         } catch { return; }
       }
@@ -182,12 +195,12 @@ export default function ChatPage() {
 
       startStream({
         url: api.chatUrl(sid),
-        body: { message: text, scope, attachments: atts.length ? atts : undefined, strict: docsOnly || undefined },
+        body: { message: text, scope, attachments: atts.length ? atts : undefined, strict: effStrict || undefined },
         sid,
         firstTurn,
       });
     },
-    [currentId, messages.length, pendingAttachments, isActive, startStream, refreshSessions, clearPending, docsOnly, scopeByConv]
+    [currentId, messages.length, pendingAttachments, isActive, startStream, refreshSessions, clearPending, strictByConv, scopeByConv]
   );
 
   const handleEdit = useCallback(

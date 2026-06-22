@@ -283,6 +283,41 @@ def test_scripts_detects_foreign_script_injection():
     assert "arabic" in rg._scripts("المركب السياحي كيمادو")
 
 
+# ─── Post-answer grounding (general answer must not show document sources) ────
+
+def test_answer_grounded_rejects_general_answer_vs_news_chunk():
+    # 'design patterns' answer vs football-news context -> ~0 overlap -> NOT grounded.
+    answer = ("Les design patterns sont des solutions réutilisables à des problèmes "
+              "récurrents de conception logicielle, comme Singleton, Factory ou Observer.")
+    ctx = ["Le Maroc affronte l'Écosse au Mondial 2026, victoire 1-0 au groupe C."]
+    assert rg._answer_grounded(answer, ctx, 0.18) is False
+
+
+def test_answer_grounded_keeps_paraphrased_arabic_answer():
+    # Arabic answer reuses entities/numbers from the chunk -> grounded even if short.
+    answer = "المركب السياحي كيمادو يقع بمدينة الحسيمة."
+    ctx = ["تعرف مدينة الحسيمة احتقانا اجتماعيا في المركب السياحي كيمادو بسبب وضعية العمال."]
+    assert rg._answer_grounded(answer, ctx, 0.18) is True
+
+
+def test_answer_grounded_keeps_answer_sharing_numbers():
+    answer = "ضبطت الشرطة 700 كيلوغرام من مخدر الشيرا في طنجة."
+    ctx = ["حجزت الشرطة القضائية بطنجة 700 كيلوغرام من مخدر الشيرا في قضية تهريب دولي."]
+    assert rg._answer_grounded(answer, ctx, 0.18) is True
+
+
+def test_answer_grounded_empty_answer_not_hidden():
+    assert rg._answer_grounded("", ["whatever"], 0.18) is True
+
+
+def test_snippet_prefers_window_with_query_terms_and_number():
+    chunk = ("Le tournoi se poursuit cette semaine au Maroc. " * 5 +
+             "La police judiciaire de Tanger a saisi 700 kilogrammes de chira "
+             "dans une affaire de trafic international.")
+    snip = RAGEngine._snippet(chunk, "Qu'a saisi la police judiciaire à Tanger ?")
+    assert "700" in snip and "Tanger" in snip
+
+
 def test_display_is_rerank_aware(monkeypatch):
     monkeypatch.setattr(rg, "SOURCE_DISPLAY_MIN_RERANK", 0.3)
     monkeypatch.setattr(rg, "SOURCE_DISPLAY_TOP_K", 5)   # see more than the top-1 card
@@ -297,7 +332,7 @@ def test_display_is_rerank_aware(monkeypatch):
 
 
 def test_snippet_windows_to_query_relevant_text():
-    chunk = ("Eau dessalée de Safi vers Marrakech sur 185 km. " * 4 +
+    chunk = ("Eau dessalée de Safi vers Marrakech sur 185 km. " * 9 +
              "Par ailleurs, la fuite FortiBleed a exposé des identifiants VPN; la DGSSI alerte.")
     snip = RAGEngine._snippet(chunk, "Que révèle la fuite FortiBleed ?")
     assert "FortiBleed" in snip
