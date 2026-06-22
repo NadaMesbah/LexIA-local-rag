@@ -84,9 +84,18 @@ RETRIEVE_TOP_K  = int(os.getenv("RETRIEVE_TOP_K", "6"))
 RETRIEVE_CANDIDATES = int(os.getenv("RETRIEVE_CANDIDATES", "20"))
 RERANK_TOP_N    = int(os.getenv("RERANK_TOP_N", "5"))
 RERANK_ENABLED  = os.getenv("RERANK_ENABLED", "false").lower() in ("1", "true", "yes")
+# Optional: drop reranked candidates whose cross-encoder score is below this
+# (0 = disabled). Lets a serious test prune off-topic passages even after rerank,
+# without affecting the cosine-based source display. Scale depends on the model.
+RERANK_MIN_SCORE = float(os.getenv("RERANK_MIN_SCORE", "0.0"))
 # Hybrid lexical (BM25) retrieval on top of dense vectors — catches exact terms,
 # names, codes, dates and short queries that pure vector search misses.
 HYBRID_ENABLED  = os.getenv("HYBRID_ENABLED", "true").lower() in ("1", "true", "yes")
+# Minimum BM25 score for a lexical-only hit to be trusted on its own. BM25 gives
+# *some* score to any shared word, so common terms create weak, noisy matches
+# (e.g. an ML paper surfacing for a news question). A lexical hit below this is
+# kept ONLY if its dense cosine also passes RELEVANCE_CUTOFF. 0 = keep any hit.
+MIN_BM25_SCORE  = float(os.getenv("MIN_BM25_SCORE", "0.0"))
 # Strict RAG: answer ONLY from documents (never fall back to general chat). Off by
 # default so casual small talk still works; can be forced per-request or via env.
 STRICT_RAG_DEFAULT = os.getenv("STRICT_RAG", "false").lower() in ("1", "true", "yes")
@@ -107,6 +116,27 @@ RELEVANCE_CUTOFF = float(os.getenv("RELEVANCE_CUTOFF", "0.35"))
 SOURCE_MIN_SCORE = float(os.getenv("SOURCE_MIN_SCORE", "0.40"))
 SOURCE_REL_GAP   = float(os.getenv("SOURCE_REL_GAP", "0.10"))
 SOURCE_MAX       = int(os.getenv("SOURCE_MAX", "4"))
+
+# Source DISPLAY layering. The answer is grounded on the retrieved context, so the
+# single best chunk is ALWAYS shown as a source (no display threshold may hide it).
+# These knobs only affect ADDITIONAL cards / ordering:
+#   - SOURCE_DISPLAY_TOP_K   max cards shown (default 1 = highest precision)
+#   - SOURCE_DISPLAY_MIN_RERANK  min rerank score for a SECONDARY card (reranker ON)
+SOURCE_DISPLAY_MIN_RERANK = float(os.getenv("SOURCE_DISPLAY_MIN_RERANK", "0.0"))
+SOURCE_DISPLAY_TOP_K = int(os.getenv("SOURCE_DISPLAY_TOP_K", "1"))
+
+# Rewrite follow-up questions into standalone retrieval queries using recent
+# conversation, so anaphora ("this complex", "ce projet", "بهذا المركب") resolves
+# before retrieval. Used ONLY for retrieval — the answer still uses the original
+# message. Skipped on the first turn (no history).
+QUERY_REWRITE_ENABLED = os.getenv("QUERY_REWRITE_ENABLED", "true").lower() in ("1", "true", "yes")
+# Post-answer grounding check (non-strict): minimum fraction of the answer's content
+# tokens that must also appear in the retrieved context for the answer to be treated
+# as document-grounded (and thus show source cards). Below this, the answer is
+# considered general ("hors documents") and NO sources are shown. Lenient on purpose
+# so paraphrased Arabic answers keep their source; high enough to drop obvious
+# mismatches (a design-patterns answer paired with a news chunk).
+GROUNDING_MIN_OVERLAP = float(os.getenv("GROUNDING_MIN_OVERLAP", "0.18"))
 RERANK_MODEL    = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
 RERANK_DEVICE   = os.getenv("RERANK_DEVICE", "cpu")
 
@@ -119,7 +149,10 @@ SYSTEM_PROMPT = (
     "Use the context extracts below when they are relevant, and prefer them over "
     "prior knowledge for facts about the documents. NEVER fabricate specific figures, "
     "amounts, numbers, dates or names: state such details ONLY if they appear in the "
-    "extracts, copying them exactly. If the question is about the documents and the "
+    "extracts, copying them exactly. When the extracts DO contain figures, quantities, "
+    "dates, names or locations relevant to the question, you MUST include them verbatim "
+    "in your answer (e.g. write '700 كيلوغرام', not just 'une quantité'; '46°C', not "
+    "'des températures élevées'). If the question is about the documents and the "
     "answer (or the requested figure) is not in the extracts, say clearly (in the "
     "user's language) that you couldn't find it — do NOT guess. For general questions "
     "or small talk unrelated to the documents, answer naturally. "
@@ -132,10 +165,16 @@ SYSTEM_PROMPT = (
 SYSTEM_PROMPT_STRICT = (
     "You are a STRICT retrieval assistant for a private knowledge base. Answer ONLY "
     "from the context extracts below. Never use general or prior knowledge to complete "
-    "or guess. If the exact answer is not explicitly present in the extracts, reply (in "
-    "the user's language) exactly: \"Je n'ai pas trouvé cette information dans les "
-    "documents.\" Do NOT add a sources/citations list or mention file names — the app "
-    "shows sources separately. Be concise and faithful to the extracts."
+    "or guess. Preserve every relevant figure, quantity, date, name and location from "
+    "the extracts VERBATIM (e.g. '700 كيلوغرام', '46°C', exact dates and proper nouns) "
+    "— do not round, omit or generalize them. If the exact answer is not explicitly "
+    "present in the extracts, reply with "
+    "ONLY this sentence, in the user's language and nothing else:\n"
+    "- English: \"I could not find this information in the provided documents.\"\n"
+    "- French: \"Je n’ai pas trouvé cette information dans les documents fournis.\"\n"
+    "- Arabic: \"لم أجد هذه المعلومة في الوثائق المقدمة.\"\n"
+    "Do NOT add a sources/citations list or mention file names — the app shows sources "
+    "separately. Be concise and faithful to the extracts."
 )
 
 CONTEXT_TEMPLATE = (
@@ -167,12 +206,41 @@ TITLE_PROMPT = (
     "Message: {message}\n\nTitle:"
 )
 
+# Rewrites a follow-up into a standalone retrieval query (resolves pronouns/deixis
+# using recent turns). The model must answer in the SAME language and output ONLY
+# the query — it is never shown to the user and never used for the final answer.
+QUERY_REWRITE_PROMPT = (
+    "You rewrite a user's latest question into a SINGLE standalone search query.\n"
+    "Resolve pronouns and references (e.g. \"this\", \"it\", \"ce projet\", \"بهذا\") using "
+    "the conversation so the query makes sense on its own. Keep the SAME language as "
+    "the question. Do not answer it. Output ONLY the rewritten query, no quotes, no "
+    "explanation.\n\nConversation:\n{history}\n\nLatest question: {question}\n\nStandalone query:"
+)
+
 
 # ─── Language lock (prevents Qwen drifting into Chinese) ──────────────────────
 _CJK = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
 _AR = re.compile(r"[\u0600-\u06ff]")
 _CYR = re.compile(r"[\u0400-\u04ff]")
 _FR_ACC = re.compile(r"[àâçéèêëîïôûùüœ]")
+
+
+def _scripts(text: str) -> set:
+    """The set of writing systems present in `text` (latin/arabic/cyrillic/cjk).
+    Used to reject a query rewrite that injects a foreign script (e.g. the Latin
+    word 'Mercer' leaking from a corrupted assistant answer into an Arabic query)."""
+    out = set()
+    for ch in text or "":
+        o = ord(ch)
+        if "a" <= ch.lower() <= "z":
+            out.add("latin")
+        elif 0x0600 <= o <= 0x06FF or 0x0750 <= o <= 0x077F or 0x08A0 <= o <= 0x08FF:
+            out.add("arabic")
+        elif 0x0400 <= o <= 0x04FF:
+            out.add("cyrillic")
+        elif 0x4E00 <= o <= 0x9FFF or 0x3400 <= o <= 0x4DBF:
+            out.add("cjk")
+    return out
 
 
 def _detect_language(text: str) -> Optional[str]:
@@ -206,6 +274,14 @@ def _language_directive(text: str) -> str:
     lang = _detect_language(text)
     if lang == "Chinese":
         return ""
+    if lang == "Arabic":
+        return (
+            "\n\nABSOLUTE RULE — LANGUAGE: The user is writing in Arabic. Write your ENTIRE "
+            "answer in Modern Standard Arabic only. Do NOT output any Chinese, Latin or other "
+            "non-Arabic words (numbers and units copied from the extracts are fine). If an "
+            "extract contains garbled or non-Arabic fragments, IGNORE them and never copy "
+            "them. This overrides everything else."
+        )
     if lang:
         return (
             f"\n\nABSOLUTE RULE — LANGUAGE: The user is writing in {lang}. Write your ENTIRE "
@@ -218,22 +294,233 @@ def _language_directive(text: str) -> str:
     )
 
 
+# ─── Strict-mode refusal (deterministic, language-aware) ──────────────────────
+# When strict RAG is on and retrieval finds no RELIABLE grounding, we refuse with
+# one of these exact messages instead of letting the model improvise (or
+# hallucinate). The message language follows the user's question.
+STRICT_REFUSALS = {
+    "English": "I could not find this information in the provided documents.",
+    "French": "Je n’ai pas trouvé cette information dans les documents fournis.",
+    "Arabic": "لم أجد هذه المعلومة في الوثائق المقدمة.",
+}
+STRICT_REFUSAL_DEFAULT = STRICT_REFUSALS["English"]
+
+
+def _strict_refusal(message: str) -> str:
+    """The canonical refusal in the user's language (English fallback)."""
+    return STRICT_REFUSALS.get(_detect_language(message), STRICT_REFUSAL_DEFAULT)
+
+
+def _no_context_note(message: str) -> str:
+    """Language-aware placeholder used as the 'context' when nothing was retrieved
+    (scoped non-strict), so the model says it couldn't find it in the right language."""
+    lang = _detect_language(message)
+    if lang == "Arabic":
+        return "(لم يتم العثور على أي مقطع ذي صلة في الوثائق لهذا السؤال.)"
+    if lang == "English":
+        return "(No relevant extract was found in the documents for this question.)"
+    return "(Aucun extrait pertinent n'a été trouvé dans les documents pour cette question.)"
+
+
 # ─── Lexical search (BM25) for hybrid retrieval ───────────────────────────────
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
+
+# Arabic diacritics (tashkeel), the superscript alef and the decorative tatweel.
+# They are optional in Arabic, are frequently mis-emitted by PDF extractors, read
+# poorly for the LLM and break matching — so we drop them everywhere.
+_AR_DIACRITICS = re.compile(
+    r"[\u0610-\u061A\u064B-\u065F\u06D6-\u06DC\u06DF-\u06E8\u06EA-\u06ED\u0670\u0640]"
+)
 
 
 def _normalize_text(text: str) -> str:
     # NFKC folds Arabic presentation-form glyphs (e.g. ﺍﻟﺤﺪ) back to standard
     # letters (الحد). PDF extractors often emit presentation forms, which (a) read
     # poorly for the LLM and (b) use different codepoints than a user's typed query
-    # — breaking BM25/embedding matches. Normalizing fixes all three.
-    return unicodedata.normalize("NFKC", text or "")
+    # — breaking BM25/embedding matches. Normalizing fixes all three. We also strip
+    # Arabic diacritics/tatweel (optional marks, often PDF noise).
+    t = unicodedata.normalize("NFKC", text or "")
+    return _AR_DIACRITICS.sub("", t)
+
+
+# Aggressive Arabic letter folding for LEXICAL MATCHING ONLY (never applied to the
+# stored/displayed text): unify the alef/ya/hamza/ta-marbuta variants a user might
+# type differently than the document, so BM25 matches regardless of spelling.
+_AR_FOLD = str.maketrans({
+    "أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا",
+    "ى": "ي", "ئ": "ي",
+    "ؤ": "و",
+    "ة": "ه",
+})
+
+
+def _fold_arabic(text: str) -> str:
+    """Fold Arabic spelling variants for matching (no-op for non-Arabic text)."""
+    return (text or "").translate(_AR_FOLD)
+
+
+# Obvious corruption to remove from a chunk before it enters the LLM context: CJK
+# (this KB is Arabic/French/English, so any Chinese is bad PDF extraction), the
+# Unicode replacement char (decode errors) and zero-width / bidi control glyphs.
+_CONTEXT_GARBAGE = re.compile(
+    r"[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff"
+    r"\ufffd"
+    r"\u200b-\u200f\u202a-\u202e\u2060\ufeff]"
+)
+
+
+def _clean_context_text(text: str) -> str:
+    """Strip obviously-corrupted artifacts from a chunk before it goes into the
+    LLM context, so the model can't echo garbage (e.g. Chinese fragments inside an
+    Arabic answer). Conservative: only removes CJK/replacement/control characters,
+    never legitimate Arabic/Latin content."""
+    t = _CONTEXT_GARBAGE.sub("", text or "")
+    return re.sub(r"[ \t]{2,}", " ", t).strip()
+
+
+# Obvious display artifacts to strip from the FINAL answer (not CJK — a Chinese user
+# answer is legitimate; the language directive handles language). Covers the black
+# squares (■ and other geometric/block glyphs), the Unicode replacement char, and
+# zero-width / bidi control characters that PDF extraction leaks into the model.
+_ANSWER_ARTIFACTS = re.compile(
+    r"[\u25A0-\u25FF\u2580-\u259F"          # ■ geometric shapes + block elements
+    r"\uFFFD"                                 # replacement char
+    r"\u200B-\u200F\u202A-\u202E\u2060\u2066-\u2069\uFEFF]"   # zero-width / bidi
+)
+
+
+def _strip_artifacts(text: str) -> str:
+    """Remove obvious artifacts (■, replacement char, zero-width/bidi controls) from
+    answer text. Safe: never touches Arabic/Latin letters, digits or punctuation."""
+    return _ANSWER_ARTIFACTS.sub("", text or "")
+
+
+def _answer_grounded(answer: str, contexts: list, min_overlap: float) -> bool:
+    """Heuristic, language-aware check that a generated answer is actually supported
+    by the retrieved context — not produced from general knowledge. Compares content
+    tokens (NFKC + Arabic-folded + stopwords removed), so it works across EN/FR/AR
+    and is robust to paraphrase (it matches shared entities, terms and numbers).
+
+    Returns True if a meaningful fraction of the answer's content tokens also appear
+    in the context, OR several distinct significant terms match (covers long
+    paraphrased answers). Catches e.g. a design-patterns answer paired with a
+    football-news chunk (≈0 overlap) while keeping كيمادو/الحسيمة answers grounded."""
+    ans = {t for t in _content_tokens(answer) if len(t) > 1}
+    if not ans:
+        return True   # nothing meaningful to verify (very short answer) — don't hide
+    ctx: set = set()
+    for c in contexts:
+        ctx |= set(_content_tokens(c or ""))
+    shared = ans & ctx
+    # Ratio-only: a general answer (e.g. design patterns) shares only a few generic
+    # tokens with an unrelated news chunk → low ratio → not grounded. A doc-grounded
+    # answer (incl. paraphrased Arabic reusing entities/numbers) stays well above.
+    return (len(shared) / len(ans)) >= min_overlap
+
+
+# Phrases that mark a "not found"/refusal answer in EN/FR/AR. When the FINAL answer
+# is one of these, NO source cards must be shown — even though retrieval found chunks
+# (strict mode lets the model itself refuse when the fact isn't in the extracts).
+_REFUSAL_MARKERS = (
+    "pas trouvé cette information", "n'ai pas trouvé", "n’ai pas trouvé", "pas trouvé d",
+    "could not find", "couldn't find", "not find this information", "not in the provided",
+    "لم أجد", "لم اجد", "لم أعثر", "لم اعثر", "لا أجد", "لم يتم العثور", "لا توجد هذه المعلوم",
+)
+
+
+def _is_refusal(answer: str) -> bool:
+    """True if the generated answer is a 'I couldn't find this in the documents'
+    statement (any of EN/FR/AR), so its (irrelevant) source cards must be dropped."""
+    a = _normalize_text(answer or "").lower()
+    return bool(a.strip()) and any(m in a for m in _REFUSAL_MARKERS)
 
 
 def _tokenize(text: str) -> list[str]:
     # Normalize first so Arabic written as presentation forms matches a query typed
     # in standard Arabic. \w with re.UNICODE keeps Arabic/accented letters + digits.
     return _WORD_RE.findall(_normalize_text(text).lower())
+
+
+# ─── Stopwords (lexical noise reduction for BM25) ─────────────────────────────
+# Removing stopwords from BM25 tokenization stops ultra-common words from creating
+# spurious lexical matches across unrelated documents. Lists are deliberately
+# focused on the three supported UI languages (English, French, Arabic).
+_STOPWORDS_EN = {
+    "a", "an", "the", "and", "or", "but", "if", "of", "to", "in", "on", "for", "with",
+    "as", "by", "at", "from", "is", "are", "was", "were", "be", "been", "being", "this",
+    "that", "these", "those", "it", "its", "i", "you", "he", "she", "we", "they", "what",
+    "which", "who", "whom", "how", "why", "when", "where", "do", "does", "did", "can",
+    "could", "will", "would", "should", "shall", "may", "might", "must", "have", "has",
+    "had", "not", "no", "yes", "please", "hello", "hi", "hey", "thanks", "thank", "about",
+    "into", "over", "than", "then", "there", "here", "your", "my", "our", "their", "his",
+    "her", "me", "us", "them", "so", "such", "very", "more", "most", "some", "any", "all",
+    "each", "both", "few", "much", "many", "give", "tell", "show", "explain", "summarize",
+}
+_STOPWORDS_FR = {
+    "le", "la", "les", "un", "une", "des", "du", "de", "et", "ou", "mais", "donc", "or",
+    "ni", "car", "est", "sont", "était", "étaient", "être", "été", "à", "au", "aux", "ce",
+    "cet", "cette", "ces", "il", "elle", "ils", "elles", "on", "je", "tu", "nous", "vous",
+    "que", "qui", "quoi", "dont", "où", "quel", "quelle", "quels", "quelles", "comment",
+    "pourquoi", "quand", "combien", "ne", "pas", "plus", "moins", "pour", "avec", "sans",
+    "sur", "sous", "dans", "par", "en", "se", "sa", "son", "ses", "leur", "leurs", "mon",
+    "ma", "mes", "ton", "ta", "tes", "notre", "nos", "votre", "vos", "qu", "aussi",
+    "alors", "comme", "tout", "tous", "toute", "toutes", "bonjour", "salut", "merci",
+    "oui", "non", "ça", "cela", "ceci", "explique", "résume", "donne", "dis",
+}
+_STOPWORDS_AR = {
+    "في", "من", "على", "إلى", "الى", "عن", "مع", "هذا", "هذه", "ذلك", "تلك", "الذي",
+    "التي", "الذين", "ما", "ماذا", "متى", "أين", "اين", "كيف", "لماذا", "كم", "هل", "أن",
+    "ان", "إن", "كان", "كانت", "يكون", "هو", "هي", "هم", "هن", "نحن", "أنا", "انا", "أنت",
+    "انت", "أنتم", "لا", "نعم", "هنا", "هناك", "كل", "بعض", "قد", "ثم", "أو", "او", "أم",
+    "لكن", "حتى", "إذا", "اذا", "عند", "عندما", "بين", "كذلك", "أيضا", "ايضا", "غير",
+}
+# Normalize stopwords the SAME way tokens are (NFKC + diacritic strip + Arabic
+# folding + lowercase) so they match the corpus/query tokens exactly.
+_STOPWORDS = {_fold_arabic(_normalize_text(w)).lower()
+              for w in (_STOPWORDS_EN | _STOPWORDS_FR | _STOPWORDS_AR)}
+
+
+def _content_tokens(text: str) -> list[str]:
+    """Tokens used for lexical (BM25) matching: normalized + Arabic-folded +
+    lowercased, with stopwords and single non-digit characters (e.g. French
+    elisions l'/d'/qu') dropped, so common words don't manufacture noisy
+    cross-document matches and Arabic spelling variants still match."""
+    out: list[str] = []
+    for t in _tokenize(text):
+        t = _fold_arabic(t)
+        if t in _STOPWORDS:
+            continue
+        if len(t) > 1 or t.isdigit():
+            out.append(t)
+    return out
+
+
+def _to_list(x) -> list:
+    """Coerce a Chroma/NumPy result to a plain Python list.
+
+    Chroma returns `embeddings` and `distances` as NumPy ndarrays. Putting an
+    ndarray in a boolean context — ``arr or default``, ``if arr:``, ``not arr`` —
+    raises "The truth value of an array with more than one element is ambiguous".
+    NEVER test those results with truthiness; pass them through here first, then
+    test with explicit ``is None`` / ``len(...)``.
+    """
+    if x is None:
+        return []
+    if isinstance(x, list):
+        return x
+    tolist = getattr(x, "tolist", None)
+    if callable(tolist):          # numpy ndarray (or scalar) -> nested py list
+        return tolist()
+    try:
+        return list(x)            # any other iterable
+    except TypeError:
+        return [x]
+
+
+def _first_row(x) -> list:
+    """First row of a Chroma query result (shape ``[[...]]``), NumPy-safe."""
+    rows = _to_list(x)
+    return _to_list(rows[0]) if rows else []
 
 
 def _cosine(a, b) -> float:
@@ -256,7 +543,7 @@ class _BM25:
 
     def __init__(self, ids: list, texts: list, metas: list, k1: float = 1.5, b: float = 0.75):
         self.ids, self.texts, self.metas, self.k1, self.b = ids, texts, metas, k1, b
-        docs = [_tokenize(t) for t in texts]
+        docs = [_content_tokens(t) for t in texts]
         self._len = [len(d) for d in docs]
         self.N = len(docs)
         self.avgdl = (sum(self._len) / self.N) if self.N else 0.0
@@ -272,7 +559,7 @@ class _BM25:
         self._idf = {t: math.log(1 + (self.N - n + 0.5) / (n + 0.5)) for t, n in df.items()}
 
     def search(self, query: str, n: int) -> list[tuple]:
-        q = _tokenize(query)
+        q = _content_tokens(query)
         if not q or self.N == 0:
             return []
         scored: list[tuple] = []
@@ -525,33 +812,84 @@ class RAGEngine:
             conds.append({"$or": [{"scope": "org"}, {"owner_id": user["id"]}]})
         return {"$and": conds} if len(conds) > 1 else conds[0]
 
-    def _rerank(self, items: list[dict], query: str) -> list[dict]:
+    def _rerank(self, items: list[dict], query: str):
+        """Cross-encoder rerank of the candidate pool.
+
+        Returns ``(items, applied)``. When the reranker is enabled it scores EVERY
+        candidate (not a pre-filtered subset) and returns them ordered by true
+        query relevance, with the cross-encoder score attached as ``rerank``. The
+        original cosine ``score`` and ``bm25`` fields are PRESERVED — source display
+        and the relevance cutoff rely on the cosine score, which is on a different
+        scale than the reranker's. When disabled/unavailable, returns the input
+        unchanged with ``applied=False``."""
         if not (self._reranker and items):
-            return items
+            return items, False
         try:
             from llama_index.core.schema import TextNode, NodeWithScore, QueryBundle
-            nodes = [NodeWithScore(node=TextNode(text=it["text"], metadata=it["metadata"]),
-                                   score=it["score"]) for it in items]
+            # id_ = index so we can map the reranked nodes back to the rich source
+            # dicts (preserving bm25/score/metadata) instead of rebuilding them.
+            nodes = [
+                NodeWithScore(
+                    node=TextNode(text=it.get("text") or "",
+                                  metadata=it.get("metadata") or {}, id_=str(i)),
+                    score=float(it.get("score") or 0.0),
+                )
+                for i, it in enumerate(items)
+            ]
             ranked = self._reranker.postprocess_nodes(nodes, query_bundle=QueryBundle(query))
-            return [{"text": n.node.get_content(), "metadata": n.node.metadata,
-                     "score": float(n.score or 0)} for n in ranked]
+            out = []
+            for n in ranked:
+                try:
+                    src = dict(items[int(n.node.id_)])
+                except (ValueError, IndexError, TypeError):
+                    src = {"text": n.node.get_content(), "metadata": n.node.metadata,
+                           "score": float(n.score or 0), "bm25": None}
+                src["rerank"] = float(n.score or 0.0)
+                out.append(src)
+            return out, True
         except Exception as e:
             print(f"[RAG] rerank error ({e})")
-            return items
+            return items, False
 
-    def _relevant_nodes(self, message: str, scope: Optional[dict], user: Optional[dict]) -> list[dict]:
+    @staticmethod
+    def _final_select(reranked: list[dict], scoped: bool, reranked_applied: bool) -> list[dict]:
+        """The post-rerank selection (aggressive filtering happens HERE, after the
+        reranker has seen the wide pool):
+          - scoped queries keep everything (the user chose the document);
+          - reranker ON  → trust its order, optionally drop very low rerank scores
+            (RERANK_MIN_SCORE), then keep the top RERANK_TOP_N;
+          - reranker OFF → cosine relevance cutoff, still keeping exact BM25 hits.
+        The caller applies the final RETRIEVE_TOP_K cap."""
+        if scoped:
+            return list(reranked)
+        if reranked_applied:
+            pool = reranked
+            if RERANK_MIN_SCORE > 0:
+                strong = [it for it in pool if (it.get("rerank") or 0.0) >= RERANK_MIN_SCORE]
+                pool = strong or pool      # never filter everything away
+            return pool[:RERANK_TOP_N]
+        return [it for it in reranked
+                if (it.get("bm25") is not None and it["bm25"] >= MIN_BM25_SCORE)
+                or (it.get("score") or 0) >= RELEVANCE_CUTOFF]
+
+    def _relevant_nodes(self, message: str, scope: Optional[dict], user: Optional[dict],
+                        debug: bool = False):
         """Hybrid retrieval: dense vector search + lexical BM25, fused with
         Reciprocal Rank Fusion, then optional rerank and a relevance filter.
 
         - Lexical BM25 catches exact terms/names/codes the vector search misses.
         - Scoped (attached-doc) queries skip the cosine cutoff (the user chose the doc).
-        - Degrades gracefully to vector-only if the lexical index is unavailable."""
+        - Degrades gracefully to vector-only if the lexical index is unavailable.
+
+        Returns the final list of chunk dicts. When ``debug=True`` it instead
+        returns a ``{"summary": {...}, "items": [...]}`` diagnostics dict describing
+        every fused candidate and how it was scored/filtered (for /debug/retrieve)."""
         where = self._visibility_where(user, scope)
         scoped_ids = self._scoped_ids(scope)
         scoped = bool(scoped_ids)
 
         try:
-            qemb = Settings.embed_model.get_query_embedding(message)
+            qemb = Settings.embed_model.get_query_embedding(_normalize_text(message))
         except Exception as e:
             print(f"[RAG] embed error ({e})")
             return []
@@ -564,8 +902,13 @@ class RAGEngine:
                 query_embeddings=[qemb], n_results=RETRIEVE_CANDIDATES, where=where,
                 include=["documents", "metadatas", "distances"],
             )
-            for cid, t, m, d in zip((res.get("ids") or [[]])[0], (res.get("documents") or [[]])[0],
-                                    (res.get("metadatas") or [[]])[0], (res.get("distances") or [[]])[0]):
+            # NumPy-safe extraction: `distances` comes back as a NumPy array, so we
+            # must not use `res.get("distances") or [[]]` (ambiguous truth value).
+            r_ids = _first_row(res.get("ids"))
+            r_docs = _first_row(res.get("documents"))
+            r_metas = _first_row(res.get("metadatas"))
+            r_dists = _first_row(res.get("distances"))
+            for cid, t, m, d in zip(r_ids, r_docs, r_metas, r_dists):
                 by_id[cid] = {"id": cid, "text": t or "", "metadata": m or {},
                               "score": 1.0 - float(d), "bm25": None}
                 vec_ids.append(cid)
@@ -594,29 +937,35 @@ class RAGEngine:
 
         if not by_id:
             print(f"[RAG] retrieve: where={where} scoped={scoped} raw=0 (no hits)")
+            if debug:
+                return {"summary": self._debug_summary(0, 0, 0, 0, False, 0, 0, 0, 0.0, True),
+                        "items": []}
             return []
 
-        # 3) Reciprocal Rank Fusion of the two rankings.
+        # 3) Reciprocal Rank Fusion of the two rankings. The fused score and
+        # provenance (dense / bm25 / both) are stored on each item for diagnostics.
         rv = {cid: i for i, cid in enumerate(vec_ids)}
         rl = {cid: i for i, cid in enumerate(lex_ids)}
         K = 60
-        fused = sorted(
-            by_id.values(),
-            key=lambda it: (1.0 / (K + rv[it["id"]]) if it["id"] in rv else 0.0)
-                           + (1.0 / (K + rl[it["id"]]) if it["id"] in rl else 0.0),
-            reverse=True,
-        )
+        for it in by_id.values():
+            cid = it["id"]
+            in_v, in_l = cid in rv, cid in rl
+            it["fused"] = ((1.0 / (K + rv[cid]) if in_v else 0.0)
+                           + (1.0 / (K + rl[cid]) if in_l else 0.0))
+            it["source"] = "both" if (in_v and in_l) else ("dense" if in_v else "bm25")
+        fused = sorted(by_id.values(), key=lambda it: it["fused"], reverse=True)
 
         # 4) Cosine score for BM25-only hits (for the cutoff + source display).
         missing = [it for it in fused if it["score"] is None]
         if missing:
             try:
-                got = self._chroma_collection.get(ids=[it["id"] for it in missing], include=["embeddings"])
-                got_ids = got.get("ids") or []
-                got_embs = got.get("embeddings")
-                if got_embs is None:
-                    got_embs = []
-                emap = dict(zip(got_ids, got_embs))
+                got = self._chroma_collection.get(ids=[it["id"] for it in missing],
+                                                  include=["embeddings"])
+                # NumPy-safe: `embeddings` is a NumPy array — coerce to plain lists
+                # and test membership with `is None`, never with truthiness.
+                got_ids = _to_list(got.get("ids"))
+                got_embs = _to_list(got.get("embeddings"))
+                emap = {cid: emb for cid, emb in zip(got_ids, got_embs)}
                 for it in missing:
                     e = emap.get(it["id"])
                     it["score"] = _cosine(qemb, e) if e is not None else RELEVANCE_CUTOFF
@@ -628,19 +977,122 @@ class RAGEngine:
         raw = len(fused)
         top_raw = round(max((it["score"] for it in fused), default=0.0), 4)
 
-        # 5) Relevance filter: keep lexical (exact-term) hits OR vector hits above
-        # the cutoff. Scoped queries keep everything (the document choice is the signal).
-        if scoped:
-            kept = fused
-        else:
-            kept = [it for it in fused if it.get("bm25") is not None or (it["score"] or 0) >= RELEVANCE_CUTOFF]
+        # 5) LIGHT pre-filter only. We deliberately do NOT apply the aggressive
+        # relevance cutoff here — that happens AFTER reranking, so the cross-encoder
+        # gets a chance to rank borderline-but-relevant passages. We only drop empty
+        # chunks and cap the pool the reranker has to score.
+        candidates = [it for it in fused if (it.get("text") or "").strip()][:RETRIEVE_CANDIDATES]
 
-        kept = self._rerank(kept, message)
-        result = kept[:RETRIEVE_TOP_K]
+        # 6) Rerank the FULL candidate pool (cross-encoder if enabled): it scores
+        # every candidate and returns them ordered by true query relevance.
+        reranked, reranked_applied = self._rerank(candidates, message)
+
+        # 7) Final selection — the aggressive filtering, now AFTER rerank.
+        selected = self._final_select(reranked, scoped, reranked_applied)
+        result = selected[:RETRIEVE_TOP_K]
         print(f"[RAG] retrieve: where={where} scoped={scoped} vec={len(vec_ids)} bm25={len(lex_ids)} "
-              f"fused={raw} top_score={top_raw} kept={len(kept)} returned={len(result)} "
+              f"fused={raw} cand={len(candidates)} rerank={'on' if reranked_applied else 'off'} "
+              f"top_score={top_raw} selected={len(selected)} returned={len(result)} "
               f"cutoff={RELEVANCE_CUTOFF}")
+        if debug:
+            return self._build_debug(message, scoped, vec_ids, lex_ids, fused, candidates,
+                                     reranked, reranked_applied, selected, result, top_raw)
         return result
+
+    # ─── Retrieval diagnostics (/debug/retrieve) ────────────────────────────────
+
+    @staticmethod
+    def _debug_summary(dense, bm25, fused, candidates, rerank_on, after_filter,
+                       returned, shown, top_cosine, strict_refuse):
+        return {
+            "dense_results": dense,
+            "bm25_results": bm25,
+            "fused_results": fused,
+            "candidates": candidates,
+            "reranker": "on" if rerank_on else "off",
+            "after_filter": after_filter,
+            "returned": returned,
+            "shown_sources": shown,
+            "top_cosine": round(float(top_cosine), 4),
+            "strict_decision": "refuse" if strict_refuse else "answer",
+            "relevance_cutoff": RELEVANCE_CUTOFF,
+            "min_bm25_score": MIN_BM25_SCORE,
+        }
+
+    @staticmethod
+    def _build_debug(query, scoped, vec_ids, lex_ids, fused, candidates,
+                     reranked, reranked_applied, selected, result, top_raw):
+        """Per-candidate + summary diagnostics describing how each fused candidate
+        was scored and why it was kept or filtered — and whether it is shown as a
+        source card."""
+        rerank_map = {it["id"]: it.get("rerank") for it in reranked}
+        cand_ids = {it["id"] for it in candidates}
+        selected_ids = {it["id"] for it in selected}
+        final_ids = {it["id"] for it in result}
+        # Which final chunks become source cards (strict display layer).
+        display_items = RAGEngine._select_source_items(result, scoped, reranked_applied)
+        display_ids = {it["id"] for it in display_items}
+
+        def reason(it):
+            cid = it["id"]
+            if cid in final_ids:
+                return True, "returned in final top-k"
+            if cid not in cand_ids:
+                return False, "dropped at light pre-filter (empty/over candidate cap)"
+            if cid in selected_ids:
+                return False, "selected but beyond RETRIEVE_TOP_K"
+            if scoped:
+                return False, "beyond RETRIEVE_TOP_K (scoped keeps all)"
+            if reranked_applied:
+                rk = it.get("rerank") or 0.0
+                if RERANK_MIN_SCORE > 0 and rk < RERANK_MIN_SCORE:
+                    return False, f"rerank {round(rk, 4)} < RERANK_MIN_SCORE {RERANK_MIN_SCORE}"
+                return False, "beyond RERANK_TOP_N"
+            bm, sc = it.get("bm25"), (it.get("score") or 0)
+            if (bm is not None and bm >= MIN_BM25_SCORE) or sc >= RELEVANCE_CUTOFF:
+                return False, "passed relevance but beyond RETRIEVE_TOP_K"
+            detail = f"cosine {round(sc, 4)} < {RELEVANCE_CUTOFF}"
+            detail += (f" and bm25 {round(bm, 4)} < {MIN_BM25_SCORE}"
+                       if bm is not None else " and no BM25 hit")
+            return False, f"weak: {detail}"
+
+        items = []
+        for idx, it in enumerate(fused):
+            md = it.get("metadata") or {}
+            passed, why = reason(it)
+            rk = rerank_map.get(it["id"])
+            shown = it["id"] in display_ids
+            if shown:
+                why = (why + "; shown as source card") if passed else "shown as source card"
+            elif passed and not RAGEngine._is_lexical_only(it):
+                pass
+            elif passed:
+                why = why + "; hidden from sources (lexical-only / off-topic)"
+            items.append({
+                "chunk_id": it.get("id"),
+                "chunk_index": idx,
+                "score": round(float(it.get("score") or 0), 4),       # dense / cosine
+                "bm25": (round(it["bm25"], 4) if it.get("bm25") is not None else None),
+                "fused": round(float(it.get("fused") or 0), 6),
+                "rerank": (round(rk, 4) if rk is not None else None),
+                "source": it.get("source"),
+                "filename": md.get("file_name"),
+                "rag_doc_id": md.get("rag_doc_id"),
+                "version": md.get("version"),
+                "page": md.get("page_label"),
+                "passed_filter": passed,
+                "displayed_as_source": shown,
+                "reason": why,
+                "text": RAGEngine._snippet(it.get("text") or "", query),
+            })
+
+        strict_refuse = RAGEngine._strict_should_refuse(len(result) > 0)
+        summary = RAGEngine._debug_summary(len(vec_ids), len(lex_ids), len(fused), len(candidates),
+                                           reranked_applied, len(selected), len(result),
+                                           len(display_ids), top_raw, strict_refuse)
+        summary["original_query"] = query
+        summary["retrieval_query"] = query   # /debug/retrieve has no history; rewrite is a no-op
+        return {"summary": summary, "items": items}
 
     # ─── Lexical index (BM25) ───────────────────────────────────────────────────
 
@@ -686,7 +1138,7 @@ class RAGEngine:
             page = md.get("page_label")
             if page and page != "?":
                 head += f" p.{page}"
-            parts.append(f"[{head}]\n{it['text']}")
+            parts.append(f"[{head}]\n{_clean_context_text(it['text'])}")
         return "\n\n".join(parts)
 
     def generate_title(self, message: str) -> str:
@@ -701,6 +1153,58 @@ class RAGEngine:
         except Exception as e:
             print(f"[RAG] title generation error ({e})")
             return fallback
+
+    def _contextualize_query(self, message: str, history: list[dict]) -> str:
+        """Rewrite a follow-up into a standalone retrieval query using recent turns,
+        resolving anaphora (e.g. 'بهذا المركب' → 'المركب السياحي كيمادو'). Returns the
+        ORIGINAL message on the first turn, when disabled, or whenever the rewrite
+        looks unsafe. Used for retrieval only — never shown, never used to answer.
+
+        Hardened against contamination: prior assistant answers can be wrong/corrupted
+        (e.g. a hallucinated 'Mercer'), so the rewrite is REJECTED if it introduces a
+        foreign script, contains corruption, drifts off-topic, or is malformed — in
+        which case we fall back to the (unmodified) original question."""
+        if not (QUERY_REWRITE_ENABLED and history):
+            return message
+        try:
+            recent = _trim_history(history)[-6:]
+            if not recent:
+                return message
+            # Clean each turn so corrupted glyphs (CJK/control) don't seed the rewrite.
+            convo = "\n".join(
+                f"{'User' if m['role'] == 'user' else 'Assistant'}: {_clean_context_text(m['content'])}"
+                for m in recent
+            )[:2000]
+            prompt = QUERY_REWRITE_PROMPT.format(history=convo, question=message)
+            resp = (self._title_llm or Settings.llm).complete(prompt.strip())
+            rewritten = ((resp.text or "").strip().strip('"').strip())
+            rewritten = _clean_context_text(rewritten.splitlines()[0]) if rewritten else ""
+
+            def reject(reason):
+                print(f"[RAG] query-rewrite REJECTED ({reason}): {message!r} -> {rewritten!r}")
+                return message
+
+            if not rewritten or rewritten.lower() == message.strip().lower():
+                return message
+            if len(rewritten) > len(message) * 4 + 120:
+                return reject("too long")
+            # Anti-contamination: the rewrite must not introduce a writing system
+            # absent from the user's question (this is what catches 'Mercer').
+            new_scripts = _scripts(rewritten) - _scripts(message)
+            if new_scripts:
+                return reject(f"introduced foreign script {sorted(new_scripts)}")
+            lm, lr = _detect_language(message), _detect_language(rewritten)
+            if lm and lr and lm != lr:
+                return reject(f"language drift {lm}->{lr}")
+            # Must stay on-topic: share at least one content token with the question.
+            q_terms, r_terms = set(_content_tokens(message)), set(_content_tokens(rewritten))
+            if q_terms and not (q_terms & r_terms):
+                return reject("no shared content token with the question")
+            print(f"[RAG] query-rewrite ACCEPTED: {message!r} -> {rewritten!r}")
+            return rewritten
+        except Exception as e:
+            print(f"[RAG] query-rewrite error ({e})")
+            return message
 
     def _should_use_docs(self, message: str, history: list[dict]) -> bool:
         # Deprecated: retrieval is now always attempted when the KB is non-empty
@@ -730,44 +1234,60 @@ class RAGEngine:
         scoped_ids = self._scoped_ids(scope)
         scoped = bool(scoped_ids)
 
+        # Resolve follow-up references against recent turns BEFORE retrieval, so an
+        # ambiguous question ("…بهذا المركب", "ce projet") fetches the right chunk.
+        # The rewrite is used ONLY for retrieval; the answer still uses `message`.
+        retrieval_query = await loop.run_in_executor(None, self._contextualize_query, message, history)
+
         items = []
         if scoped:
             # Explicit attachment(s): block until they are indexed, then ground on them.
             await self._await_attachments_indexed(scoped_ids)
-            items = await loop.run_in_executor(None, self._relevant_nodes, message, scope, user)
+            items = await loop.run_in_executor(None, self._relevant_nodes, retrieval_query, scope, user)
             print(f"[RAG] chat: scoped_docs={scoped_ids} items={len(items)} "
                   f"role={(user or {}).get('role')}")
         elif self.doc_count() > 0:
-            # Always retrieve when the KB is non-empty. A previous LLM yes/no
-            # "router" gated this per message, but it misfired badly for non-English
-            # replies — the model answering "Oui"/"نعم" was parsed as "no search" —
-            # so French/Arabic questions were answered WITHOUT the documents. The
-            # relevance cutoff already decides whether the hits are good enough to
-            # ground on, so the gate was both redundant and harmful.
-            items = await loop.run_in_executor(None, self._relevant_nodes, message, scope, user)
+            # Always retrieve when the KB is non-empty; the relevance cutoff decides
+            # whether the hits are good enough to ground on.
+            items = await loop.run_in_executor(None, self._relevant_nodes, retrieval_query, scope, user)
             print(f"[RAG] chat: doc_count={self.doc_count()} items={len(items)} "
                   f"role={(user or {}).get('role')}")
         else:
             print("[RAG] chat: knowledge base is empty (doc_count=0) — answering conversationally")
 
         use_docs = len(items) > 0
+        reranked_applied = any(it.get("rerank") is not None for it in items)
+
+        # GROUNDING is decided by the retrieved CONTEXT chunks (`items`), which have
+        # already passed the relevance gate (cosine >= cutoff OR strong BM25, or a
+        # scoped match). Strict refusal and the source display BOTH follow grounding
+        # — never the other way round. A chunk good enough to answer from is shown.
+        if strict and self._strict_should_refuse(use_docs):
+            print(f"[RAG] strict: refusing — no grounding chunk retrieved "
+                  f"(items=0 scoped={scoped})")
+            yield ("token", _strict_refusal(message))
+            yield ("sources", [])
+            return
+
+        # Source cards: always ≥1 when grounded (top chunk), precision-filtered tail.
+        display_sources = (self._format_sources(items, scoped=scoped, query=retrieval_query,
+                                                reranked_applied=reranked_applied)
+                           if use_docs else [])
+        grounded = use_docs
+
         base_prompt = SYSTEM_PROMPT_STRICT if strict else SYSTEM_PROMPT
-        if use_docs:
+        if grounded:
             system_text = (
                 base_prompt + directive + "\n\n"
                 + CONTEXT_TEMPLATE.format(context_str=self._context_block(items))
             )
         elif scoped or strict:
-            # Scoped to attachments (nothing retrievable) OR strict mode with no
-            # match: stay grounded and instruct the model to say it couldn't find
-            # the answer rather than inventing one or chatting from general knowledge.
-            no_ctx = (
-                "(Aucun extrait pertinent n'a été trouvé dans les documents pour cette "
-                "question.)"
-            )
+            # Scoped to attachments with nothing retrievable: stay grounded and
+            # instruct the model to say it couldn't find the answer (in the user's
+            # language) rather than inventing one or chatting from general knowledge.
             system_text = (
                 base_prompt + directive + "\n\n"
-                + CONTEXT_TEMPLATE.format(context_str=no_ctx)
+                + CONTEXT_TEMPLATE.format(context_str=_no_context_note(message))
             )
         else:
             system_text = CONV_SYSTEM_PROMPT + directive
@@ -782,56 +1302,161 @@ class RAGEngine:
 
         gen = await loop.run_in_executor(None, lambda: Settings.llm.stream_chat(msgs))
         sentinel = object()
+        answer_parts: list[str] = []
         while True:
             resp = await loop.run_in_executor(None, next, gen, sentinel)
             if resp is sentinel:
                 break
             delta = getattr(resp, "delta", None)
             if delta:
+                delta = _strip_artifacts(delta)   # drop ■/replacement/zero-width live
+                if not delta:
+                    continue
+                answer_parts.append(delta)
                 yield ("token", delta)
 
-        yield ("sources", self._format_sources(items, scoped=scoped) if use_docs else [])
+        # POST-ANSWER source gating. Source cards are emitted ONLY if the final answer
+        # is actually grounded. Two cases force sources=[]:
+        #   (1) the answer is a 'not found'/refusal statement (any mode) — e.g. strict
+        #       mode where the model refused because the fact wasn't in the extracts;
+        #   (2) non-strict, the answer barely overlaps the context (general answer).
+        # Genuinely document-grounded answers are untouched.
+        answer_text = "".join(answer_parts)
+        if display_sources and _is_refusal(answer_text):
+            print(f"[RAG] grounding: answer is a 'not found'/refusal — hiding "
+                  f"{len(display_sources)} source(s)")
+            display_sources = []
+        elif display_sources and not strict and not _answer_grounded(
+                answer_text, [it.get("text", "") for it in items], GROUNDING_MIN_OVERLAP):
+            print(f"[RAG] grounding: answer does not overlap retrieved context "
+                  f"(min_overlap={GROUNDING_MIN_OVERLAP}) — hiding {len(display_sources)} "
+                  f"source(s), treating as a general answer")
+            display_sources = []
+
+        yield ("sources", display_sources)
 
     @staticmethod
-    def _format_sources(items: list[dict], scoped: bool = False) -> list[dict]:
-        """Build the user-facing sources list. For normal questions, show only the
-        clearly-relevant matches (near the best score, above a floor) so an unrelated
-        long tail isn't displayed and small talk shows nothing. For scoped
-        (attached-document) queries, always surface the chosen document(s).
-        One entry per file (collapses multi-chunk hits and org/personal same-name)."""
+    def _strict_should_refuse(use_docs: bool) -> bool:
+        """Strict refusal is GROUNDING-based: refuse only when retrieval produced no
+        reliable chunk to answer from (``use_docs`` is False). It must NOT depend on
+        the source-card display filter — a chunk good enough to answer from is good
+        enough to cite, so a display bug must never cause a false refusal."""
+        return not use_docs
+
+    @staticmethod
+    def _source_eff(it: dict, use_rerank: bool) -> float:
+        """Effective relevance for DISPLAY ordering. With the reranker ON, use its
+        score (best, language-robust). With it OFF, use the FUSED (dense+BM25) score
+        — NOT raw cosine — so a strong lexical match (e.g. Arabic keywords) ranks as
+        the top source instead of an off-topic chunk with higher cosine. Falls back
+        to cosine when no fused score is present (e.g. in unit tests)."""
+        if use_rerank and it.get("rerank") is not None:
+            return float(it.get("rerank"))
+        if it.get("fused") is not None:
+            return float(it.get("fused"))
+        return float(it.get("score") or 0)
+
+    @staticmethod
+    def _is_lexical_only(it: dict) -> bool:
+        """A BM25 hit whose dense cosine is below the relevance cutoff: matched on
+        word overlap only. Used to keep such chunks out of SECONDARY source cards."""
+        return it.get("bm25") is not None and (it.get("score") or 0) < RELEVANCE_CUTOFF
+
+    @staticmethod
+    def _select_source_items(items: list[dict], scoped: bool = False,
+                             reranked_applied: bool = False) -> list[dict]:
+        """Pick the chunk(s) to display as source cards. The answer is grounded on
+        `items`, so the SINGLE best chunk is ALWAYS shown when items exist — a chunk
+        good enough to answer from is good enough to cite, and no display threshold
+        may hide it (this is what previously caused 'hors documents'/false refusals).
+        Additional cards (only when SOURCE_DISPLAY_TOP_K > 1) are filtered for
+        precision: close to the top and not lexical-only/off-topic. Scoped queries
+        surface the chosen document(s)."""
         if not items:
             return []
-        ranked = sorted(items, key=lambda it: float(it.get("score") or 0), reverse=True)
-        top = float(ranked[0].get("score") or 0)
-        sources: list[dict] = []
-        seen = set()  # one source per file
-        for it in ranked:
-            score = float(it.get("score") or 0)
-            if not scoped:
-                # Sorted desc: once we hit a weak/out-of-gap chunk, all the rest are
-                # worse, so stop. This drops the irrelevant tail and (when even the
-                # best match is weak, e.g. greetings) shows no source.
-                if score < SOURCE_MIN_SCORE:
-                    break
-                if sources and score < top - SOURCE_REL_GAP:
-                    break
+        use_rerank = reranked_applied and any(it.get("rerank") is not None for it in items)
+        ranked = sorted(items, key=lambda it: RAGEngine._source_eff(it, use_rerank), reverse=True)
+        top = RAGEngine._source_eff(ranked[0], use_rerank)
+        # Cards favour PRECISION: cap to SOURCE_DISPLAY_TOP_K for global search
+        # (default 1). Scoped queries may show up to SOURCE_MAX of the chosen docs.
+        limit = SOURCE_MAX if scoped else min(SOURCE_MAX, max(1, SOURCE_DISPLAY_TOP_K))
+
+        chosen, seen = [], set()
+        for i, it in enumerate(ranked):
+            if i > 0 and not scoped:
+                # SECONDARY cards only: must be near the best AND genuinely relevant.
+                # (The top card is always kept — it is what the answer is grounded on.)
+                e = RAGEngine._source_eff(it, use_rerank)
+                if use_rerank:
+                    if SOURCE_DISPLAY_MIN_RERANK > 0 and e < SOURCE_DISPLAY_MIN_RERANK:
+                        break
+                else:
+                    if RAGEngine._is_lexical_only(it):
+                        continue                   # skip lexical-only noise tail
+                    if top > 0 and e < top - SOURCE_REL_GAP:
+                        break                      # too far below the best match
             md = it.get("metadata") or {}
             key = md.get("file_name") or md.get("rag_doc_id")
             if not key or key in seen:
                 continue
             seen.add(key)
-            text = it.get("text") or ""
+            chosen.append(it)
+            if len(chosen) >= limit:
+                break
+        return chosen
+
+    @staticmethod
+    def _snippet(text: str, query: Optional[str], width: int = 320) -> str:
+        """A clean preview that shows the part of the chunk that best supports the
+        answer — not blindly the first N chars or the first loosely-matching term.
+        Among all query-term match positions it picks the window covering the MOST
+        distinct query terms, and prefers a window containing a number/date (so a
+        quantity like '700 كيلوغرام' is shown rather than an unrelated lead line)."""
+        clean = _clean_context_text(text)
+        if len(clean) <= width:
+            return clean                          # whole (short) chunk fits — no windowing
+        toks = _content_tokens(query) if query else []
+        if not toks:
+            return clean[:width] + "…"
+        hay = _fold_arabic(clean.lower())          # length-aligned with `clean`
+        positions = sorted({p for p in (hay.find(t) for t in set(toks)) if p != -1})
+        if not positions:
+            return clean[:width] + "…"
+        best_start, best_score = 0, -1
+        tokset = set(toks)
+        for p in positions:
+            start = max(0, p - 60)
+            end = min(len(clean), start + width)
+            window = hay[start:end]
+            score = sum(1 for t in tokset if t in window)        # query-term coverage
+            if any(ch.isdigit() for ch in clean[start:end]):
+                score += 1                                       # prefer facts/numbers
+            if score > best_score:
+                best_score, best_start = score, start
+        start = best_start
+        end = min(len(clean), start + width)
+        seg = clean[start:end].strip()
+        return ("…" if start > 0 else "") + seg + ("…" if end < len(clean) else "")
+
+    @staticmethod
+    def _format_sources(items: list[dict], scoped: bool = False, query: Optional[str] = None,
+                        reranked_applied: bool = False) -> list[dict]:
+        """Build the user-facing source cards from the selection, with a query-relevant
+        snippet per card. One entry per file. When `items` is non-empty (the answer is
+        grounded) this ALWAYS returns at least one card. See _select_source_items."""
+        chosen = RAGEngine._select_source_items(items, scoped, reranked_applied)
+        sources = []
+        for it in chosen:
+            md = it.get("metadata") or {}
             sources.append({
-                "text": text[:320] + ("…" if len(text) > 320 else ""),
-                "score": round(score, 4),
+                "text": RAGEngine._snippet(it.get("text") or "", query),
+                "score": round(float(it.get("score") or 0), 4),
                 "filename": md.get("file_name", "Unknown"),
                 "page": md.get("page_label", "?"),
                 "document_id": md.get("rag_doc_id"),
                 "version": md.get("version"),
             })
-            if len(sources) >= SOURCE_MAX:
-                break
-        print(f"[RAG] sources: scoped={scoped} top={round(top, 4)} "
+        print(f"[RAG] sources: scoped={scoped} "
               f"shown={len(sources)}/{len(items)} -> {[(s['filename'], s['score']) for s in sources]}")
         return sources
 

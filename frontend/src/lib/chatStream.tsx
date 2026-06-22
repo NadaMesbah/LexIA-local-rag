@@ -133,22 +133,28 @@ export function ChatStreamProvider({ children }: { children: React.ReactNode }) 
           delete controllersRef.current[sid];
           const ok = !errored && acc.trim().length > 0;
 
-          // Auto-title the conversation on its first successful turn. No longer
-          // swallowed silently: log the failure so it is diagnosable, and pass
-          // the resulting title back so the page can apply it immediately.
-          let title = '';
+          // Finalize the stream IMMEDIATELY: stop the loading bubble and let the page
+          // re-sync from the server. The auto-title (a separate LLM call that can take
+          // seconds on a local model) must NOT block this — doing so left the
+          // streaming bubble stuck on screen and made the answer appear to repeat.
+          seqRef.current += 1;
+          setCompletion({ seq: seqRef.current, sid, ok, errored, errMsg, answer: acc, title: '' });
+          clearStreamFor(sid);
+
+          // Auto-title asynchronously, AFTER the stream is finalized. When it returns,
+          // emit a second completion carrying only the title so the page applies it.
           if (firstTurn && ok) {
             try {
               const r = await api.autotitleSession(sid);
-              title = r?.title || '';
+              const title = r?.title || '';
+              if (title) {
+                seqRef.current += 1;
+                setCompletion({ seq: seqRef.current, sid, ok: true, errored: false, errMsg: '', answer: acc, title });
+              }
             } catch (e) {
               console.warn('[chat] auto-title failed for session', sid, e);
             }
           }
-
-          seqRef.current += 1;
-          setCompletion({ seq: seqRef.current, sid, ok, errored, errMsg, answer: acc, title });
-          clearStreamFor(sid);
         }
       })();
     },

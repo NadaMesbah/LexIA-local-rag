@@ -24,6 +24,21 @@ import * as api from '@/lib/api';
 import { useChatStream } from '@/lib/chatStream';
 import { useAttachments } from '@/lib/attachments';
 
+// Per-conversation UI prefs (strict mode + active document scope) persisted across
+// page navigation / reload. Keyed by conversation id (and '__draft__' before first send).
+const STRICT_LS_KEY = 'rag.strictByConv';
+const SCOPE_LS_KEY = 'rag.scopeByConv';
+
+function loadConvMap<T extends object>(key: string): T {
+  if (typeof window === 'undefined') return {} as T;
+  try { return (JSON.parse(window.localStorage.getItem(key) || '{}') as T) || ({} as T); }
+  catch { return {} as T; }
+}
+function saveConvMap(key: string, val: unknown): void {
+  if (typeof window === 'undefined') return;
+  try { window.localStorage.setItem(key, JSON.stringify(val)); } catch { /* ignore quota */ }
+}
+
 export default function ChatPage() {
   const [status, setStatus] = useState<Status | null>(null);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
@@ -31,6 +46,19 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [confirmId, setConfirmId] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
+  // Strict RAG ("Documents uniquement") AND active document scope are stored PER
+  // conversation, persisted in localStorage so they survive navigating to /documents
+  // or /users and back (the chat page unmounts). '__draft__' holds the choice for a
+  // not-yet-created conversation (migrated to its id on the first send).
+  const [strictByConv, setStrictByConv] = useState<Record<string, boolean>>(() => loadConvMap(STRICT_LS_KEY));
+  const [scopeByConv, setScopeByConv] = useState<Record<string, { id: string; filename: string }[]>>(() => loadConvMap(SCOPE_LS_KEY));
+  useEffect(() => { saveConvMap(STRICT_LS_KEY, strictByConv); }, [strictByConv]);
+  useEffect(() => { saveConvMap(SCOPE_LS_KEY, scopeByConv); }, [scopeByConv]);
+  const docsOnly = strictByConv[currentId ?? '__draft__'] ?? false;
+  const setDocsOnly = useCallback(
+    (v: boolean) => setStrictByConv((m) => ({ ...m, [currentId ?? '__draft__']: v })),
+    [currentId],
+  );
   const [toast, setToast] = useState<{ msg: string; sev: 'success' | 'error' | 'info'; sid?: string } | null>(null);
 
   // Streaming lives ABOVE this page (in a layout-level provider), so a running
@@ -143,19 +171,28 @@ export default function ChatPage() {
     async (text: string) => {
       let sid = currentId;
       const firstTurn = !sid || messages.length === 0;
+      // Strict mode chosen for THIS conversation (or the draft, before it exists).
+      const effStrict = strictByConv[currentId ?? '__draft__'] ?? false;
       if (!sid) {
         try {
           const s = await api.createSession();
           sid = s.id;
           setCurrentId(sid);
+          // Carry the draft strict choice onto the freshly-created conversation.
+          setStrictByConv((m) => ({ ...m, [sid as string]: effStrict }));
           await refreshSessions();
         } catch { return; }
       }
       if (isActive(sid)) return; // this conversation is already generating
 
       const atts = pendingAttachments.map((a) => ({ id: a.id, filename: a.filename }));
-      const scope = atts.length ? { type: 'document', ids: atts.map((a) => a.id) } : undefined;
+      // Sticky scope: newly attached docs become the conversation's active scope;
+      // otherwise reuse the scope already active for this conversation (follow-ups).
+      const sticky = scopeByConv[sid as string] || [];
+      const scopeDocs = atts.length ? atts : sticky;
+      const scope = scopeDocs.length ? { type: 'document', ids: scopeDocs.map((a) => a.id) } : undefined;
       const notReady = pendingAttachments.some((a) => a.status !== 'indexed' && a.status !== 'failed');
+      if (atts.length) setScopeByConv((m) => ({ ...m, [sid as string]: atts }));
 
       setMessages((m) => [
         ...m,
@@ -173,12 +210,12 @@ export default function ChatPage() {
 
       startStream({
         url: api.chatUrl(sid),
-        body: { message: text, scope, attachments: atts.length ? atts : undefined },
+        body: { message: text, scope, attachments: atts.length ? atts : undefined, strict: effStrict || undefined },
         sid,
         firstTurn,
       });
     },
-    [currentId, messages.length, pendingAttachments, isActive, startStream, refreshSessions, clearPending]
+    [currentId, messages.length, pendingAttachments, isActive, startStream, refreshSessions, clearPending, strictByConv, scopeByConv]
   );
 
   const handleEdit = useCallback(
@@ -347,6 +384,10 @@ export default function ChatPage() {
           streaming={!!cur?.active}
           uploading={uploading}
           attachments={pendingAttachments}
+          strict={docsOnly}
+          onStrictChange={setDocsOnly}
+          scopeDocs={currentId ? scopeByConv[currentId] || [] : []}
+          onClearScope={() => currentId && setScopeByConv((m) => ({ ...m, [currentId]: [] }))}
           onSend={handleSend}
           onStop={handleStop}
           onAttach={handleAttach}
