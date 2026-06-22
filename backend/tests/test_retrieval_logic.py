@@ -227,6 +227,56 @@ def test_sources_capped():
     assert len(RAGEngine._format_sources(items)) == rg.SOURCE_MAX
 
 
+# ─── Source display = strictest layer (grounding/snippet/precision) ───────────
+
+def _lex(name, cosine, bm25):
+    # A lexical-only candidate: BM25 hit whose dense cosine is below the cutoff.
+    return {"id": name, "text": f"text {name}", "score": cosine, "bm25": bm25,
+            "metadata": {"file_name": name, "rag_doc_id": name}}
+
+
+def test_lexical_only_chunk_is_not_displayed_as_source():
+    # Weather question: ML chunk matched only on lexical overlap (temperature/hot).
+    pool = [_item("Weather.pdf", 0.52), _lex("Machine_Learning_Ch4.pdf", 0.20, 3.0)]
+    assert rg.RAGEngine._is_lexical_only(pool[1]) is True
+    assert names(RAGEngine._format_sources(pool)) == ["Weather.pdf"]
+
+
+def test_ensure_one_surfaces_grounded_source_when_all_below_floor():
+    # Grounded Arabic answer: chunks below the display floor → no card normally,
+    # but ensure_one shows the single best one so it isn't flagged "hors documents".
+    ar = [_item("AL-ALAM2026-AR.pdf", 0.33), _item("AL-ALAM2026-AR.pdf", 0.31)]
+    assert RAGEngine._format_sources(ar) == []
+    assert names(RAGEngine._format_sources(ar, ensure_one=True)) == ["AL-ALAM2026-AR.pdf"]
+
+
+def test_display_is_rerank_aware(monkeypatch):
+    monkeypatch.setattr(rg, "SOURCE_DISPLAY_MIN_RERANK", 0.3)
+    rr = [
+        {"id": "c", "score": 0.20, "rerank": 0.95, "text": "t", "metadata": {"file_name": "C.pdf"}},
+        {"id": "a", "score": 0.55, "rerank": 0.80, "text": "t", "metadata": {"file_name": "A.pdf"}},
+        {"id": "b", "score": 0.30, "bm25": 2.0, "rerank": 0.05, "text": "t", "metadata": {"file_name": "B.pdf"}},
+    ]
+    disp = names(RAGEngine._format_sources(rr, reranked_applied=True))
+    assert disp[:2] == ["C.pdf", "A.pdf"]   # ordered by rerank, not cosine
+    assert "B.pdf" not in disp              # below SOURCE_DISPLAY_MIN_RERANK
+
+
+def test_snippet_windows_to_query_relevant_text():
+    chunk = ("Eau dessalée de Safi vers Marrakech sur 185 km. " * 4 +
+             "Par ailleurs, la fuite FortiBleed a exposé des identifiants VPN; la DGSSI alerte.")
+    snip = RAGEngine._snippet(chunk, "Que révèle la fuite FortiBleed ?")
+    assert "FortiBleed" in snip
+    assert snip.startswith("…")             # a window, not the head of the chunk
+    # No query → head of (cleaned) text.
+    assert RAGEngine._snippet("ABCDEFGH" * 60, None).startswith("ABCDEFGH")
+
+
+def test_contextualize_query_noop_without_history():
+    # The guard returns the original message (no LLM call) on the first turn.
+    assert RAGEngine._contextualize_query(object(), "ما هذا؟", []) == "ما هذا؟"
+
+
 # ─── Strict mode: deterministic, language-aware refusal ───────────────────────
 
 def test_strict_refusal_messages_are_language_aware():
