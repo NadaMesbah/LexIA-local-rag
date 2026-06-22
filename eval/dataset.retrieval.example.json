@@ -1,0 +1,18 @@
+[
+  {
+    "question": "Selon le Digital News Report 2026, qu'est-ce qui est devenu la principale porte d'entrée vers l'actualité ?",
+    "ground_truth": "Les réseaux sociaux et les plateformes vidéo sont devenus la principale porte d'entrée vers l'actualité.",
+    "expected_doc": "reuters",
+    "expected_page": "1"
+  },
+  {
+    "question": "Pourquoi Bank Al-Maghrib a-t-elle émis un avertissement en lien avec le Mondial 2026 ?",
+    "ground_truth": "Recrudescence des cyberattaques (phishing, fraude) exploitant l'engouement pour le Mondial 2026.",
+    "expected_doc": "bank-al-maghrib"
+  },
+  {
+    "question": "من ترأس أشغال تجديد فرع حزب الاستقلال بالفنيدق؟",
+    "ground_truth": "منصف الطوب هو من ترأس أشغال تجديد فرع حزب الاستقلال بالفنيدق.",
+    "expected_doc_id": "REPLACE_WITH_REAL_rag_doc_id"
+  }
+]

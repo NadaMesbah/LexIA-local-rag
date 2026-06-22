@@ -23,6 +23,41 @@ def test_tokenize_is_nfkc_invariant():
     assert rg._tokenize("Bonjour LE Monde") == ["bonjour", "le", "monde"]
 
 
+def test_normalize_strips_arabic_diacritics_and_tatweel():
+    assert rg._normalize_text("العَمُولَة") == "العمولة"     # tashkeel removed
+    assert rg._normalize_text("العمـــولة") == "العمولة"     # tatweel removed
+
+
+def test_fold_arabic_unifies_spelling_variants():
+    assert rg._fold_arabic("إلى") == "الي"      # alef-hamza-below + alef-maqsura
+    assert rg._fold_arabic("نسبة") == "نسبه"    # ta marbuta -> ha
+    assert rg._fold_arabic("hello") == "hello"  # no-op for Latin
+
+
+def test_bm25_matches_arabic_spelling_variants():
+    bm = _bm25([
+        "التقرير يذكر أن إجمالي العمولة مرتفع",
+        "وثيقة عن تعلم الآلة والشبكات العصبية",
+    ])
+    # Query typed without the hamza / with ta-marbuta differences still matches.
+    hits = bm.search("ما هو اجمالي العموله ؟", 2)
+    assert hits and hits[0][0] == "c0"
+
+
+def test_clean_context_strips_cjk_and_control_keeps_arabic():
+    dirty = "العمولة 2,9% \u4f60\u597d\ufffd\u200b للمعاملات"
+    clean = rg._clean_context_text(dirty)
+    import re as _re
+    assert not _re.search(r"[\u4e00-\u9fff]", clean)   # CJK gone
+    assert "\ufffd" not in clean and "\u200b" not in clean
+    assert "العمولة" in clean and "للمعاملات" in clean  # Arabic preserved
+
+
+def test_arabic_language_directive_is_arabic_only():
+    d = rg._language_directive("ما هي نسبة العمولة؟")
+    assert "Arabic" in d and "non-Arabic" in d
+
+
 # ─── BM25 lexical search ──────────────────────────────────────────────────────
 
 def _bm25(texts):
@@ -44,6 +79,72 @@ def test_bm25_ranks_exact_term_match_first():
 def test_bm25_greeting_has_no_lexical_hit():
     bm = _bm25(["Switch Pay commission Banque Atlas", "machine learning model"])
     assert bm.search("Bonjour, comment vas-tu ?", 3) == []
+
+
+# ─── Stopwords / content tokens (BM25 noise reduction) ────────────────────────
+
+def test_content_tokens_drop_stopwords_keep_content():
+    ct = rg._content_tokens("Quelle est la commission appliquée par Switch Pay ?")
+    assert "la" not in ct and "est" not in ct and "par" not in ct      # FR stopwords gone
+    assert {"commission", "switch", "pay"}.issubset(set(ct))            # content kept
+
+
+def test_content_tokens_drop_french_elision_keep_digits():
+    assert rg._content_tokens("l'application d'agent") == ["application", "agent"]
+    assert "2024" in rg._content_tokens("rapport 2024")
+
+
+def test_content_tokens_drop_arabic_stopwords():
+    ar = rg._content_tokens("ما هي نسبة العمولة في البنك؟")
+    assert "ما" not in ar and "هي" not in ar and "في" not in ar
+
+
+def test_tokenize_still_keeps_stopwords():
+    # _tokenize is unchanged (used for NFKC invariants); only BM25 strips stopwords.
+    assert rg._tokenize("Bonjour LE Monde") == ["bonjour", "le", "monde"]
+
+
+def test_min_bm25_score_filters_weak_lexical_noise(monkeypatch):
+    monkeypatch.setattr(rg, "MIN_BM25_SCORE", 1.5)
+    monkeypatch.setattr(rg, "RELEVANCE_CUTOFF", 0.25)
+    pool = [
+        {"id": "vec", "score": 0.55, "bm25": None, "text": "a"},        # strong cosine
+        {"id": "bm_ok", "score": 0.10, "bm25": 3.0, "text": "b"},       # weak cos, strong BM25
+        {"id": "bm_weak", "score": 0.10, "bm25": 0.4, "text": "c"},     # weak both -> noise
+    ]
+    out = [x["id"] for x in RAGEngine._final_select(pool, scoped=False, reranked_applied=False)]
+    assert "vec" in out and "bm_ok" in out
+    assert "bm_weak" not in out
+
+
+# ─── NumPy-safety (the fix for "truth value of an array is ambiguous") ────────
+# Chroma returns embeddings/distances as numpy arrays; the retrieval code must
+# never put them in a boolean context. These tests use REAL numpy arrays.
+
+def test_to_list_handles_numpy_and_none():
+    import numpy as np
+    assert rg._to_list(None) == []
+    assert rg._to_list([1, 2]) == [1, 2]
+    # 2D ndarray (a Chroma get(embeddings) result) -> nested python list.
+    assert rg._to_list(np.array([[0.1, 0.2], [0.3, 0.4]])) == [[0.1, 0.2], [0.3, 0.4]]
+    # An empty ndarray must not raise and must be falsy-safe.
+    assert rg._to_list(np.array([])) == []
+
+
+def test_first_row_handles_numpy_query_result():
+    import numpy as np
+    # Chroma query results are shaped [[...]] and distances come back as ndarrays.
+    assert rg._first_row(np.array([[0.1, 0.25, 0.4]])) == [0.1, 0.25, 0.4]
+    assert rg._first_row([["c1", "c2"]]) == ["c1", "c2"]
+    assert rg._first_row(None) == []
+    assert rg._first_row(np.array([])) == []
+
+
+def test_cosine_accepts_numpy_arrays():
+    import numpy as np
+    # The BM25-only cosine backfill passes coerced numpy embeddings here.
+    assert abs(rg._cosine([1.0, 0.0], np.array([1.0, 0.0])) - 1.0) < 1e-9
+    assert abs(rg._cosine(np.array([1.0, 0.0]), np.array([0.0, 1.0]))) < 1e-9
 
 
 # ─── Cosine ───────────────────────────────────────────────────────────────────
@@ -124,3 +225,67 @@ def test_sources_scoped_bypasses_floor():
 def test_sources_capped():
     items = [_item(f"{i}.pdf", 0.60) for i in range(8)]
     assert len(RAGEngine._format_sources(items)) == rg.SOURCE_MAX
+
+
+# ─── Strict mode: deterministic, language-aware refusal ───────────────────────
+
+def test_strict_refusal_messages_are_language_aware():
+    assert rg._strict_refusal("What is the commission rate?") == \
+        "I could not find this information in the provided documents."
+    assert rg._strict_refusal("Quelle est la commission appliquée ?") == \
+        "Je n’ai pas trouvé cette information dans les documents fournis."
+    assert rg._strict_refusal("ما هي نسبة العمولة المطبقة؟") == \
+        "لم أجد هذه المعلومة في الوثائق المقدمة."
+    # Unknown language falls back to English.
+    assert rg._strict_refusal("?!?") == \
+        "I could not find this information in the provided documents."
+
+
+def test_no_context_note_follows_language():
+    assert "العثور" in rg._no_context_note("ما هذا؟")                 # Arabic
+    assert "No relevant extract" in rg._no_context_note("What is this?")
+    assert "Aucun extrait" in rg._no_context_note("Quel est ce document ?")
+
+
+def test_strict_grounding_gate():
+    R = RAGEngine._strict_should_refuse
+    # No source strong enough to show, global query -> refuse.
+    assert R([], scoped=False, use_docs=False) is True
+    assert R([], scoped=False, use_docs=True) is True       # retrieved but all weak
+    # A displayed source -> answer.
+    assert R([{"filename": "x"}], scoped=False, use_docs=True) is False
+    # Scoped (attached) query with chunks -> answer even below display floor.
+    assert R([], scoped=True, use_docs=True) is False
+    # Scoped but nothing retrieved (e.g. empty/failed index) -> refuse.
+    assert R([], scoped=True, use_docs=False) is True
+
+
+# ─── Pipeline order: rerank BEFORE the aggressive final filter ────────────────
+
+def _cand(id_, score=None, bm25=None, rerank=None):
+    return {"id": id_, "score": score, "bm25": bm25, "rerank": rerank,
+            "text": id_, "metadata": {"file_name": id_}}
+
+
+def test_final_select_rerank_off_applies_cosine_cutoff():
+    pool = [_cand("a", score=0.55), _cand("b", score=0.30, bm25=2.0),
+            _cand("c", score=0.20), _cand("d", score=0.42), _cand("e", score=0.10, bm25=1.0)]
+    out = [x["id"] for x in RAGEngine._final_select(pool, scoped=False, reranked_applied=False)]
+    assert "a" in out and "d" in out      # strong cosine kept
+    assert "b" in out and "e" in out      # exact BM25 hits kept even below cutoff
+    assert "c" not in out                 # weak vector-only noise dropped
+
+
+def test_final_select_rerank_on_trusts_reranker_order_no_premature_cutoff():
+    # The reranker ranked a low-cosine chunk #1 — it must survive (the old code
+    # filtered by cosine BEFORE rerank and would have dropped it).
+    reranked = [_cand("c", score=0.20, rerank=0.99), _cand("a", score=0.55, rerank=0.80),
+                _cand("b", score=0.30, bm25=2.0, rerank=0.10)]
+    out = RAGEngine._final_select(reranked, scoped=False, reranked_applied=True)
+    assert [x["id"] for x in out] == ["c", "a", "b"]
+    assert out[0]["id"] == "c"
+
+
+def test_final_select_scoped_keeps_all():
+    pool = [_cand("a", score=0.55), _cand("c", score=0.05)]
+    assert len(RAGEngine._final_select(pool, scoped=True, reranked_applied=False)) == 2
