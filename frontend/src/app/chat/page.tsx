@@ -24,6 +24,21 @@ import * as api from '@/lib/api';
 import { useChatStream } from '@/lib/chatStream';
 import { useAttachments } from '@/lib/attachments';
 
+// Per-conversation UI prefs (strict mode + active document scope) persisted across
+// page navigation / reload. Keyed by conversation id (and '__draft__' before first send).
+const STRICT_LS_KEY = 'rag.strictByConv';
+const SCOPE_LS_KEY = 'rag.scopeByConv';
+
+function loadConvMap<T extends object>(key: string): T {
+  if (typeof window === 'undefined') return {} as T;
+  try { return (JSON.parse(window.localStorage.getItem(key) || '{}') as T) || ({} as T); }
+  catch { return {} as T; }
+}
+function saveConvMap(key: string, val: unknown): void {
+  if (typeof window === 'undefined') return;
+  try { window.localStorage.setItem(key, JSON.stringify(val)); } catch { /* ignore quota */ }
+}
+
 export default function ChatPage() {
   const [status, setStatus] = useState<Status | null>(null);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
@@ -32,13 +47,13 @@ export default function ChatPage() {
   const [confirmId, setConfirmId] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   // Strict RAG ("Documents uniquement") AND active document scope are stored PER
-  // conversation, so conversation A can be strict while B stays general, and switching
-  // conversations restores each one's own mode + scope. '__draft__' holds the choice
-  // for a not-yet-created conversation (migrated to its id on the first send).
-  const [strictByConv, setStrictByConv] = useState<Record<string, boolean>>({});
-  // Sticky document scope, per conversation: once a document is attached/selected it
-  // stays the active scope for that conversation's follow-ups until cleared.
-  const [scopeByConv, setScopeByConv] = useState<Record<string, { id: string; filename: string }[]>>({});
+  // conversation, persisted in localStorage so they survive navigating to /documents
+  // or /users and back (the chat page unmounts). '__draft__' holds the choice for a
+  // not-yet-created conversation (migrated to its id on the first send).
+  const [strictByConv, setStrictByConv] = useState<Record<string, boolean>>(() => loadConvMap(STRICT_LS_KEY));
+  const [scopeByConv, setScopeByConv] = useState<Record<string, { id: string; filename: string }[]>>(() => loadConvMap(SCOPE_LS_KEY));
+  useEffect(() => { saveConvMap(STRICT_LS_KEY, strictByConv); }, [strictByConv]);
+  useEffect(() => { saveConvMap(SCOPE_LS_KEY, scopeByConv); }, [scopeByConv]);
   const docsOnly = strictByConv[currentId ?? '__draft__'] ?? false;
   const setDocsOnly = useCallback(
     (v: boolean) => setStrictByConv((m) => ({ ...m, [currentId ?? '__draft__']: v })),

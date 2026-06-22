@@ -378,6 +378,23 @@ def _clean_context_text(text: str) -> str:
     return re.sub(r"[ \t]{2,}", " ", t).strip()
 
 
+# Obvious display artifacts to strip from the FINAL answer (not CJK — a Chinese user
+# answer is legitimate; the language directive handles language). Covers the black
+# squares (■ and other geometric/block glyphs), the Unicode replacement char, and
+# zero-width / bidi control characters that PDF extraction leaks into the model.
+_ANSWER_ARTIFACTS = re.compile(
+    r"[\u25A0-\u25FF\u2580-\u259F"          # ■ geometric shapes + block elements
+    r"\uFFFD"                                 # replacement char
+    r"\u200B-\u200F\u202A-\u202E\u2060\u2066-\u2069\uFEFF]"   # zero-width / bidi
+)
+
+
+def _strip_artifacts(text: str) -> str:
+    """Remove obvious artifacts (■, replacement char, zero-width/bidi controls) from
+    answer text. Safe: never touches Arabic/Latin letters, digits or punctuation."""
+    return _ANSWER_ARTIFACTS.sub("", text or "")
+
+
 def _answer_grounded(answer: str, contexts: list, min_overlap: float) -> bool:
     """Heuristic, language-aware check that a generated answer is actually supported
     by the retrieved context — not produced from general knowledge. Compares content
@@ -395,7 +412,10 @@ def _answer_grounded(answer: str, contexts: list, min_overlap: float) -> bool:
     for c in contexts:
         ctx |= set(_content_tokens(c or ""))
     shared = ans & ctx
-    return (len(shared) / len(ans)) >= min_overlap or len(shared) >= 4
+    # Ratio-only: a general answer (e.g. design patterns) shares only a few generic
+    # tokens with an unrelated news chunk → low ratio → not grounded. A doc-grounded
+    # answer (incl. paraphrased Arabic reusing entities/numbers) stays well above.
+    return (len(shared) / len(ans)) >= min_overlap
 
 
 def _tokenize(text: str) -> list[str]:
@@ -1272,6 +1292,9 @@ class RAGEngine:
                 break
             delta = getattr(resp, "delta", None)
             if delta:
+                delta = _strip_artifacts(delta)   # drop ■/replacement/zero-width live
+                if not delta:
+                    continue
                 answer_parts.append(delta)
                 yield ("token", delta)
 

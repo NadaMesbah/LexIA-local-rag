@@ -310,6 +310,25 @@ def test_answer_grounded_empty_answer_not_hidden():
     assert rg._answer_grounded("", ["whatever"], 0.18) is True
 
 
+def test_answer_grounded_long_general_answer_not_grounded():
+    # A long general answer must NOT be considered grounded just by sharing a few
+    # generic words with a news chunk (the dropped `>=4` fallback bug).
+    answer = ("Les design patterns sont des solutions réutilisables. Par exemple le "
+              "Singleton garantit une instance unique. La Factory permet de créer des "
+              "objets. Observer notifie plusieurs composants. Strategy encapsule des "
+              "algorithmes. Adapter convertit une interface. Decorator ajoute des "
+              "comportements. Ils améliorent la maintenance et la lisibilité du code.")
+    ctx = ["Le Maroc bat l'Écosse 1-0 au Mondial 2026; la météo annonce 46°C par exemple."]
+    assert rg._answer_grounded(answer, ctx, 0.18) is False
+
+
+def test_strip_artifacts_removes_box_replacement_zerowidth_keeps_text():
+    assert rg._strip_artifacts("شحنة ■ من مخدر") == "شحنة  من مخدر"
+    assert rg._strip_artifacts("identifiants\ufffd VPN\u200b") == "identifiants VPN"
+    # Real Arabic/Latin/digits/punctuation untouched.
+    assert rg._strip_artifacts("700 كيلوغرام (DGSSI)") == "700 كيلوغرام (DGSSI)"
+
+
 def test_snippet_prefers_window_with_query_terms_and_number():
     chunk = ("Le tournoi se poursuit cette semaine au Maroc. " * 5 +
              "La police judiciaire de Tanger a saisi 700 kilogrammes de chira "
