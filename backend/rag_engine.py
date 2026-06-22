@@ -435,6 +435,57 @@ def _is_refusal(answer: str) -> bool:
     return bool(a.strip()) and any(m in a for m in _REFUSAL_MARKERS)
 
 
+# ─── Small talk / greeting detection (deterministic, language-aware) ──────────
+# Obvious greetings / thanks / social small talk must be answered NATURALLY without
+# retrieving documents and without showing any source card — even when "Documents
+# uniquement" (strict) is on. This is deliberately conservative: it only fires for
+# short messages made ENTIRELY of greeting/thanks vocabulary, or matching a known
+# small-talk phrase. Any real question — including short ones like "C'est quoi le
+# machine learning ?" — falls through to normal RAG (and strict refusal if needed).
+_SMALLTALK_WORDS = {
+    # French
+    "bonjour", "salut", "coucou", "bonsoir", "cc", "slt", "slut", "cv",
+    "merci", "mercii", "beaucoup", "bien", "bonne", "journee", "soiree", "ok",
+    # English
+    "hi", "hello", "hey", "yo", "sup", "hiya", "thanks", "thank", "thx", "ty",
+    "you", "u", "bye", "goodbye", "greetings", "lot",
+    # Arabic (already folded: أ→ا, ة→ه, ى→ي, diacritics stripped)
+    "مرحبا", "سلام", "السلام", "عليكم", "شكرا", "اهلا", "صباح", "مساء", "الخير",
+}
+_SMALLTALK_PHRASES = (
+    # French
+    "ca va", "comment ca va", "comment vas tu", "comment allez vous",
+    "tu vas bien", "vous allez bien", "ca roule", "quoi de neuf",
+    # English
+    "thank you", "thanks a lot", "how are you", "whats up", "what s up",
+    "how s it going", "how are things", "nice to meet",
+    # Arabic
+    "السلام عليكم", "وعليكم السلام", "كيف حالك", "كيف الحال", "كيفك",
+    "صباح الخير", "مساء الخير",
+)
+
+
+def _smalltalk_key(text: str) -> str:
+    """Fold a message for small-talk matching: strip accents/diacritics, fold Arabic
+    spelling variants and lowercase (é→e, ç→c, أ→ا …) so 'Ça va' matches 'ca va'."""
+    t = unicodedata.normalize("NFKD", text or "")
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    return _fold_arabic(_AR_DIACRITICS.sub("", t)).lower()
+
+
+def _is_small_talk(message: str) -> bool:
+    """True only for obvious, short greetings / thanks / social small talk. Used to
+    bypass retrieval AND source display (and to skip strict refusal) for messages
+    like 'Salut', 'Ça va ?', 'Merci', 'مرحبا', 'السلام عليكم'."""
+    tokens = re.findall(r"\w+", _smalltalk_key(message), re.UNICODE)
+    if not tokens or len(tokens) > 5:
+        return False
+    joined = " ".join(tokens)
+    if any(p in joined for p in _SMALLTALK_PHRASES):
+        return True
+    return all(tok in _SMALLTALK_WORDS for tok in tokens)
+
+
 def _tokenize(text: str) -> list[str]:
     # Normalize first so Arabic written as presentation forms matches a query typed
     # in standard Arabic. \w with re.UNICODE keeps Arabic/accented letters + digits.
@@ -1233,6 +1284,9 @@ class RAGEngine:
         strict = STRICT_RAG_DEFAULT if strict is None else bool(strict)
         scoped_ids = self._scoped_ids(scope)
         scoped = bool(scoped_ids)
+        # Obvious greetings / thanks / small talk: answer naturally, never retrieve,
+        # never show a source card, never trigger a strict refusal.
+        small_talk = _is_small_talk(message)
 
         # Resolve follow-up references against recent turns BEFORE retrieval, so an
         # ambiguous question ("…بهذا المركب", "ce projet") fetches the right chunk.
@@ -1240,7 +1294,10 @@ class RAGEngine:
         retrieval_query = await loop.run_in_executor(None, self._contextualize_query, message, history)
 
         items = []
-        if scoped:
+        if small_talk:
+            print("[RAG] chat: small-talk/greeting — answering conversationally, "
+                  "no retrieval, no sources")
+        elif scoped:
             # Explicit attachment(s): block until they are indexed, then ground on them.
             await self._await_attachments_indexed(scoped_ids)
             items = await loop.run_in_executor(None, self._relevant_nodes, retrieval_query, scope, user)
@@ -1262,7 +1319,7 @@ class RAGEngine:
         # already passed the relevance gate (cosine >= cutoff OR strong BM25, or a
         # scoped match). Strict refusal and the source display BOTH follow grounding
         # — never the other way round. A chunk good enough to answer from is shown.
-        if strict and self._strict_should_refuse(use_docs):
+        if strict and not small_talk and self._strict_should_refuse(use_docs):
             print(f"[RAG] strict: refusing — no grounding chunk retrieved "
                   f"(items=0 scoped={scoped})")
             yield ("token", _strict_refusal(message))
@@ -1285,10 +1342,14 @@ class RAGEngine:
             # Scoped to attachments with nothing retrievable: stay grounded and
             # instruct the model to say it couldn't find the answer (in the user's
             # language) rather than inventing one or chatting from general knowledge.
-            system_text = (
-                base_prompt + directive + "\n\n"
-                + CONTEXT_TEMPLATE.format(context_str=_no_context_note(message))
-            )
+            # (Small talk is excluded above — a greeting must answer naturally.)
+            if small_talk:
+                system_text = CONV_SYSTEM_PROMPT + directive
+            else:
+                system_text = (
+                    base_prompt + directive + "\n\n"
+                    + CONTEXT_TEMPLATE.format(context_str=_no_context_note(message))
+                )
         else:
             system_text = CONV_SYSTEM_PROMPT + directive
 
