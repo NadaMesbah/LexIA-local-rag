@@ -151,6 +151,15 @@ class ChatRequest(BaseModel):
     strict: Optional[bool] = None  # documents-only mode (overrides server default when set)
 
 
+class RegenerateRequest(BaseModel):
+    # Regenerate carries no new message text (it reuses the existing question),
+    # but the client may send the conversation's CURRENT strict value and active
+    # document scope so the variant matches a normal send. Both optional → an
+    # empty body ({}) stays backward-compatible.
+    scope: Optional[dict] = None
+    strict: Optional[bool] = None
+
+
 # ─── Ownership helpers ───────────────────────────────────────────────────────
 
 def _is_admin(user: dict) -> bool:
@@ -579,6 +588,7 @@ async def edit_message(session_id: str, message_id: str, req: ChatRequest,
 
 @app.post("/sessions/{session_id}/messages/{message_id}/regenerate")
 async def regenerate_message(session_id: str, message_id: str,
+                             req: RegenerateRequest = RegenerateRequest(),
                              user: dict = Depends(auth.current_user)):
     """
     (Re)generate the assistant reply to a user message. Recovers an interrupted
@@ -590,10 +600,12 @@ async def regenerate_message(session_id: str, message_id: str,
         raise HTTPException(status_code=404, detail="User message not found.")
 
     history = _history_before(session_id, message_id)
-    # Keep grounding on the document(s) originally attached to this question.
-    scope = _scope_from_attachments(target.get("attachments"))
+    # Prefer the conversation's CURRENT scope/strict sent by the client (so a
+    # regenerate matches a normal send), falling back to the document(s) originally
+    # attached to this question when the client sends nothing.
+    scope = req.scope or _scope_from_attachments(target.get("attachments"))
     gen = _reply_generator(session_id, session["title"], message_id, target["content"],
-                           history, scope, user)
+                           history, scope, user, req.strict)
     return StreamingResponse(gen(), media_type="application/x-ndjson")
 
 
