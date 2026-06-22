@@ -32,6 +32,9 @@ export default function ChatPage() {
   const [confirmId, setConfirmId] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const [docsOnly, setDocsOnly] = useState(false);   // strict RAG: answer only from documents
+  // Sticky document scope, per conversation: once a document is attached/selected it
+  // stays the active scope for that conversation's follow-ups until cleared.
+  const [scopeByConv, setScopeByConv] = useState<Record<string, { id: string; filename: string }[]>>({});
   const [toast, setToast] = useState<{ msg: string; sev: 'success' | 'error' | 'info'; sid?: string } | null>(null);
 
   // Streaming lives ABOVE this page (in a layout-level provider), so a running
@@ -155,8 +158,13 @@ export default function ChatPage() {
       if (isActive(sid)) return; // this conversation is already generating
 
       const atts = pendingAttachments.map((a) => ({ id: a.id, filename: a.filename }));
-      const scope = atts.length ? { type: 'document', ids: atts.map((a) => a.id) } : undefined;
+      // Sticky scope: newly attached docs become the conversation's active scope;
+      // otherwise reuse the scope already active for this conversation (follow-ups).
+      const sticky = scopeByConv[sid as string] || [];
+      const scopeDocs = atts.length ? atts : sticky;
+      const scope = scopeDocs.length ? { type: 'document', ids: scopeDocs.map((a) => a.id) } : undefined;
       const notReady = pendingAttachments.some((a) => a.status !== 'indexed' && a.status !== 'failed');
+      if (atts.length) setScopeByConv((m) => ({ ...m, [sid as string]: atts }));
 
       setMessages((m) => [
         ...m,
@@ -179,7 +187,7 @@ export default function ChatPage() {
         firstTurn,
       });
     },
-    [currentId, messages.length, pendingAttachments, isActive, startStream, refreshSessions, clearPending, docsOnly]
+    [currentId, messages.length, pendingAttachments, isActive, startStream, refreshSessions, clearPending, docsOnly, scopeByConv]
   );
 
   const handleEdit = useCallback(
@@ -350,6 +358,8 @@ export default function ChatPage() {
           attachments={pendingAttachments}
           strict={docsOnly}
           onStrictChange={setDocsOnly}
+          scopeDocs={currentId ? scopeByConv[currentId] || [] : []}
+          onClearScope={() => currentId && setScopeByConv((m) => ({ ...m, [currentId]: [] }))}
           onSend={handleSend}
           onStop={handleStop}
           onAttach={handleAttach}

@@ -212,8 +212,13 @@ def test_sources_dedupe_same_filename():
     assert names(src) == ["ar_bank.pdf"]
 
 
-def test_sources_empty_on_small_talk():
-    assert RAGEngine._format_sources([_item("x.pdf", 0.37), _item("y.pdf", 0.33)]) == []
+def test_top_source_shown_when_grounded_even_below_old_floor():
+    # Small talk no longer filtered HERE — that's the retrieval layer (empty items).
+    # When chunks ARE retrieved (grounded), the single best is always shown, even
+    # with a modest Arabic-style cosine, so a grounded answer always cites a source.
+    assert RAGEngine._format_sources([]) == []
+    items = [_item("AL-ALAM2026-AR.pdf", 0.3594), _item("AL-ALAM2026-AR.pdf", 0.31)]
+    assert names(RAGEngine._format_sources(items)) == ["AL-ALAM2026-AR.pdf"]
 
 
 def test_sources_scoped_bypasses_floor():
@@ -249,23 +254,26 @@ def test_lexical_only_chunk_is_not_displayed_as_source():
     assert names(RAGEngine._format_sources(pool)) == ["Weather.pdf"]
 
 
-def test_ensure_one_rejects_weak_or_unrelated_source(monkeypatch):
-    # ensure_one must NEVER force an unrelated/weak source (the ML-for-Arabic bug).
-    monkeypatch.setattr(rg, "ENSURE_ONE_MIN_SCORE", 0.50)
-    weak = [_item("Machine_Learning_Ch1.pdf", 0.3919)]      # high-ish cosine, still < 0.50
-    assert RAGEngine._format_sources(weak, ensure_one=True) == []
+def test_lexical_only_excluded_from_secondary_cards(monkeypatch):
+    # With more than one card allowed, a lexical-only ML chunk is NOT a secondary
+    # source for a weather question — but the genuine top source is still shown.
+    monkeypatch.setattr(rg, "SOURCE_DISPLAY_TOP_K", 3)
+    pool = [_item("Weather.pdf", 0.52), _item("News.pdf", 0.50),
+            _lex("Machine_Learning_Ch4.pdf", 0.20, 3.0)]
+    out = names(RAGEngine._format_sources(pool))
+    assert "Weather.pdf" in out and "Machine_Learning_Ch4.pdf" not in out
 
 
-def test_ensure_one_forces_only_a_strong_source(monkeypatch):
-    monkeypatch.setattr(rg, "ENSURE_ONE_MIN_SCORE", 0.50)
-    strong = [_item("AL-ALAM2026-AR.pdf", 0.61)]
-    assert names(RAGEngine._format_sources(strong, ensure_one=True)) == ["AL-ALAM2026-AR.pdf"]
-
-
-def test_ensure_one_never_forces_lexical_only(monkeypatch):
-    monkeypatch.setattr(rg, "ENSURE_ONE_MIN_SCORE", 0.10)   # low floor on purpose
-    lex = [_lex("Machine_Learning_Ch4.pdf", 0.20, 5.0)]     # lexical-only, big BM25
-    assert RAGEngine._format_sources(lex, ensure_one=True) == []
+def test_display_orders_by_fused_score_not_raw_cosine():
+    # Arabic-style: AL-ALAM has a STRONG BM25/fused signal but a lower cosine than an
+    # off-topic ML chunk. Display must surface AL-ALAM (fused), not ML (cosine).
+    items = [
+        {"id": "ml", "score": 0.3919, "fused": 0.0164, "text": "ml",
+         "metadata": {"file_name": "Machine_Learning_Ch1.pdf"}},
+        {"id": "al", "score": 0.3300, "bm25": 6.0, "fused": 0.0320, "text": "al",
+         "metadata": {"file_name": "AL-ALAM2026-AR.pdf"}},
+    ]
+    assert names(RAGEngine._format_sources(items)) == ["AL-ALAM2026-AR.pdf"]
 
 
 def test_scripts_detects_foreign_script_injection():
@@ -325,15 +333,9 @@ def test_no_context_note_follows_language():
 
 def test_strict_grounding_gate():
     R = RAGEngine._strict_should_refuse
-    # No source strong enough to show, global query -> refuse.
-    assert R([], scoped=False, use_docs=False) is True
-    assert R([], scoped=False, use_docs=True) is True       # retrieved but all weak
-    # A displayed source -> answer.
-    assert R([{"filename": "x"}], scoped=False, use_docs=True) is False
-    # Scoped (attached) query with chunks -> answer even below display floor.
-    assert R([], scoped=True, use_docs=True) is False
-    # Scoped but nothing retrieved (e.g. empty/failed index) -> refuse.
-    assert R([], scoped=True, use_docs=False) is True
+    # Grounding-based (NOT display-based): refuse only when nothing was retrieved.
+    assert R(False) is True       # no grounding chunk -> refuse
+    assert R(True) is False        # at least one reliable chunk retrieved -> answer
 
 
 # ─── Pipeline order: rerank BEFORE the aggressive final filter ────────────────

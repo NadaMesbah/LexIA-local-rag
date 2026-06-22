@@ -117,25 +117,13 @@ SOURCE_MIN_SCORE = float(os.getenv("SOURCE_MIN_SCORE", "0.40"))
 SOURCE_REL_GAP   = float(os.getenv("SOURCE_REL_GAP", "0.10"))
 SOURCE_MAX       = int(os.getenv("SOURCE_MAX", "4"))
 
-# Source DISPLAY is the STRICTEST of the three layers (retrieved candidates →
-# context chunks sent to the LLM → source cards shown to the user). It defaults to
-# the retrieval values but can be tightened independently so the UI never shows a
-# weak/lexical-only/off-topic chunk even when it was used as context.
-#   - SOURCE_DISPLAY_MIN_SCORE      cosine floor for a card (reranker OFF)
-#   - SOURCE_DISPLAY_MIN_RERANK     cross-encoder floor for a card (reranker ON)
-#   - SOURCE_DISPLAY_REQUIRE_RERANK if true, show cards ONLY when the reranker ran
-SOURCE_DISPLAY_MIN_SCORE  = float(os.getenv("SOURCE_DISPLAY_MIN_SCORE", str(SOURCE_MIN_SCORE)))
+# Source DISPLAY layering. The answer is grounded on the retrieved context, so the
+# single best chunk is ALWAYS shown as a source (no display threshold may hide it).
+# These knobs only affect ADDITIONAL cards / ordering:
+#   - SOURCE_DISPLAY_TOP_K   max cards shown (default 1 = highest precision)
+#   - SOURCE_DISPLAY_MIN_RERANK  min rerank score for a SECONDARY card (reranker ON)
 SOURCE_DISPLAY_MIN_RERANK = float(os.getenv("SOURCE_DISPLAY_MIN_RERANK", "0.0"))
-SOURCE_DISPLAY_REQUIRE_RERANK = os.getenv("SOURCE_DISPLAY_REQUIRE_RERANK", "false").lower() in ("1", "true", "yes")
-# Max source cards to show. Default 1 favours PRECISION (one correct source beats
-# three where two are wrong) — raise it if you want more recall in the cards.
 SOURCE_DISPLAY_TOP_K = int(os.getenv("SOURCE_DISPLAY_TOP_K", "1"))
-# When a grounded answer has no card clearing the strict bar, optionally force the
-# single best one. OFF by default: forcing a weak/unrelated source is worse than
-# showing none. When ON it is still gated by ENSURE_ONE_MIN_SCORE (never forces a
-# weak or lexical-only chunk).
-SOURCE_ENSURE_ONE = os.getenv("SOURCE_ENSURE_ONE", "false").lower() in ("1", "true", "yes")
-ENSURE_ONE_MIN_SCORE = float(os.getenv("ENSURE_ONE_MIN_SCORE", "0.50"))
 
 # Rewrite follow-up questions into standalone retrieval queries using recent
 # conversation, so anaphora ("this complex", "ce projet", "بهذا المركب") resolves
@@ -1028,7 +1016,7 @@ class RAGEngine:
                 "text": RAGEngine._snippet(it.get("text") or "", query),
             })
 
-        strict_refuse = RAGEngine._strict_should_refuse(display_items, scoped, len(result) > 0)
+        strict_refuse = RAGEngine._strict_should_refuse(len(result) > 0)
         summary = RAGEngine._debug_summary(len(vec_ids), len(lex_ids), len(fused), len(candidates),
                                            reranked_applied, len(selected), len(result),
                                            len(display_ids), top_raw, strict_refuse)
@@ -1200,34 +1188,22 @@ class RAGEngine:
         use_docs = len(items) > 0
         reranked_applied = any(it.get("rerank") is not None for it in items)
 
-        # Layer 3 — SOURCE CARDS (strictest layer). A card must actually support the
-        # answer: rerank-aware ranking, no lexical-only/off-topic chunks, and a
-        # query-relevant snippet. `display_strict` also drives the strict gate.
-        display_strict = (self._format_sources(items, scoped=scoped, query=retrieval_query,
-                                               reranked_applied=reranked_applied)
-                          if use_docs else [])
-
-        # STRICT MODE — deterministic refusal when no chunk clears the strict bar, so
-        # it never answers from prior knowledge or weak/lexical matches.
-        if strict and self._strict_should_refuse(display_strict, scoped, use_docs):
-            print(f"[RAG] strict: refusing — no reliable grounding "
-                  f"(items={len(items)} shown={len(display_strict)} scoped={scoped})")
+        # GROUNDING is decided by the retrieved CONTEXT chunks (`items`), which have
+        # already passed the relevance gate (cosine >= cutoff OR strong BM25, or a
+        # scoped match). Strict refusal and the source display BOTH follow grounding
+        # — never the other way round. A chunk good enough to answer from is shown.
+        if strict and self._strict_should_refuse(use_docs):
+            print(f"[RAG] strict: refusing — no grounding chunk retrieved "
+                  f"(items=0 scoped={scoped})")
             yield ("token", _strict_refusal(message))
             yield ("sources", [])
             return
 
-        # Sources to SHOW. Non-strict + grounded but nothing cleared the strict bar:
-        # only force a card if SOURCE_ENSURE_ONE is on (and the candidate is genuinely
-        # relevant — see _select_source_items). Otherwise show none rather than risk a
-        # wrong source.
-        if strict or display_strict or not use_docs:
-            display_sources = display_strict
-        elif SOURCE_ENSURE_ONE:
-            display_sources = self._format_sources(items, scoped=scoped, query=retrieval_query,
-                                                   reranked_applied=reranked_applied, ensure_one=True)
-        else:
-            display_sources = display_strict   # [] — honest, never a forced wrong source
-        grounded = bool(display_sources) or (scoped and use_docs)
+        # Source cards: always ≥1 when grounded (top chunk), precision-filtered tail.
+        display_sources = (self._format_sources(items, scoped=scoped, query=retrieval_query,
+                                                reranked_applied=reranked_applied)
+                           if use_docs else [])
+        grounded = use_docs
 
         base_prompt = SYSTEM_PROMPT_STRICT if strict else SYSTEM_PROMPT
         if grounded:
@@ -1267,37 +1243,42 @@ class RAGEngine:
         yield ("sources", display_sources)
 
     @staticmethod
-    def _strict_should_refuse(displayed: list, scoped: bool, use_docs: bool) -> bool:
-        """Strict-mode grounding gate. Refuse (True) when there is no reliable
-        grounding: no source strong enough to display AND not a scoped query that
-        retrieved at least one chunk. This is what turns a 'shown=0' retrieval into
-        a clean refusal instead of an ungrounded answer."""
-        return not (bool(displayed) or (scoped and use_docs))
+    def _strict_should_refuse(use_docs: bool) -> bool:
+        """Strict refusal is GROUNDING-based: refuse only when retrieval produced no
+        reliable chunk to answer from (``use_docs`` is False). It must NOT depend on
+        the source-card display filter — a chunk good enough to answer from is good
+        enough to cite, so a display bug must never cause a false refusal."""
+        return not use_docs
 
     @staticmethod
     def _source_eff(it: dict, use_rerank: bool) -> float:
-        """Effective relevance for DISPLAY ranking: the cross-encoder score when the
-        reranker ran (best signal, language-robust), else the dense cosine."""
+        """Effective relevance for DISPLAY ordering. With the reranker ON, use its
+        score (best, language-robust). With it OFF, use the FUSED (dense+BM25) score
+        — NOT raw cosine — so a strong lexical match (e.g. Arabic keywords) ranks as
+        the top source instead of an off-topic chunk with higher cosine. Falls back
+        to cosine when no fused score is present (e.g. in unit tests)."""
         if use_rerank and it.get("rerank") is not None:
             return float(it.get("rerank"))
+        if it.get("fused") is not None:
+            return float(it.get("fused"))
         return float(it.get("score") or 0)
 
     @staticmethod
     def _is_lexical_only(it: dict) -> bool:
-        """A BM25 hit whose dense cosine is below the relevance cutoff: it matched on
-        word overlap only, with no semantic support (e.g. an ML PDF surfacing for a
-        weather question via 'temperature'). Such chunks must never be SHOWN as a
-        source, even if they were carried into the candidate pool."""
+        """A BM25 hit whose dense cosine is below the relevance cutoff: matched on
+        word overlap only. Used to keep such chunks out of SECONDARY source cards."""
         return it.get("bm25") is not None and (it.get("score") or 0) < RELEVANCE_CUTOFF
 
     @staticmethod
     def _select_source_items(items: list[dict], scoped: bool = False,
-                             reranked_applied: bool = False, ensure_one: bool = False) -> list[dict]:
-        """Pick the actual chunk(s) to display as source cards — the STRICTEST layer.
-        One per file, capped, ordered by effective relevance. Drops weak, off-topic
-        and lexical-only matches. `ensure_one` guarantees the single best
-        semantically-supported chunk is returned when the answer is grounded (so a
-        grounded reply is never shown as 'hors documents')."""
+                             reranked_applied: bool = False) -> list[dict]:
+        """Pick the chunk(s) to display as source cards. The answer is grounded on
+        `items`, so the SINGLE best chunk is ALWAYS shown when items exist — a chunk
+        good enough to answer from is good enough to cite, and no display threshold
+        may hide it (this is what previously caused 'hors documents'/false refusals).
+        Additional cards (only when SOURCE_DISPLAY_TOP_K > 1) are filtered for
+        precision: close to the top and not lexical-only/off-topic. Scoped queries
+        surface the chosen document(s)."""
         if not items:
             return []
         use_rerank = reranked_applied and any(it.get("rerank") is not None for it in items)
@@ -1308,22 +1289,19 @@ class RAGEngine:
         limit = SOURCE_MAX if scoped else min(SOURCE_MAX, max(1, SOURCE_DISPLAY_TOP_K))
 
         chosen, seen = [], set()
-        for it in ranked:
-            e = RAGEngine._source_eff(it, use_rerank)
-            if not scoped:
+        for i, it in enumerate(ranked):
+            if i > 0 and not scoped:
+                # SECONDARY cards only: must be near the best AND genuinely relevant.
+                # (The top card is always kept — it is what the answer is grounded on.)
+                e = RAGEngine._source_eff(it, use_rerank)
                 if use_rerank:
-                    # Reranker ran: trust its score; drop low-relevance cards.
                     if SOURCE_DISPLAY_MIN_RERANK > 0 and e < SOURCE_DISPLAY_MIN_RERANK:
                         break
                 else:
-                    if SOURCE_DISPLAY_REQUIRE_RERANK:
-                        break                      # display requires rerank, none available
-                    if e < SOURCE_DISPLAY_MIN_SCORE:
-                        break                      # sorted desc → nothing below qualifies
-                    if chosen and e < top - SOURCE_REL_GAP:
-                        break                      # too far below the best match
                     if RAGEngine._is_lexical_only(it):
-                        continue                   # skip lexical-only noise, keep scanning
+                        continue                   # skip lexical-only noise tail
+                    if top > 0 and e < top - SOURCE_REL_GAP:
+                        break                      # too far below the best match
             md = it.get("metadata") or {}
             key = md.get("file_name") or md.get("rag_doc_id")
             if not key or key in seen:
@@ -1332,28 +1310,6 @@ class RAGEngine:
             chosen.append(it)
             if len(chosen) >= limit:
                 break
-
-        if not chosen and ensure_one and not scoped and ranked:
-            # Grounded answer but nothing cleared the strict display bar. Optionally
-            # force the single best chunk — but ONLY if it is genuinely relevant, so
-            # we never surface an unrelated file (e.g. an ML PDF for an Arabic news
-            # question). Otherwise show nothing (honest 'hors documents' / refuse).
-            best = ranked[0]
-            e = RAGEngine._source_eff(best, use_rerank)
-            reason = None
-            if RAGEngine._is_lexical_only(best):
-                reason = "best candidate is lexical-only (no semantic support)"
-            elif use_rerank:
-                if SOURCE_DISPLAY_MIN_RERANK > 0 and e < SOURCE_DISPLAY_MIN_RERANK:
-                    reason = f"best rerank {round(e, 4)} < SOURCE_DISPLAY_MIN_RERANK {SOURCE_DISPLAY_MIN_RERANK}"
-            elif e < ENSURE_ONE_MIN_SCORE:
-                reason = f"best cosine {round(e, 4)} < ENSURE_ONE_MIN_SCORE {ENSURE_ONE_MIN_SCORE}"
-            if reason:
-                print(f"[RAG] ensure_one: NOT forcing a source — {reason}")
-            else:
-                fn = (best.get("metadata") or {}).get("file_name")
-                print(f"[RAG] ensure_one: forcing best source ({fn}, eff={round(e, 4)})")
-                chosen.append(best)
         return chosen
 
     @staticmethod
@@ -1376,11 +1332,11 @@ class RAGEngine:
 
     @staticmethod
     def _format_sources(items: list[dict], scoped: bool = False, query: Optional[str] = None,
-                        reranked_applied: bool = False, ensure_one: bool = False) -> list[dict]:
-        """Build the user-facing source cards from the strict selection, with a
-        query-relevant snippet per card. One entry per file. See _select_source_items
-        for the filtering policy."""
-        chosen = RAGEngine._select_source_items(items, scoped, reranked_applied, ensure_one)
+                        reranked_applied: bool = False) -> list[dict]:
+        """Build the user-facing source cards from the selection, with a query-relevant
+        snippet per card. One entry per file. When `items` is non-empty (the answer is
+        grounded) this ALWAYS returns at least one card. See _select_source_items."""
+        chosen = RAGEngine._select_source_items(items, scoped, reranked_applied)
         sources = []
         for it in chosen:
             md = it.get("metadata") or {}
@@ -1392,7 +1348,7 @@ class RAGEngine:
                 "document_id": md.get("rag_doc_id"),
                 "version": md.get("version"),
             })
-        print(f"[RAG] sources: scoped={scoped} ensure_one={ensure_one} "
+        print(f"[RAG] sources: scoped={scoped} "
               f"shown={len(sources)}/{len(items)} -> {[(s['filename'], s['score']) for s in sources]}")
         return sources
 
