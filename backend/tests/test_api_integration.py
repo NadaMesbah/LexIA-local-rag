@@ -40,7 +40,12 @@ class FakeEngine:
     def generate_title(self, message):
         return "Titre test"
 
-    def _relevant_nodes(self, message, scope, user):
+    def _relevant_nodes(self, message, scope, user, debug=False):
+        # Mirrors the real engine's contract: a plain list of nodes normally, but a
+        # diagnostics dict (summary + items) when debug=True (used by /debug/retrieve).
+        if debug:
+            return {"summary": {"retrieved": 0, "kept": 0, "strict_would_answer": False},
+                    "items": []}
         return []
 
     async def stream_chat(self, message, history, scope=None, user=None, strict=None):

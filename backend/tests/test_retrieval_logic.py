@@ -411,12 +411,19 @@ def _cand(id_, score=None, bm25=None, rerank=None):
             "text": id_, "metadata": {"file_name": id_}}
 
 
-def test_final_select_rerank_off_applies_cosine_cutoff():
+def test_final_select_rerank_off_applies_cosine_cutoff(monkeypatch):
+    # With MIN_BM25_SCORE=1.5, a lexical-only hit is trusted on its own ONLY if its
+    # BM25 score clears that floor; weaker lexical hits below the floor are dropped
+    # (they're kept only if their dense cosine also passes RELEVANCE_CUTOFF). Pin the
+    # threshold so the test is deterministic regardless of the runtime env/.env.
+    monkeypatch.setattr(rg, "MIN_BM25_SCORE", 1.5)
+    monkeypatch.setattr(rg, "RELEVANCE_CUTOFF", 0.25)
     pool = [_cand("a", score=0.55), _cand("b", score=0.30, bm25=2.0),
             _cand("c", score=0.20), _cand("d", score=0.42), _cand("e", score=0.10, bm25=1.0)]
     out = [x["id"] for x in RAGEngine._final_select(pool, scoped=False, reranked_applied=False)]
     assert "a" in out and "d" in out      # strong cosine kept
-    assert "b" in out and "e" in out      # exact BM25 hits kept even below cutoff
+    assert "b" in out                     # strong BM25 hit (>= MIN_BM25_SCORE) kept
+    assert "e" not in out                 # weak BM25 hit (< MIN_BM25_SCORE) dropped
     assert "c" not in out                 # weak vector-only noise dropped
 
 
