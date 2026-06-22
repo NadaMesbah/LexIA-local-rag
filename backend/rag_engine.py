@@ -418,6 +418,23 @@ def _answer_grounded(answer: str, contexts: list, min_overlap: float) -> bool:
     return (len(shared) / len(ans)) >= min_overlap
 
 
+# Phrases that mark a "not found"/refusal answer in EN/FR/AR. When the FINAL answer
+# is one of these, NO source cards must be shown — even though retrieval found chunks
+# (strict mode lets the model itself refuse when the fact isn't in the extracts).
+_REFUSAL_MARKERS = (
+    "pas trouvé cette information", "n'ai pas trouvé", "n’ai pas trouvé", "pas trouvé d",
+    "could not find", "couldn't find", "not find this information", "not in the provided",
+    "لم أجد", "لم اجد", "لم أعثر", "لم اعثر", "لا أجد", "لم يتم العثور", "لا توجد هذه المعلوم",
+)
+
+
+def _is_refusal(answer: str) -> bool:
+    """True if the generated answer is a 'I couldn't find this in the documents'
+    statement (any of EN/FR/AR), so its (irrelevant) source cards must be dropped."""
+    a = _normalize_text(answer or "").lower()
+    return bool(a.strip()) and any(m in a for m in _REFUSAL_MARKERS)
+
+
 def _tokenize(text: str) -> list[str]:
     # Normalize first so Arabic written as presentation forms matches a query typed
     # in standard Arabic. \w with re.UNICODE keeps Arabic/accented letters + digits.
@@ -1298,18 +1315,23 @@ class RAGEngine:
                 answer_parts.append(delta)
                 yield ("token", delta)
 
-        # POST-ANSWER grounding check (non-strict): if the generated answer barely
-        # overlaps the retrieved context, the model answered from general knowledge —
-        # so DON'T attach document source cards (UI shows 'hors documents'). This
-        # stops e.g. a design-patterns answer being paired with a news source, while
-        # keeping paraphrased Arabic answers (which reuse entities/numbers) grounded.
-        if display_sources and not strict:
-            if not _answer_grounded("".join(answer_parts),
-                                    [it.get("text", "") for it in items], GROUNDING_MIN_OVERLAP):
-                print(f"[RAG] grounding: answer does not overlap retrieved context "
-                      f"(min_overlap={GROUNDING_MIN_OVERLAP}) — hiding {len(display_sources)} "
-                      f"source(s), treating as a general answer")
-                display_sources = []
+        # POST-ANSWER source gating. Source cards are emitted ONLY if the final answer
+        # is actually grounded. Two cases force sources=[]:
+        #   (1) the answer is a 'not found'/refusal statement (any mode) — e.g. strict
+        #       mode where the model refused because the fact wasn't in the extracts;
+        #   (2) non-strict, the answer barely overlaps the context (general answer).
+        # Genuinely document-grounded answers are untouched.
+        answer_text = "".join(answer_parts)
+        if display_sources and _is_refusal(answer_text):
+            print(f"[RAG] grounding: answer is a 'not found'/refusal — hiding "
+                  f"{len(display_sources)} source(s)")
+            display_sources = []
+        elif display_sources and not strict and not _answer_grounded(
+                answer_text, [it.get("text", "") for it in items], GROUNDING_MIN_OVERLAP):
+            print(f"[RAG] grounding: answer does not overlap retrieved context "
+                  f"(min_overlap={GROUNDING_MIN_OVERLAP}) — hiding {len(display_sources)} "
+                  f"source(s), treating as a general answer")
+            display_sources = []
 
         yield ("sources", display_sources)
 

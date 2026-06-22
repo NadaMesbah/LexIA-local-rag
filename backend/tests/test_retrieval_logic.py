@@ -329,6 +329,18 @@ def test_strip_artifacts_removes_box_replacement_zerowidth_keeps_text():
     assert rg._strip_artifacts("700 كيلوغرام (DGSSI)") == "700 كيلوغرام (DGSSI)"
 
 
+def test_is_refusal_detects_canonical_refusals():
+    # The exact strict-refusal sentences (EN/FR/AR) must be detected so their
+    # (irrelevant) source cards are dropped.
+    assert rg._is_refusal("Je n’ai pas trouvé cette information dans les documents fournis.") is True
+    assert rg._is_refusal("I could not find this information in the provided documents.") is True
+    assert rg._is_refusal("لم أجد هذه المعلومة في الوثائق المقدمة.") is True
+    # A real document answer is NOT flagged as a refusal.
+    assert rg._is_refusal("La police judiciaire de Tanger a saisi 700 كيلوغرام de chira.") is False
+    assert rg._is_refusal("المركب السياحي كيمادو يقع بمدينة الحسيمة.") is False
+    assert rg._is_refusal("") is False
+
+
 def test_snippet_prefers_window_with_query_terms_and_number():
     chunk = ("Le tournoi se poursuit cette semaine au Maroc. " * 5 +
              "La police judiciaire de Tanger a saisi 700 kilogrammes de chira "
