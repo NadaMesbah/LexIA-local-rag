@@ -218,16 +218,9 @@ export default function ChatPage() {
     [currentId, messages.length, pendingAttachments, isActive, startStream, refreshSessions, clearPending, strictByConv, scopeByConv]
   );
 
-  // Edit and regenerate must reuse the SAME effective strict value and active
-  // document scope as a normal send (handleSend), read from the per-conversation
-  // state. Without this, editing/regenerating silently dropped "Documents
-  // uniquement" and the sticky document scope, falling back to server defaults.
   const handleEdit = useCallback(
     async (id: string, text: string) => {
       if (!currentId || !text || isActive(currentId)) return;
-      const effStrict = strictByConv[currentId] ?? false;
-      const sticky = scopeByConv[currentId] || [];
-      const scope = sticky.length ? { type: 'document', ids: sticky.map((a) => a.id) } : undefined;
       setMessages((prev) => {
         const i = prev.findIndex((m) => m.id === id);
         if (i < 0) return prev;
@@ -235,32 +228,21 @@ export default function ChatPage() {
         copy[i] = { ...copy[i], content: text };
         return copy;
       });
-      startStream({
-        url: api.editUrl(currentId, id),
-        body: { message: text, scope, strict: effStrict || undefined },
-        sid: currentId,
-      });
+      startStream({ url: api.editUrl(currentId, id), body: { message: text }, sid: currentId });
     },
-    [currentId, isActive, startStream, strictByConv, scopeByConv]
+    [currentId, isActive, startStream]
   );
 
   const handleRegenerate = useCallback(
     async (userMessageId: string) => {
       if (!currentId || isActive(currentId)) return;
-      const effStrict = strictByConv[currentId] ?? false;
-      const sticky = scopeByConv[currentId] || [];
-      const scope = sticky.length ? { type: 'document', ids: sticky.map((a) => a.id) } : undefined;
       setMessages((prev) => {
         const i = prev.findIndex((m) => m.id === userMessageId);
         return i < 0 ? prev : prev.slice(0, i + 1);
       });
-      startStream({
-        url: api.regenerateUrl(currentId, userMessageId),
-        body: { scope, strict: effStrict || undefined },
-        sid: currentId,
-      });
+      startStream({ url: api.regenerateUrl(currentId, userMessageId), body: {}, sid: currentId });
     },
-    [currentId, isActive, startStream, strictByConv, scopeByConv]
+    [currentId, isActive, startStream]
   );
 
   const handleSwitchVersion = useCallback(
@@ -342,14 +324,14 @@ export default function ChatPage() {
           <Box sx={{ maxWidth: 860, mx: 'auto', display: 'flex', flexDirection: 'column', gap: 2.5 }}>
             {messages.length === 0 && !cur?.active && (
               <Box sx={{ textAlign: 'center', py: 8, color: 'text.secondary' }}>
-                <Box sx={{ width: 64, height: 64, mx: 'auto', mb: 2, borderRadius: 2.5, bgcolor: 'rgba(0,167,111,0.12)', color: 'primary.main', display: 'grid', placeItems: 'center' }}>
+                <Box sx={{ width: 64, height: 64, mx: 'auto', mb: 2, borderRadius: 2.5, bgcolor: 'rgba(1,134,135,0.12)', color: 'primary.main', display: 'grid', placeItems: 'center' }}>
                   <AutoAwesomeRoundedIcon fontSize="large" />
                 </Box>
                 <Typography variant="h5" sx={{ fontWeight: 800, color: 'text.primary' }}>
                   Interrogez votre base de connaissance
                 </Typography>
                 <Typography variant="body2" sx={{ mt: 1, maxWidth: 460, mx: 'auto' }}>
-                  Posez une question, ou joignez un document avec <AttachFileRoundedIcon sx={{ fontSize: 16, verticalAlign: 'middle', mx: 0.3 }} /> et l&apos;assistant répondra
+                  Posez une question, ou joignez un document avec <AttachFileRoundedIcon sx={{ fontSize: 16, verticalAlign: 'middle', mx: 0.3 }} /> et LexIA répondra
                   en s&apos;appuyant dessus — avec sources.
                 </Typography>
               </Box>
@@ -370,7 +352,7 @@ export default function ChatPage() {
 
             {cur?.active && (
               <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 0.5 }}>
-                <Typography variant="caption" sx={{ color: 'warning.dark', fontWeight: 700 }}>ASSISTANT</Typography>
+                <Typography variant="caption" sx={{ color: 'primary.main', fontWeight: 700, letterSpacing: 0.5 }}>LexIA</Typography>
                 <Paper sx={{ px: 2, py: 1.5, width: '100%', border: '1px solid rgba(145,158,171,0.2)', boxShadow: 'none', borderRadius: 2 }}>
                   {cur.thinking && !cur.answer ? (
                     <Typography variant="body2" sx={{ color: 'text.secondary', fontStyle: 'italic' }}>Recherche dans la base…</Typography>

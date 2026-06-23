@@ -11,8 +11,8 @@ import Providers from '@/components/Providers';
 import AppShell from '@/components/AppShell';
 
 export const metadata: Metadata = {
-  title: 'RAG Local',
-  description: 'Local knowledge base assistant',
+  title: 'LexIA',
+  description: 'LexIA — assistant documentaire local et privé',
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
