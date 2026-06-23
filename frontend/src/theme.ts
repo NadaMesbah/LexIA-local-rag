@@ -2,16 +2,24 @@
 
 import { createTheme } from '@mui/material/styles';
 
-// Minimal-UI-inspired palette: soft greys, a green primary, gentle shadows.
+// LexIA palette: soft greys + a teal/turquoise primary, gentle shadows.
 const theme = createTheme({
   palette: {
     mode: 'light',
     primary: {
-      lighter: '#C8FAD6',
-      light: '#5BE49B',
-      main: '#00A76F',
-      dark: '#007867',
-      darker: '#004B50',
+      lighter: '#E6F7F7',
+      light: '#01B7B7',
+      main: '#018687',
+      dark: '#016F70',
+      darker: '#014B4C',
+      contrastText: '#FFFFFF',
+    } as any,
+    secondary: {
+      lighter: '#E6F7F7',
+      light: '#01B7B7',
+      main: '#01A1A1',
+      dark: '#016F70',
+      darker: '#014B4C',
       contrastText: '#FFFFFF',
     } as any,
     background: {

@@ -402,7 +402,7 @@ export default function DocumentsPage() {
         <Box {...getRootProps()} sx={{
           p: 4, mb: 3, borderRadius: 2, border: '1.5px dashed',
           borderColor: isDragActive ? 'primary.main' : 'rgba(145,158,171,0.32)',
-          bgcolor: isDragActive ? 'rgba(0,167,111,0.08)' : 'background.paper', textAlign: 'center', transition: 'all .2s',
+          bgcolor: isDragActive ? 'rgba(1,134,135,0.08)' : 'background.paper', textAlign: 'center', transition: 'all .2s',
         }}>
           <input {...getInputProps()} />
           <CloudUploadRoundedIcon sx={{ fontSize: 40, color: 'primary.main', mb: 1 }} />
