@@ -1,17 +1,122 @@
 [
   {
+    "question": "Quel a été le score du match entre le Maroc et l'Écosse lors du Mondial 2026 ?",
+    "expected_doc": "Mondial-2026-LE_MATIN.pdf"
+  },
+  {
+    "question": "Quels sujets Mohamed Ouahbi a-t-il abordés après le succès face à l'Écosse ?",
+    "expected_doc": "Mondial-2026-LE_MATIN.pdf"
+  },
+  {
     "question": "Selon le Digital News Report 2026, qu'est-ce qui est devenu la principale porte d'entrée vers l'actualité ?",
-    "ground_truth": "Les réseaux sociaux et les plateformes vidéo sont devenus la principale porte d'entrée vers l'actualité.",
+    "expected_doc": "Mondial-2026-LE_MATIN.pdf"
+  },
+  {
+    "question": "Comment évolue la confiance du public dans l'information selon le Digital News Report 2026 ?",
     "expected_doc": "Mondial-2026-LE_MATIN.pdf"
   },
   {
     "question": "Pourquoi Bank Al-Maghrib a-t-elle émis un avertissement en lien avec le Mondial 2026 ?",
-    "ground_truth": "Recrudescence des cyberattaques liées au phishing et à la fraude exploitant l'engouement pour le Mondial 2026.",
     "expected_doc": "Mondial-2026-LE_MATIN.pdf"
   },
   {
+    "question": "Quand Marrakech sera-t-elle alimentée en eau dessalée depuis Safi, et avec quelle capacité annuelle ?",
+    "expected_doc": "Mondial-2026-LE_MATIN.pdf"
+  },
+  {
+    "question": "Quelle température maximale est annoncée dans plusieurs régions du Maroc, et quelles zones sont concernées ?",
+    "expected_doc": "Mondial-2026-LE_MATIN.pdf"
+  },
+  {
+    "question": "Qu'est-ce que la fuite FortiBleed a exposé, et qui appelle à renforcer la sécurité ?",
+    "expected_doc": "Mondial-2026-LE_MATIN.pdf"
+  },
+  {
+    "question": "À quelle occasion la CGEM a-t-elle complété ses instances de gouvernance ?",
+    "expected_doc": "LE_MATIN_22-06-2026.pdf"
+  },
+  {
+    "question": "Combien de commissions permanentes la CGEM a-t-elle installées ?",
+    "expected_doc": "LE_MATIN_22-06-2026.pdf"
+  },
+  {
+    "question": "Quelle ligne de Casabus passe désormais toutes les 15 minutes ?",
+    "expected_doc": "LE_MATIN_22-06-2026.pdf"
+  },
+  {
+    "question": "Quelle était l'ancienne fréquence de passage de la ligne L65 de Casabus ?",
+    "expected_doc": "LE_MATIN_22-06-2026.pdf"
+  },
+  {
+    "question": "Quelles destinations sans visa sont citées pour les voyageurs marocains à l'été 2026 ?",
+    "expected_doc": "LE_MATIN_22-06-2026.pdf"
+  },
+  {
+    "question": "À combien de destinations le passeport marocain permet-il d'accéder avec des conditions simplifiées ?",
+    "expected_doc": "LE_MATIN_22-06-2026.pdf"
+  },
+  {
+    "question": "Qui supervise l'audit des Établissements pionniers avant l'attribution du label Riada ?",
+    "expected_doc": "LE_MATIN_22-06-2026.pdf"
+  },
+  {
+    "question": "Quel taux directeur BMCE Capital anticipe-t-elle pour Bank Al-Maghrib ?",
+    "expected_doc": "LE_MATIN_22-06-2026.pdf"
+  },
+  {
+    "question": "Quel dirigeant britannique a annoncé sa démission selon le journal Al Alam ?",
+    "expected_doc": "AL-ALAM-22-06-2026.pdf"
+  },
+  {
+    "question": "Quel club a réussi son retour en deuxième division professionnelle après une saison en amateur ?",
+    "expected_doc": "AL-ALAM-22-06-2026.pdf"
+  },
+  {
+    "question": "Que demande le syndicat national de l'ONDA concernant les employés ?",
+    "expected_doc": "AL-ALAM-22-06-2026.pdf"
+  },
+  {
+    "question": "ماذا ضبطت الشرطة القضائية في طنجة في قضية التهريب الدولي؟",
+    "expected_doc": "AL-ALAM-22-06-2026.pdf"
+  },
+  {
     "question": "من ترأس أشغال تجديد فرع حزب الاستقلال بالفنيدق؟",
-    "ground_truth": "منصف الطوب هو من ترأس أشغال تجديد فرع حزب الاستقلال بالفنيدق.",
     "expected_doc": "AL-ALAM2026-AR.pdf"
+  },
+  {
+    "question": "متى احتضنت مدينة الفنيدق أشغال تجديد فرع حزب الاستقلال؟",
+    "expected_doc": "AL-ALAM2026-AR.pdf"
+  },
+  {
+    "question": "بماذا أشادت فرنسا في علاقتها مع المغرب في مجال الهجرة؟",
+    "expected_doc": "AL-ALAM2026-AR.pdf"
+  },
+  {
+    "question": "أي نادٍ حجز بطاقة الصعود إلى القسم الاحترافي الأول؟",
+    "expected_doc": "AL-ALAM2026-AR.pdf"
+  },
+  {
+    "question": "ما اسم المركب السياحي الذي يشهد حالة احتقان اجتماعي، وفي أي مدينة يقع؟",
+    "expected_doc": "AL-ALAM2026-AR.pdf"
+  },
+  {
+    "question": "متى تحتضن طنجة الدورة الثالثة للمنتدى الدولي للأعمال؟",
+    "expected_doc": "AL-ALAM2026-AR.pdf"
+  },
+  {
+    "question": "متى تم إيداع جداول نتائج مراجعة اللوائح الانتخابية؟",
+    "expected_doc": "AL_YAOUM24.pdf"
+  },
+  {
+    "question": "ما الفترة المحددة للاطلاع على جداول اللوائح الانتخابية وتقديم الطعون؟",
+    "expected_doc": "AL_YAOUM24.pdf"
+  },
+  {
+  "question": "ما هي الإكراهات الثلاثة التي ذكرها حزب الاستقلال ضد مقترح تسقيف أسعار المحروقات؟",
+  "expected_doc": "L'opinion-2026.pdf"
+  },
+  {
+  "question": "Selon Nizar Baraka, que provoquerait le plafonnement des prix des hydrocarbures ?",
+  "expected_doc": "L'opinion-2026.pdf"
   }
 ]

@@ -1,110 +1,122 @@
 [
   {
-    "question": "Quel a été le score du match entre le Maroc et l'Écosse, et à quelle journée du groupe C ?",
-    "ground_truth": "Le score du match entre le Maroc et l'Écosse était de 1-0, lors de la deuxième journée du groupe C de la Coupe du monde 2026."
+    "question": "Quel a été le score du match entre le Maroc et l'Écosse lors du Mondial 2026 ?",
+    "ground_truth": "Le Maroc a battu l'Écosse sur le score de 1-0."
   },
   {
-    "question": "Quels sujets Mohamed Ouahbi a-t-il abordés en conférence de presse après ce match ?",
-    "ground_truth": "Mohamed Ouahbi a abordé l'analyse tactique, la gestion du groupe, les ambitions pour la suite du tournoi, et son soutien affiché à Achraf Hakimi."
+    "question": "Quels sujets Mohamed Ouahbi a-t-il abordés après le succès face à l'Écosse ?",
+    "ground_truth": "Mohamed Ouahbi a abordé l'analyse tactique, la gestion du groupe, les ambitions pour la suite du tournoi et le soutien à Achraf Hakimi."
   },
   {
-    "question": "Selon le Digital News Report 2026 du Reuters Institute, qu'est-ce qui est devenu la principale porte d'entrée vers l'actualité dans le monde ?",
-    "ground_truth": "Les réseaux sociaux et les plateformes vidéo sont devenus la principale porte d'entrée vers l'actualité dans le monde, devant les sites des médias et la télévision."
+    "question": "Selon le Digital News Report 2026, qu'est-ce qui est devenu la principale porte d'entrée vers l'actualité ?",
+    "ground_truth": "Les réseaux sociaux et les plateformes vidéo sont devenus la principale porte d'entrée vers l'actualité dans le monde."
   },
   {
-    "question": "Comment évolue la confiance du public dans l'information selon ce même rapport ?",
-    "ground_truth": "La confiance dans l'information atteint son niveau le plus bas depuis une décennie."
+    "question": "Comment évolue la confiance du public dans l'information selon le Digital News Report 2026 ?",
+    "ground_truth": "La confiance du public dans l'information atteint son niveau le plus bas depuis une décennie."
   },
   {
     "question": "Pourquoi Bank Al-Maghrib a-t-elle émis un avertissement en lien avec le Mondial 2026 ?",
-    "ground_truth": "Bank Al-Maghrib a alerté sur une recrudescence des cyberattaques (phishing, fraude en ligne) exploitant l'engouement du public pour le Mondial 2026, et a appelé les établissements bancaires à renforcer la sensibilisation de leur clientèle."
+    "ground_truth": "Bank Al-Maghrib a averti contre la recrudescence des cyberattaques exploitant l'engouement pour le Mondial 2026, notamment les risques de phishing et de fraude en ligne."
   },
   {
-    "question": "Quels sont la longueur et la capacité annuelle de l'infrastructure qui alimentera Marrakech en eau dessalée depuis Safi ?",
-    "ground_truth": "L'infrastructure mesure 185,3 km et peut acheminer près de 100 millions de m³ d'eau par an."
+    "question": "Quand Marrakech sera-t-elle alimentée en eau dessalée depuis Safi, et avec quelle capacité annuelle ?",
+    "ground_truth": "Marrakech sera alimentée en eau dessalée depuis Safi à partir de fin juillet, grâce à une infrastructure capable d'acheminer près de 100 millions de mètres cubes par an."
   },
   {
-    "question": "Quel est le montant de l'investissement de ce projet d'eau dessalée, et qui le porte ?",
-    "ground_truth": "Le projet représente un investissement de 4,2 milliards de dirhams et est porté par la Société régionale multiservices (SRM) de Marrakech-Safi."
+    "question": "Quelle température maximale est annoncée dans plusieurs régions du Maroc, et quelles zones sont concernées ?",
+    "ground_truth": "Des températures pouvant atteindre 46 °C sont attendues, notamment dans l'Oriental, le sud-est, la vallée de la Moulouya et le sud des provinces sahariennes."
   },
   {
-    "question": "À partir de quand l'eau dessalée doit-elle alimenter Marrakech ?",
-    "ground_truth": "L'eau dessalée doit alimenter le Grand Marrakech à partir de fin juillet."
+    "question": "Qu'est-ce que la fuite FortiBleed a exposé, et qui appelle à renforcer la sécurité ?",
+    "ground_truth": "La fuite FortiBleed a exposé des milliers d'identifiants d'administration et d'accès VPN actifs. La DGSSI appelle les organisations utilisant des solutions Fortinet à renforcer leurs mesures de sécurité."
   },
   {
-    "question": "Quelle température maximale est annoncée, et dans quelles régions ?",
-    "ground_truth": "Des températures pouvant atteindre 46°C sont attendues, notamment dans l'Oriental, le sud-est, la vallée de la Moulouya et le sud des provinces sahariennes."
+    "question": "À quelle occasion la CGEM a-t-elle complété ses instances de gouvernance ?",
+    "ground_truth": "La CGEM a complété ses instances de gouvernance lors de son premier Conseil d'administration au titre de la mandature 2026-2029, tenu à Casablanca."
   },
   {
-    "question": "Qu'est-ce que la fuite \"FortiBleed\" a exposé, et qui appelle à renforcer la sécurité face à cette menace ?",
-    "ground_truth": "La fuite \"FortiBleed\" a exposé des milliers d'identifiants d'administration et d'accès VPN actifs, dont certains liés à des entités marocaines ; la DGSSI appelle les organisations utilisant des solutions Fortinet à renforcer sans délai leurs mesures de sécurité."
+    "question": "Combien de commissions permanentes la CGEM a-t-elle installées ?",
+    "ground_truth": "La CGEM a installé 20 commissions permanentes."
   },
   {
-    "question": "Quel dispositif l'ONCF a-t-il annoncé pour l'été 2026, et dans quel but ?",
-    "ground_truth": "L'ONCF a annoncé le déploiement de son \"Plan Spécial Été 2026\", un dispositif conçu pour répondre à l'affluence exceptionnelle attendue sur le réseau ferroviaire national durant la saison estivale."
+    "question": "Quelle ligne de Casabus passe désormais toutes les 15 minutes ?",
+    "ground_truth": "La ligne L65 de Casabus passe désormais toutes les 15 minutes."
+  },
+  {
+    "question": "Quelle était l'ancienne fréquence de passage de la ligne L65 de Casabus ?",
+    "ground_truth": "L'ancienne fréquence de passage de la ligne L65 était de 21 minutes."
+  },
+  {
+    "question": "Quelles destinations sans visa sont citées pour les voyageurs marocains à l'été 2026 ?",
+    "ground_truth": "Les destinations citées sont notamment la Turquie, le Brésil et la Malaisie."
+  },
+  {
+    "question": "À combien de destinations le passeport marocain permet-il d'accéder avec des conditions simplifiées ?",
+    "ground_truth": "Le passeport marocain permet d'accéder à plus de 70 destinations avec des conditions d'entrée simplifiées."
+  },
+  {
+    "question": "Qui supervise l'audit des Établissements pionniers avant l'attribution du label Riada ?",
+    "ground_truth": "L'audit est conduit sous la supervision de l'Observatoire national du développement humain (ONDH)."
+  },
+  {
+    "question": "Quel taux directeur BMCE Capital anticipe-t-elle pour Bank Al-Maghrib ?",
+    "ground_truth": "BMCE Capital anticipe le maintien du taux directeur de Bank Al-Maghrib à 2,25 %."
+  },
+  {
+    "question": "Quel dirigeant britannique a annoncé sa démission selon le journal Al Alam ?",
+    "ground_truth": "Le Premier ministre britannique Keir Starmer a annoncé sa démission."
+  },
+  {
+    "question": "Quel club a réussi son retour en deuxième division professionnelle après une saison en amateur ?",
+    "ground_truth": "L'Olympique Khouribga a réussi son retour en deuxième division professionnelle après une saison en amateur."
+  },
+  {
+    "question": "Que demande le syndicat national de l'ONDA concernant les employés ?",
+  "ground_truth": "Le syndicat demande l'équité pour les employés et la prise en compte des années d'expérience professionnelle avant le recrutement."
+  },
+  {
+    "question": "ماذا ضبطت الشرطة القضائية في طنجة في قضية التهريب الدولي؟",
+    "ground_truth": "ضبطت الشرطة القضائية في طنجة 700 كيلوغرام من مخدر الشيرا في إطار قضية تهريب دولية."
   },
   {
     "question": "من ترأس أشغال تجديد فرع حزب الاستقلال بالفنيدق؟",
-    "ground_truth": "منصف الطوب هو من ترأس أشغال تجديد فرع حزب الاستقلال بالفنيدق."
+    "ground_truth": "ترأس منصف الطوب أشغال تجديد فرع حزب الاستقلال بالفنيدق."
   },
   {
-    "question": "في أي مدينة وفي أي تاريخ احتضنت هذه الفعالية؟",
-    "ground_truth": "احتضنت مدينة الفنيدق هذه الفعالية يوم الجمعة 19 يونيو 2026."
+    "question": "متى احتضنت مدينة الفنيدق أشغال تجديد فرع حزب الاستقلال؟",
+    "ground_truth": "احتضنت مدينة الفنيدق أشغال تجديد فرع حزب الاستقلال يوم الجمعة 19 يونيو 2026."
   },
   {
-    "question": "بماذا أشادت فرنسا فيما يخص تعاونها مع المغرب في مجال الهجرة؟",
-    "ground_truth": "أشادت فرنسا بـ\"التعاون الغني للغاية\" والمهيكل مع المغرب في مجال الهجرة."
+    "question": "بماذا أشادت فرنسا في علاقتها مع المغرب في مجال الهجرة؟",
+    "ground_truth": "أشادت فرنسا بالتعاون الغني للغاية والمهيكل مع المغرب في مجال الهجرة."
   },
   {
-    "question": "من صرح بهذا التصريح، وما منصبه؟",
-    "ground_truth": "صرح بذلك فريديريك جورام، مدير الهجرة بوزارة الداخلية الفرنسية."
-  },
-  {
-    "question": "أي فريق تأهل رسميا إلى القسم الوطني الأول للبطولة الاحترافية؟",
-    "ground_truth": "نادي وداد تمارة هو الفريق الذي تأهل رسميا إلى القسم الوطني الأول."
+    "question": "أي نادٍ حجز بطاقة الصعود إلى القسم الاحترافي الأول؟",
+    "ground_truth": "نادي وداد تمارة حجز بطاقة الصعود إلى القسم الاحترافي الأول."
   },
   {
     "question": "ما اسم المركب السياحي الذي يشهد حالة احتقان اجتماعي، وفي أي مدينة يقع؟",
-    "ground_truth": "المركب السياحي يسمى \"كيمادو\" ويقع بمدينة الحسيمة."
+    "ground_truth": "المركب السياحي هو كيمادو، ويقع في مدينة الحسيمة."
   },
   {
-    "question": "من وصف حالة التوتر والاحتقان بهذا المركب؟",
-    "ground_truth": "المكتب النقابي لعمال وأطر المؤسسة هو من وصف حالة التوتر والاحتقان."
+    "question": "متى تحتضن طنجة الدورة الثالثة للمنتدى الدولي للأعمال؟",
+    "ground_truth": "تحتضن طنجة الدورة الثالثة للمنتدى الدولي للأعمال خلال الفترة من 30 يونيو إلى 2 يوليوز."
   },
   {
-    "question": "في أي منطقة ومدينة وقعت حادثة استخدام السلاح الوظيفي ضد شخصين، وفي أي تاريخ؟",
-    "ground_truth": "وقعت الحادثة بمنطقة العيايدة بمدينة سلا، يوم السبت 20 يونيو 2026."
+    "question": "متى تم إيداع جداول نتائج مراجعة اللوائح الانتخابية؟",
+    "ground_truth": "تم إيداع جداول نتائج مراجعة اللوائح الانتخابية يوم الاثنين 22 يونيو 2026."
   },
   {
-    "question": "لماذا اضطر الضابط والمفتش لاستخدام سلاحيهما الوظيفيين؟",
-    "ground_truth": "اضطرا لاستخدام سلاحيهما الوظيفيين لتحييد الخطر الصادر عن شخصين مبحوث عنهما في جريمة قتل."
+    "question": "ما الفترة المحددة للاطلاع على جداول اللوائح الانتخابية وتقديم الطعون؟",
+    "ground_truth": "يمكن الاطلاع على الجداول وتقديم الطعون خلال الفترة الممتدة من 22 إلى 28 يونيو 2026."
   },
   {
-    "question": "أي مدينة ستحتضن الدورة الثالثة للملتقى الدولي للأعمال، وما الفترة الزمنية؟",
-    "ground_truth": "ستحتضن مدينة طنجة الدورة الثالثة للملتقى الدولي للأعمال، من 30 يونيو إلى 2 يوليوز."
+    "question": "Quels sont les trois écueils mentionnés par l'Istiqlal contre le plafonnement des prix des hydrocarbures ?",
+    "ground_truth": "L'Istiqlal mentionne trois écueils : les contraintes constitutionnelles, les limites juridiques et les équilibres économiques."
   },
   {
-    "question": "ما الهدف من هذا الملتقى الاقتصادي؟",
-    "ground_truth": "الهدف من الملتقى هو تطوير المقاولات الصغرى وتحسين مناخ الاستثمار."
-  },
-  {
-    "question": "ما درجة الحرارة القصوى المتوقعة حسب نشرة الإنذار؟",
-    "ground_truth": "درجة الحرارة القصوى المتوقعة تتجاوز 45 درجة."
-  },
-  {
-    "question": "من أصدر نشرة الإنذار بموجة الحر، ومتى؟",
-    "ground_truth": "أصدرت المديرية العامة للأرصاد الجوية نشرة الإنذار يوم الخميس 18 يونيو 2026."
-  },
-  {
-    "question": "من ينظم المؤتمر الدولي الأول للروبوتيك في الصحة، وفي أي تاريخ؟",
-    "ground_truth": "تنظم الجمعية المغربية للروبوتيك في الصحة (SMRS) هذا المؤتمر يومي 19 و20 يونيو 2026."
-  },
-  {
-    "question": "ما الهدف المعلن لهذا المؤتمر؟",
-    "ground_truth": "الهدف المعلن هو الولوج العادل والمنصف للجراحة الروبوتية."
-  },
-  {
-    "question": "أي لجنة صادقت على مشروع قانون إعادة تنظيم المجلس الوطني للصحافة؟",
-    "ground_truth": "صادقت لجنة التعليم والشؤون الثقافية والاجتماعية بمجلس المستشارين على هذا المشروع."
+    "question": "Selon Nizar Baraka, que provoquerait le plafonnement des prix des hydrocarbures ?",
+    "ground_truth": "Selon Nizar Baraka, le plafonnement des prix reviendrait à ressusciter le système de compensation."
   }
 ]
