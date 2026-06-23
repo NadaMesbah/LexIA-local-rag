@@ -388,10 +388,6 @@ export default function DocumentsPage() {
     <Box sx={{ height: '100%', overflowY: 'auto', p: { xs: 2, md: 4 } }}>
       <Box sx={{ maxWidth: 1100, mx: 'auto' }}>
         <Typography variant="h4" sx={{ fontWeight: 800, mb: 0.5 }}>Documents</Typography>
-        <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
-          Importez, versionnez, restaurez et supprimez les documents de la base. Le chat utilise
-          toujours la dernière version indexée.
-        </Typography>
 
         <Tabs value={tab} onChange={(_, v) => setTab(v)} sx={{ mb: 2 }}>
           <Tab value="active" label="Actifs" />
@@ -402,7 +398,7 @@ export default function DocumentsPage() {
         <Box {...getRootProps()} sx={{
           p: 4, mb: 3, borderRadius: 2, border: '1.5px dashed',
           borderColor: isDragActive ? 'primary.main' : 'rgba(145,158,171,0.32)',
-          bgcolor: isDragActive ? 'rgba(0,167,111,0.08)' : 'background.paper', textAlign: 'center', transition: 'all .2s',
+          bgcolor: isDragActive ? 'rgba(1,134,135,0.08)' : 'background.paper', textAlign: 'center', transition: 'all .2s',
         }}>
           <input {...getInputProps()} />
           <CloudUploadRoundedIcon sx={{ fontSize: 40, color: 'primary.main', mb: 1 }} />

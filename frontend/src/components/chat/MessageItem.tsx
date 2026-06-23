@@ -39,8 +39,8 @@ function AttachmentChip({ id, filename, status }: { id: string; filename: string
       size="small"
       sx={{
         maxWidth: 260,
-        bgcolor: 'rgba(0,167,111,0.08)',
-        border: '1px solid rgba(0,167,111,0.24)',
+        bgcolor: 'rgba(1,134,135,0.08)',
+        border: '1px solid rgba(1,134,135,0.24)',
         '& .MuiChip-label': { fontWeight: 600 },
       }}
     />
@@ -185,8 +185,8 @@ export default function MessageItem({
               px: 2,
               py: 1.25,
               maxWidth: '78%',
-              bgcolor: 'rgba(0,167,111,0.12)',
-              border: '1px solid rgba(0,167,111,0.24)',
+              bgcolor: 'rgba(1,134,135,0.12)',
+              border: '1px solid rgba(1,134,135,0.24)',
               boxShadow: 'none',
               borderRadius: 2,
               borderBottomRightRadius: 4,
@@ -219,8 +219,8 @@ export default function MessageItem({
   // assistant
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 0.5 }}>
-      <Typography variant="caption" sx={{ color: 'warning.dark', fontWeight: 700, letterSpacing: 0.5 }}>
-        OWANA
+      <Typography variant="caption" sx={{ color: 'primary.main', fontWeight: 700, letterSpacing: 0.5 }}>
+        LexIA
       </Typography>
       <Paper
         sx={{

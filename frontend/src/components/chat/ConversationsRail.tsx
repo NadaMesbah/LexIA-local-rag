@@ -151,7 +151,7 @@ export default function ConversationsRail({
                 borderRadius: 1.5,
                 mb: 0.25,
                 pr: 1,
-                '&.Mui-selected': { bgcolor: 'rgba(0,167,111,0.10)' },
+                '&.Mui-selected': { bgcolor: 'rgba(1,134,135,0.10)' },
                 '&:hover .more-btn': { opacity: 1 },
               }}
             >
