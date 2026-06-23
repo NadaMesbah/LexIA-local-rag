@@ -88,7 +88,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             <AutoAwesomeRoundedIcon fontSize="small" />
           </Box>
           <Typography variant="h6" sx={{ fontWeight: 800 }}>
-            RAG&nbsp;<Box component="span" sx={{ color: 'primary.main' }}>Local</Box>
+            Lex<Box component="span" sx={{ color: 'primary.main' }}>IA</Box>
           </Typography>
         </Box>
 
@@ -112,8 +112,8 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
                   mb: 0.5,
                   color: active ? 'primary.main' : 'text.secondary',
                   '&.Mui-selected': {
-                    bgcolor: 'rgba(0,167,111,0.08)',
-                    '&:hover': { bgcolor: 'rgba(0,167,111,0.16)' },
+                    bgcolor: 'rgba(1,134,135,0.08)',
+                    '&:hover': { bgcolor: 'rgba(1,134,135,0.16)' },
                   },
                 }}
               >

@@ -105,7 +105,7 @@ export default function Composer({
               onDelete={onRemoveAttachment ? () => onRemoveAttachment(a.id) : undefined}
               size="small"
               variant="outlined"
-              sx={{ maxWidth: 280, borderColor: 'rgba(0,167,111,0.4)' }}
+              sx={{ maxWidth: 280, borderColor: 'rgba(1,134,135,0.4)' }}
             />
           ))}
         </Box>
@@ -128,7 +128,7 @@ export default function Composer({
         </Tooltip>
 
         <TextField
-          fullWidth multiline maxRows={8} variant="standard" placeholder="Posez votre question…"
+          fullWidth multiline maxRows={8} variant="standard" placeholder="Posez votre question à LexIA…"
           value={value} onChange={(e) => setValue(e.target.value)}
           onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); } }}
           InputProps={{ disableUnderline: true }}

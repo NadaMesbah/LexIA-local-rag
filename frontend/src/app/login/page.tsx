@@ -124,7 +124,7 @@ export default function LoginPage() {
           width: '46%',
           p: 8,
           color: 'common.white',
-          background: 'linear-gradient(135deg, #007867 0%, #00A76F 55%, #5BE49B 100%)',
+          background: 'linear-gradient(135deg, #016F70 0%, #018687 55%, #01B7B7 100%)',
         }}
       >
         <Stack direction="row" spacing={1.5} alignItems="center" sx={{ mb: 5 }}>
@@ -141,7 +141,7 @@ export default function LoginPage() {
             <AutoAwesomeRoundedIcon />
           </Box>
           <Typography variant="h5" sx={{ fontWeight: 800 }}>
-            RAG Local
+            LexIA
           </Typography>
         </Stack>
 
@@ -217,7 +217,7 @@ export default function LoginPage() {
               <AutoAwesomeRoundedIcon fontSize="small" />
             </Box>
             <Typography variant="h6" sx={{ fontWeight: 800 }}>
-              RAG&nbsp;<Box component="span" sx={{ color: 'primary.main' }}>Local</Box>
+              Lex<Box component="span" sx={{ color: 'primary.main' }}>IA</Box>
             </Typography>
           </Stack>
 
