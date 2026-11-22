@@ -1,6 +1,6 @@
-# Local RAG Advanced
+# LexIA - Local RAG
 
-**Local RAG Advanced** is a private, multilingual Retrieval-Augmented Generation application that lets users upload documents, build a local knowledge base, and ask questions with grounded answers and sources.
+**LexIA - Local RAG** is a private, multilingual Retrieval-Augmented Generation application that lets users upload documents, build a local knowledge base, and ask questions with grounded answers and sources.
 
 The system runs locally with **Ollama**, **ChromaDB**, **SQLite**, **FastAPI**, and a **Next.js** web interface. Documents, conversations, embeddings, and metadata stay on the local machine.
 
